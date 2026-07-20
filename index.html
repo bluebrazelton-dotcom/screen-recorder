@@ -360,6 +360,7 @@
     <h3>Interrupted recording found</h3>
     <p id="recoveryInfo">A previous recording was interrupted. You can recover it or discard it.</p>
     <div class="recovery-actions">
+      <button class="primary btn-record" onclick="continueRecording()">Continue recording</button>
       <button class="primary btn-save" onclick="recoverRecording()">Recover &amp; save</button>
       <button class="primary btn-stop" onclick="discardRecovery()">Discard</button>
     </div>
@@ -460,6 +461,7 @@ const state = {
   pauseStart: null,
   sessionId: null,
   chunkIndex: 0,
+  priorSegments: [],   // Array of { sessionId, mimeType } from interrupted recordings
 };
 
 // ============================================================
@@ -857,6 +859,297 @@ function createAudioMix(streams) {
 }
 
 // ============================================================
+// WebM Concatenation — zero-dependency EBML parser
+// ============================================================
+// WebM uses EBML (Extended Binary Markup Language), a binary format
+// similar to XML. Each element has: [ID (variable-length)] [Size (variable-length)] [Data]
+// To stitch recordings, we parse the container structure, extract Clusters
+// (the elements that hold actual audio/video data), adjust their timestamps,
+// and write them into a single file.
+
+const EBML_IDS = {
+  HEADER:    0x1A45DFA3,
+  SEGMENT:   0x18538067,
+  INFO:      0x1549A966,
+  TRACKS:    0x1654AE6B,
+  CLUSTER:   0x1F43B675,
+  TIMESTAMP: 0xE7,
+  TIMESCALE: 0x2AD7B1,
+};
+
+// Read an EBML variable-length integer from a DataView.
+// Element IDs keep the leading marker bit; data sizes strip it.
+function ebmlReadVarInt(view, pos, stripLeadingBit) {
+  if (pos >= view.byteLength) return null;
+  const b0 = view.getUint8(pos);
+  let width = 0;
+  for (let mask = 0x80; mask > 0; mask >>= 1) {
+    width++;
+    if (b0 & mask) break;
+  }
+  if (width > 8 || pos + width > view.byteLength) return null;
+
+  let value = stripLeadingBit ? (b0 & ((0x80 >> (width - 1)) - 1)) : b0;
+  for (let i = 1; i < width; i++) {
+    value = value * 256 + view.getUint8(pos + i);
+  }
+
+  // Check for "unknown size" (all value bits set)
+  let isUnknown = false;
+  if (stripLeadingBit) {
+    const maxKnown = [0x7E, 0x3FFE, 0x1FFFFE, 0x0FFFFFFE, 0x07FFFFFFFE,
+                      0x03FFFFFFFFFE, 0x01FFFFFFFFFFFE, 0x00FFFFFFFFFFFFFE];
+    isUnknown = value > maxKnown[width - 1];
+  }
+
+  return { value, length: width, isUnknown };
+}
+
+function ebmlReadId(view, pos) {
+  return ebmlReadVarInt(view, pos, false);
+}
+
+function ebmlReadSize(view, pos) {
+  return ebmlReadVarInt(view, pos, true);
+}
+
+// Read an unsigned integer of `size` bytes from a DataView
+function ebmlReadUInt(view, pos, size) {
+  let val = 0;
+  for (let i = 0; i < size; i++) val = val * 256 + view.getUint8(pos + i);
+  return val;
+}
+
+// Encode a value as an EBML data-size VINT (with leading marker bit)
+function ebmlWriteSize(value) {
+  if (value <= 0x7E)       return new Uint8Array([0x80 | value]);
+  if (value <= 0x3FFE)     return new Uint8Array([0x40 | (value >> 8), value & 0xFF]);
+  if (value <= 0x1FFFFE)   return new Uint8Array([0x20 | (value >> 16), (value >> 8) & 0xFF, value & 0xFF]);
+  if (value <= 0x0FFFFFFE) return new Uint8Array([0x10 | (value >> 24), (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF]);
+  throw new Error('EBML size too large');
+}
+
+// Write an unsigned integer into `size` bytes
+function ebmlWriteUInt(value, size) {
+  const out = new Uint8Array(size);
+  for (let i = size - 1; i >= 0; i--) { out[i] = value & 0xFF; value = Math.floor(value / 256); }
+  return out;
+}
+
+// Determine how many bytes are needed for an unsigned integer
+function ebmlUIntWidth(value) {
+  if (value <= 0xFF) return 1;
+  if (value <= 0xFFFF) return 2;
+  if (value <= 0xFFFFFF) return 3;
+  return 4;
+}
+
+// Scan a WebM ArrayBuffer and return structural info: header region, cluster list, etc.
+function webmScan(buffer) {
+  const view = new DataView(buffer);
+  const info = {
+    preambleEnd: 0,      // End of header + info + tracks (start of first cluster)
+    clusters: [],         // { offset, totalSize, timestamp }
+    timestampScale: 1000000, // nanoseconds per tick (default 1ms)
+    lastTimestamp: 0,
+  };
+
+  let pos = 0;
+
+  // --- EBML Header ---
+  const hdrId = ebmlReadId(view, pos);
+  if (!hdrId || hdrId.value !== EBML_IDS.HEADER) throw new Error('Not a valid WebM file');
+  pos += hdrId.length;
+  const hdrSize = ebmlReadSize(view, pos);
+  pos += hdrSize.length + hdrSize.value;
+
+  // --- Segment ---
+  const segId = ebmlReadId(view, pos);
+  if (!segId || segId.value !== EBML_IDS.SEGMENT) throw new Error('Missing Segment element');
+  pos += segId.length;
+  const segSize = ebmlReadSize(view, pos);
+  pos += segSize.length;
+  const segEnd = segSize.isUnknown ? buffer.byteLength : pos + segSize.value;
+
+  // --- Scan Segment children ---
+  while (pos < segEnd && pos < buffer.byteLength) {
+    const elemId = ebmlReadId(view, pos);
+    if (!elemId) break;
+    const sizeField = ebmlReadSize(view, pos + elemId.length);
+    if (!sizeField) break;
+    const dataStart = pos + elemId.length + sizeField.length;
+
+    if (elemId.value === EBML_IDS.CLUSTER) {
+      // Parse Cluster's Timestamp child (always the first child element)
+      let clusterTs = 0;
+      if (!sizeField.isUnknown) {
+        const tsId = ebmlReadId(view, dataStart);
+        if (tsId && tsId.value === EBML_IDS.TIMESTAMP) {
+          const tsSize = ebmlReadSize(view, dataStart + tsId.length);
+          clusterTs = ebmlReadUInt(view, dataStart + tsId.length + tsSize.length, tsSize.value);
+        }
+      }
+
+      // For unknown-size clusters, scan forward for the next top-level element
+      let clusterEnd;
+      if (sizeField.isUnknown) {
+        clusterEnd = segEnd; // default: extends to end
+        let scanPos = dataStart;
+        // Skip past the Timestamp element
+        const tsId = ebmlReadId(view, scanPos);
+        if (tsId && tsId.value === EBML_IDS.TIMESTAMP) {
+          const tsSize = ebmlReadSize(view, scanPos + tsId.length);
+          scanPos = scanPos + tsId.length + tsSize.length + tsSize.value;
+        }
+        // Scan for next Cluster or Segment-level element
+        while (scanPos < segEnd) {
+          const nextId = ebmlReadId(view, scanPos);
+          if (!nextId) break;
+          // Check if this is a Segment-level element (Cluster, Info, Tracks, Cues, etc.)
+          if (nextId.value === EBML_IDS.CLUSTER || nextId.value === EBML_IDS.INFO ||
+              nextId.value === EBML_IDS.TRACKS) {
+            clusterEnd = scanPos;
+            break;
+          }
+          // Otherwise it's a Cluster child — skip it
+          const childSize = ebmlReadSize(view, scanPos + nextId.length);
+          if (!childSize || childSize.isUnknown) break;
+          scanPos = scanPos + nextId.length + childSize.length + childSize.value;
+        }
+      } else {
+        clusterEnd = dataStart + sizeField.value;
+      }
+
+      info.clusters.push({
+        offset: pos,
+        totalSize: clusterEnd - pos,
+        timestamp: clusterTs,
+      });
+      info.lastTimestamp = Math.max(info.lastTimestamp, clusterTs);
+      pos = clusterEnd;
+
+    } else if (elemId.value === EBML_IDS.INFO) {
+      // Look for TimestampScale inside Info
+      let inner = dataStart;
+      const infoEnd = dataStart + sizeField.value;
+      while (inner < infoEnd) {
+        const iId = ebmlReadId(view, inner);
+        if (!iId) break;
+        const iSize = ebmlReadSize(view, inner + iId.length);
+        if (!iSize) break;
+        if (iId.value === EBML_IDS.TIMESCALE) {
+          info.timestampScale = ebmlReadUInt(view, inner + iId.length + iSize.length, iSize.value);
+        }
+        inner = inner + iId.length + iSize.length + iSize.value;
+      }
+      info.preambleEnd = infoEnd;
+      pos = infoEnd;
+
+    } else {
+      // Skip other elements (Tracks, Cues, Tags, etc.)
+      if (sizeField.isUnknown) break;
+      const elemEnd = dataStart + sizeField.value;
+      // Track the end of non-Cluster elements as the preamble boundary
+      if (elemId.value === EBML_IDS.TRACKS) {
+        info.preambleEnd = elemEnd;
+      }
+      pos = elemEnd;
+    }
+  }
+
+  // If no clusters were found, preambleEnd is the whole file
+  if (info.clusters.length > 0 && info.preambleEnd === 0) {
+    info.preambleEnd = info.clusters[0].offset;
+  }
+
+  return info;
+}
+
+// Rebuild a Cluster with an adjusted timestamp.
+// Reads the original cluster, replaces only the Timestamp element value,
+// and reconstructs the Cluster header to account for any size change.
+function webmRewriteCluster(buffer, cluster, timeOffset) {
+  const view = new DataView(buffer, cluster.offset);
+
+  // Parse Cluster header
+  const cId = ebmlReadId(view, 0);           // Cluster ID (0x1F43B675, 4 bytes)
+  const cSize = ebmlReadSize(view, cId.length); // Cluster data size
+  const dataStart = cId.length + cSize.length;
+
+  // Parse Timestamp element (first child of Cluster per WebM spec)
+  const tsId = ebmlReadId(view, dataStart);     // should be 0xE7
+  if (!tsId || tsId.value !== EBML_IDS.TIMESTAMP) {
+    // No Timestamp element found — return cluster bytes as-is (can't adjust)
+    return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
+  }
+  const tsSize = ebmlReadSize(view, dataStart + tsId.length);
+  const tsDataStart = dataStart + tsId.length + tsSize.length;
+  const tsDataEnd = tsDataStart + tsSize.value;
+  const origTs = ebmlReadUInt(view, tsDataStart, tsSize.value);
+
+  // Calculate new timestamp
+  const newTs = origTs + timeOffset;
+  const newTsWidth = ebmlUIntWidth(newTs);
+
+  // Build new Timestamp element: [0xE7] [size VINT] [value bytes]
+  const newTsSizeField = ebmlWriteSize(newTsWidth);
+  const newTsValue = ebmlWriteUInt(newTs, newTsWidth);
+
+  // Remainder of cluster data (everything after the original Timestamp element)
+  const restStart = cluster.offset + tsDataEnd;
+  const restEnd = cluster.offset + cluster.totalSize;
+  const restLen = restEnd - restStart;
+
+  // New cluster data size = new timestamp element + rest
+  const newTsElemLen = 1 + newTsSizeField.length + newTsWidth; // 0xE7 + size + value
+  const newClusterDataSize = newTsElemLen + restLen;
+  const newClusterSizeField = ebmlWriteSize(newClusterDataSize);
+
+  // Assemble: Cluster ID + new size + new Timestamp element + rest of data
+  const clusterIdBytes = new Uint8Array([0x1F, 0x43, 0xB6, 0x75]);
+  const totalLen = 4 + newClusterSizeField.length + newClusterDataSize;
+  const out = new Uint8Array(totalLen);
+  let w = 0;
+
+  out.set(clusterIdBytes, w);      w += 4;
+  out.set(newClusterSizeField, w); w += newClusterSizeField.length;
+  out[w++] = 0xE7;                                   // Timestamp ID
+  out.set(newTsSizeField, w);      w += newTsSizeField.length;
+  out.set(newTsValue, w);          w += newTsWidth;
+  // Copy the rest of the cluster data from the original buffer
+  out.set(new Uint8Array(buffer, restStart, restLen), w);
+
+  return out;
+}
+
+// Concatenate multiple WebM blobs into a single WebM blob.
+// Uses remuxing (no decode/re-encode) — fast and lossless.
+async function concatenateWebM(blobs) {
+  if (blobs.length === 0) return null;
+  if (blobs.length === 1) return blobs[0];
+
+  const buffers = await Promise.all(blobs.map(b => b.arrayBuffer()));
+  const scans = buffers.map(buf => webmScan(buf));
+
+  // Start with the entire first file (header + clusters)
+  const parts = [new Uint8Array(buffers[0])];
+
+  // For each subsequent segment: extract clusters, adjust timestamps.
+  // timeOffset accumulates: each segment's clusters are shifted by the
+  // total duration of all preceding segments.
+  let timeOffset = 0;
+  for (let i = 1; i < buffers.length; i++) {
+    timeOffset += scans[i - 1].lastTimestamp + 1000; // +1000 for last cluster's ~1s duration
+
+    for (const cluster of scans[i].clusters) {
+      parts.push(webmRewriteCluster(buffers[i], cluster, timeOffset));
+    }
+  }
+
+  return new Blob(parts, { type: 'video/webm' });
+}
+
+// ============================================================
 // Screen selection (two-step flow)
 // ============================================================
 async function selectScreen() {
@@ -1124,23 +1417,25 @@ async function finalizeRecording() {
     // Mark session complete
     await completeSession(state.sessionId);
 
-    // Get all chunks
+    // Get all chunks for the current session
     const chunks = await getSessionChunks(state.sessionId);
-    if (chunks.length === 0) {
+    if (chunks.length === 0 && state.priorSegments.length === 0) {
       showError('No recording data found.');
       resetUI();
       return;
     }
 
-    // Build blob from stored chunks
-    const blobs = chunks.map(c => new Blob([c.data]));
-    const fullBlob = new Blob(blobs, { type: sessionMimeType });
+    // Build blob for the current session
+    const currentBlob = new Blob(chunks.map(c => new Blob([c.data])), { type: sessionMimeType });
 
-    // Save via File System Access API
-    await saveFile(fullBlob);
-
-    // Clean up the session from IndexedDB
-    await deleteSession(state.sessionId);
+    if (state.priorSegments.length > 0) {
+      // Multi-segment: stitch prior segments + current into one file
+      await stitchAndSave(currentBlob, sessionMimeType);
+    } else {
+      // Single segment: save directly
+      await saveFile(currentBlob);
+      await deleteSession(state.sessionId);
+    }
 
   } catch (err) {
     console.error('Failed to finalize:', err);
@@ -1151,12 +1446,78 @@ async function finalizeRecording() {
   }
 }
 
-async function saveFile(blob) {
+// Stitch multiple recording segments into one file and save.
+// Falls back to saving segments separately if stitching fails.
+async function stitchAndSave(currentBlob, currentMimeType) {
+  updateStatus('idle', 'Stitching segments together...');
+
+  try {
+    // Build blobs for all prior segments
+    const segmentBlobs = [];
+    for (const seg of state.priorSegments) {
+      const chunks = await getSessionChunks(seg.sessionId);
+      if (chunks.length > 0) {
+        segmentBlobs.push(new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType }));
+      }
+    }
+
+    // Add the current recording as the final segment
+    segmentBlobs.push(currentBlob);
+
+    if (segmentBlobs.length < 2) {
+      // Only one segment has data — save directly
+      await saveFile(segmentBlobs[0] || currentBlob);
+    } else {
+      // Concatenate using the EBML parser
+      const stitched = await concatenateWebM(segmentBlobs);
+      await saveFile(stitched);
+    }
+
+    // Clean up all sessions from IndexedDB
+    for (const seg of state.priorSegments) {
+      await deleteSession(seg.sessionId);
+    }
+    await deleteSession(state.sessionId);
+    state.priorSegments = [];
+
+  } catch (err) {
+    console.error('Stitching failed:', err);
+
+    // Fallback: offer to save segments separately
+    const fallback = confirm(
+      'Stitching failed (' + err.message + '). Save each segment as a separate file instead?'
+    );
+    if (fallback) {
+      let fileNum = 1;
+      for (const seg of state.priorSegments) {
+        const chunks = await getSessionChunks(seg.sessionId);
+        if (chunks.length > 0) {
+          const blob = new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType });
+          await saveFile(blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+          fileNum++;
+        }
+      }
+      await saveFile(currentBlob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+
+      // Clean up
+      for (const seg of state.priorSegments) {
+        await deleteSession(seg.sessionId);
+      }
+      await deleteSession(state.sessionId);
+      state.priorSegments = [];
+    } else {
+      showError('Stitching failed. Your recordings are safe in the browser — refresh and use Recovery.');
+    }
+  }
+}
+
+async function saveFile(blob, suggestedName) {
+  suggestedName = suggestedName || `recording-${formatDateForFilename()}.webm`;
   // Try File System Access API first
   if ('showSaveFilePicker' in window) {
     try {
       const handle = await window.showSaveFilePicker({
-        suggestedName: `recording-${formatDateForFilename()}.webm`,
+        suggestedName,
         types: [{
           description: 'WebM Video',
           accept: { 'video/webm': ['.webm'] },
@@ -1181,7 +1542,7 @@ async function saveFile(blob) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `recording-${formatDateForFilename()}.webm`;
+  a.download = suggestedName;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
@@ -1199,23 +1560,51 @@ function formatDateForFilename() {
 // ============================================================
 async function checkForRecovery() {
   try {
-    const session = await getIncompleteSession();
-    if (session) {
+    // Find all incomplete sessions (there may be multiple from repeated crashes)
+    const db = await openDB();
+    const allSessions = await new Promise((resolve, reject) => {
+      const tx = db.transaction('sessions', 'readonly');
+      const req = tx.objectStore('sessions').getAll();
+      req.onsuccess = () => { db.close(); resolve(req.result.filter(s => !s.completed)); };
+      req.onerror = () => { db.close(); reject(req.error); };
+    });
+
+    if (allSessions.length === 0) return;
+
+    // Calculate total chunks and size across all incomplete sessions
+    let totalChunks = 0;
+    let totalBytes = 0;
+    const sessionInfos = [];
+
+    for (const session of allSessions) {
       const chunks = await getSessionChunks(session.id);
       if (chunks.length > 0) {
-        const totalBytes = chunks.reduce((sum, c) => sum + c.data.byteLength, 0);
-        const sizeMB = (totalBytes / (1024 * 1024)).toFixed(1);
-        const elapsed = chunks.length; // Rough seconds (1 chunk ≈ 1 second)
-        const mins = Math.floor(elapsed / 60);
-        const secs = elapsed % 60;
-
-        document.getElementById('recoveryInfo').textContent =
-          `Found ${chunks.length} chunks (~${mins}m ${secs}s, ${sizeMB} MB) from ${new Date(session.startTime).toLocaleString()}.`;
-        document.getElementById('recoveryBanner').classList.add('visible');
-        window._recoverySessionId = session.id;
-        window._recoveryMimeType = session.mimeType;
+        totalChunks += chunks.length;
+        totalBytes += chunks.reduce((sum, c) => sum + c.data.byteLength, 0);
+        sessionInfos.push({ id: session.id, mimeType: session.mimeType, startTime: session.startTime, chunkCount: chunks.length });
       }
     }
+
+    if (sessionInfos.length === 0) return;
+
+    const sizeMB = (totalBytes / (1024 * 1024)).toFixed(1);
+    const mins = Math.floor(totalChunks / 60);
+    const secs = totalChunks % 60;
+
+    const segmentNote = sessionInfos.length > 1
+      ? ` across ${sessionInfos.length} segments`
+      : '';
+
+    document.getElementById('recoveryInfo').textContent =
+      `Found ${totalChunks} chunks (~${mins}m ${secs}s, ${sizeMB} MB)${segmentNote} from ${new Date(sessionInfos[0].startTime).toLocaleString()}.`;
+    document.getElementById('recoveryBanner').classList.add('visible');
+
+    // Store all session IDs for recovery/continue
+    // The most recent session is the "primary" recovery target
+    // All earlier sessions become prior segments if continuing
+    window._recoverySessions = sessionInfos;
+    window._recoverySessionId = sessionInfos[sessionInfos.length - 1].id;
+    window._recoveryMimeType = sessionInfos[sessionInfos.length - 1].mimeType;
   } catch (err) {
     console.error('Recovery check failed:', err);
   }
@@ -1223,12 +1612,44 @@ async function checkForRecovery() {
 
 async function recoverRecording() {
   try {
-    const chunks = await getSessionChunks(window._recoverySessionId);
-    const blobs = chunks.map(c => new Blob([c.data]));
-    const blob = new Blob(blobs, { type: window._recoveryMimeType || 'video/webm' });
+    const sessions = window._recoverySessions || [{ id: window._recoverySessionId, mimeType: window._recoveryMimeType }];
 
-    await saveFile(blob);
-    await deleteSession(window._recoverySessionId);
+    if (sessions.length === 1) {
+      // Single segment: save directly
+      const chunks = await getSessionChunks(sessions[0].id);
+      const blob = new Blob(chunks.map(c => new Blob([c.data])), { type: sessions[0].mimeType || 'video/webm' });
+      await saveFile(blob);
+      await deleteSession(sessions[0].id);
+    } else {
+      // Multiple segments from repeated crashes: stitch them together
+      updateStatus('idle', 'Stitching recovered segments...');
+      const segmentBlobs = [];
+      for (const sess of sessions) {
+        const chunks = await getSessionChunks(sess.id);
+        if (chunks.length > 0) {
+          segmentBlobs.push(new Blob(chunks.map(c => new Blob([c.data])), { type: sess.mimeType || 'video/webm' }));
+        }
+      }
+
+      let finalBlob;
+      if (segmentBlobs.length > 1) {
+        try {
+          finalBlob = await concatenateWebM(segmentBlobs);
+        } catch (stitchErr) {
+          console.warn('Stitch failed during recovery, saving last segment:', stitchErr);
+          finalBlob = segmentBlobs[segmentBlobs.length - 1];
+          showError('Could not stitch segments — saving the most recent one.');
+        }
+      } else {
+        finalBlob = segmentBlobs[0];
+      }
+
+      await saveFile(finalBlob);
+      for (const sess of sessions) {
+        await deleteSession(sess.id);
+      }
+    }
+
     document.getElementById('recoveryBanner').classList.remove('visible');
   } catch (err) {
     console.error('Recovery failed:', err);
@@ -1238,11 +1659,29 @@ async function recoverRecording() {
 
 async function discardRecovery() {
   try {
-    await deleteSession(window._recoverySessionId);
+    const sessions = window._recoverySessions || [{ id: window._recoverySessionId }];
+    for (const sess of sessions) {
+      await deleteSession(sess.id);
+    }
     document.getElementById('recoveryBanner').classList.remove('visible');
   } catch (err) {
     console.error('Discard failed:', err);
   }
+}
+
+async function continueRecording() {
+  // Preserve ALL interrupted sessions as prior segments — they'll be stitched when the new recording stops.
+  const sessions = window._recoverySessions || [{ id: window._recoverySessionId, mimeType: window._recoveryMimeType }];
+  for (const sess of sessions) {
+    state.priorSegments.push({
+      sessionId: sess.id,
+      mimeType: sess.mimeType || 'video/webm',
+    });
+  }
+
+  document.getElementById('recoveryBanner').classList.remove('visible');
+  const segCount = state.priorSegments.length;
+  updateStatus('idle', `${segCount} prior segment${segCount > 1 ? 's' : ''} preserved. Select a screen and click Record to continue.`);
 }
 
 // ============================================================
@@ -1297,7 +1736,12 @@ function resetUI() {
   document.getElementById('placeholder').classList.remove('hidden');
   updateToggleUI();
   updateRecordButton();
-  updateStatus('idle', 'Ready');
+  // Show segment indicator if continuing a recording
+  if (state.priorSegments.length > 0) {
+    updateStatus('idle', `${state.priorSegments.length} prior segment(s) preserved — select a screen and record to continue`);
+  } else {
+    updateStatus('idle', 'Ready');
+  }
   updateChunkCount(0);
   stopTimer();
 
