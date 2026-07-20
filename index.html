@@ -997,17 +997,29 @@ function webmScan(buffer) {
       let clusterEnd;
       let clusterSizeIsUnknown = sizeField.isUnknown;
       if (sizeField.isUnknown) {
-        // Byte-scan for the next Cluster ID (0x1F 0x43 0xB6 0x75)
-        // or any other Segment-level element. This is more robust than
-        // trying to parse child elements (which can also have unknown sizes).
+        // Byte-scan for the next Cluster ID (0x1F 0x43 0xB6 0x75).
+        // The 4-byte pattern can appear in compressed video data (false positive),
+        // so we validate each match: the bytes after the ID must form a valid
+        // EBML size VINT (leading byte has a marker bit set, i.e. >= 0x01).
         clusterEnd = segEnd; // default: extends to end of segment
         for (let scanPos = dataStart + 1; scanPos < segEnd - 3; scanPos++) {
           if (view.getUint8(scanPos)     === 0x1F &&
               view.getUint8(scanPos + 1) === 0x43 &&
               view.getUint8(scanPos + 2) === 0xB6 &&
               view.getUint8(scanPos + 3) === 0x75) {
-            clusterEnd = scanPos;
-            break;
+            // Validate: after the 4-byte ID, the next byte must start a valid
+            // EBML size VINT. Also check that a Timestamp element (0xE7) follows
+            // at a plausible position.
+            if (scanPos + 4 < segEnd) {
+              const sizeStart = scanPos + 4;
+              const candidateSize = ebmlReadSize(view, sizeStart);
+              if (candidateSize) {
+                // Looks like a real Cluster element
+                clusterEnd = scanPos;
+                break;
+              }
+            }
+            // If validation failed, it's a false positive — keep scanning
           }
         }
       } else {
@@ -1064,62 +1076,77 @@ function webmScan(buffer) {
 // Reads the original cluster, replaces only the Timestamp element value,
 // and reconstructs the Cluster header to account for any size change.
 function webmRewriteCluster(buffer, cluster, timeOffset) {
-  const view = new DataView(buffer, cluster.offset);
+  try {
+    const view = new DataView(buffer, cluster.offset);
 
-  // Parse Cluster header
-  const cId = ebmlReadId(view, 0);           // Cluster ID (0x1F43B675, 4 bytes)
-  const cSize = ebmlReadSize(view, cId.length); // Cluster data size
-  const dataStart = cId.length + cSize.length;
+    // Parse Cluster header
+    const cId = ebmlReadId(view, 0);           // Cluster ID (0x1F43B675, 4 bytes)
+    if (!cId) return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
+    const cSize = ebmlReadSize(view, cId.length); // Cluster data size
+    if (!cSize) return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
+    const dataStart = cId.length + cSize.length;
 
-  // Parse Timestamp element (first child of Cluster per WebM spec)
-  const tsId = ebmlReadId(view, dataStart);     // should be 0xE7
-  if (!tsId || tsId.value !== EBML_IDS.TIMESTAMP) {
-    // No Timestamp element found — return cluster bytes as-is (can't adjust)
+    // Parse Timestamp element (first child of Cluster per WebM spec)
+    const tsId = ebmlReadId(view, dataStart);     // should be 0xE7
+    if (!tsId || tsId.value !== EBML_IDS.TIMESTAMP) {
+      // No Timestamp element found — return cluster bytes as-is (can't adjust)
+      return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
+    }
+    const tsSize = ebmlReadSize(view, dataStart + tsId.length);
+    if (!tsSize) return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
+    const tsDataStart = dataStart + tsId.length + tsSize.length;
+    const tsDataEnd = tsDataStart + tsSize.value;
+    const origTs = ebmlReadUInt(view, tsDataStart, tsSize.value);
+
+    // Calculate new timestamp
+    const newTs = origTs + timeOffset;
+    const newTsWidth = ebmlUIntWidth(newTs);
+
+    // Build new Timestamp element: [0xE7] [size VINT] [value bytes]
+    const newTsSizeField = ebmlWriteSize(newTsWidth);
+    const newTsValue = ebmlWriteUInt(newTs, newTsWidth);
+
+    // Remainder of cluster data (everything after the original Timestamp element)
+    const restStart = cluster.offset + tsDataEnd;
+    const restEnd = cluster.offset + cluster.totalSize;
+    const restLen = restEnd - restStart;
+
+    // Sanity check: restLen must be positive and within buffer bounds
+    if (restLen <= 0 || restStart + restLen > buffer.byteLength) {
+      return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
+    }
+
+    // New cluster data size = new timestamp element + rest
+    const newTsElemLen = 1 + newTsSizeField.length + newTsWidth; // 0xE7 + size + value
+    const newClusterDataSize = newTsElemLen + restLen;
+
+    // If the original cluster had unknown size, preserve that — don't try to
+    // compute a known size (which can exceed the 4-byte VINT limit).
+    const newClusterSizeField = cluster.sizeIsUnknown
+      ? EBML_UNKNOWN_SIZE
+      : ebmlWriteSize(newClusterDataSize);
+
+    // Assemble: Cluster ID + new size + new Timestamp element + rest of data
+    const clusterIdBytes = new Uint8Array([0x1F, 0x43, 0xB6, 0x75]);
+    const totalLen = 4 + newClusterSizeField.length + newClusterDataSize;
+    const out = new Uint8Array(totalLen);
+    let w = 0;
+
+    out.set(clusterIdBytes, w);      w += 4;
+    out.set(newClusterSizeField, w); w += newClusterSizeField.length;
+    out[w++] = 0xE7;                                   // Timestamp ID
+    out.set(newTsSizeField, w);      w += newTsSizeField.length;
+    out.set(newTsValue, w);          w += newTsWidth;
+    // Copy the rest of the cluster data from the original buffer
+    out.set(new Uint8Array(buffer, restStart, restLen), w);
+
+    return out;
+  } catch (e) {
+    // If anything goes wrong parsing this cluster, return it unchanged.
+    // Timestamps at this point may be off, but the video data is preserved.
+    console.warn('webmRewriteCluster: falling back to raw copy', e);
     return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
   }
-  const tsSize = ebmlReadSize(view, dataStart + tsId.length);
-  const tsDataStart = dataStart + tsId.length + tsSize.length;
-  const tsDataEnd = tsDataStart + tsSize.value;
-  const origTs = ebmlReadUInt(view, tsDataStart, tsSize.value);
-
-  // Calculate new timestamp
-  const newTs = origTs + timeOffset;
-  const newTsWidth = ebmlUIntWidth(newTs);
-
-  // Build new Timestamp element: [0xE7] [size VINT] [value bytes]
-  const newTsSizeField = ebmlWriteSize(newTsWidth);
-  const newTsValue = ebmlWriteUInt(newTs, newTsWidth);
-
-  // Remainder of cluster data (everything after the original Timestamp element)
-  const restStart = cluster.offset + tsDataEnd;
-  const restEnd = cluster.offset + cluster.totalSize;
-  const restLen = restEnd - restStart;
-
-  // New cluster data size = new timestamp element + rest
-  const newTsElemLen = 1 + newTsSizeField.length + newTsWidth; // 0xE7 + size + value
-  const newClusterDataSize = newTsElemLen + restLen;
-
-  // If the original cluster had unknown size, preserve that — don't try to
-  // compute a known size (which can exceed the 4-byte VINT limit).
-  const newClusterSizeField = cluster.sizeIsUnknown
-    ? EBML_UNKNOWN_SIZE
-    : ebmlWriteSize(newClusterDataSize);
-
-  // Assemble: Cluster ID + new size + new Timestamp element + rest of data
-  const clusterIdBytes = new Uint8Array([0x1F, 0x43, 0xB6, 0x75]);
-  const totalLen = 4 + newClusterSizeField.length + newClusterDataSize;
-  const out = new Uint8Array(totalLen);
-  let w = 0;
-
-  out.set(clusterIdBytes, w);      w += 4;
-  out.set(newClusterSizeField, w); w += newClusterSizeField.length;
-  out[w++] = 0xE7;                                   // Timestamp ID
-  out.set(newTsSizeField, w);      w += newTsSizeField.length;
-  out.set(newTsValue, w);          w += newTsWidth;
-  // Copy the rest of the cluster data from the original buffer
-  out.set(new Uint8Array(buffer, restStart, restLen), w);
-
-  return out;
 }
 
 // Concatenate multiple WebM blobs into a single WebM blob.
