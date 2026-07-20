@@ -1011,17 +1011,24 @@ function startCompositing() {
         ctx.stroke();
         ctx.restore();
 
-        // Resize handle — small triangle in bottom-right corner (only during preview, not recording)
+        // Resize handle — corner grip in bottom-right (only during preview, not recording)
         if (!state.recording) {
           ctx.save();
+          const hs = Math.max(20, Math.round(pip.w * 0.1)); // 10% of PiP width, min 20px
+          const hx = pip.x + pip.w;
+          const hy = pip.y + pip.h;
+
+          // Two diagonal lines (grip pattern)
+          ctx.strokeStyle = 'rgba(255,255,255,0.8)';
+          ctx.lineWidth = Math.max(2, Math.round(pip.w * 0.01));
           ctx.beginPath();
-          const hs = 14; // handle size
-          ctx.moveTo(pip.x + pip.w, pip.y + pip.h);
-          ctx.lineTo(pip.x + pip.w - hs, pip.y + pip.h);
-          ctx.lineTo(pip.x + pip.w, pip.y + pip.h - hs);
-          ctx.closePath();
-          ctx.fillStyle = 'rgba(255,255,255,0.5)';
-          ctx.fill();
+          ctx.moveTo(hx - hs * 0.3, hy);
+          ctx.lineTo(hx, hy - hs * 0.3);
+          ctx.moveTo(hx - hs * 0.65, hy);
+          ctx.lineTo(hx, hy - hs * 0.65);
+          ctx.moveTo(hx - hs, hy);
+          ctx.lineTo(hx, hy - hs);
+          ctx.stroke();
           ctx.restore();
         }
       }

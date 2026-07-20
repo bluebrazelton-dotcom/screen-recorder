@@ -113,6 +113,61 @@ This is **remuxing, not re-encoding** — the actual compressed video/audio data
 
 ---
 
+### v1.3.1 — EBML stitching fix (2026-07-20)
+
+**Bug:** "EBML size too large" error when stitching recordings via Continue Recording.
+
+**Root cause:** Chrome's MediaRecorder writes Cluster elements with "unknown size" VINT markers (all value bits set). The `webmScan()` function tried to find unknown-size cluster boundaries by parsing child elements, but would fail when children also had unknown sizes or when parsing hit unexpected data. This caused the scanner to treat the rest of the file as one giant cluster. Then `webmRewriteCluster()` tried to write a known size for the combined data, which exceeded the 4-byte VINT limit (max ~268MB), triggering the error in `ebmlWriteSize()`.
+
+**Fixes (three changes):**
+
+1. **`ebmlWriteSize` fallback:** Instead of throwing when a value exceeds the 4-byte limit, fall back to the 8-byte "unknown size" VINT (`[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]`). WebM players handle unknown-size clusters correctly.
+
+2. **`webmScan` byte-scanning:** Replaced the fragile child-element parsing approach for finding unknown-size cluster boundaries with a simple byte-scan for the Cluster ID pattern (`0x1F 0x43 0xB6 0x75`). Also fixed a bug where timestamp wasn't read from unknown-size clusters (was inside an `if (!sizeField.isUnknown)` guard).
+
+3. **`webmRewriteCluster` size preservation:** Added `sizeIsUnknown` flag to cluster info. When the original cluster had unknown size, the rewriter now preserves that instead of computing a known size — preventing the too-large error entirely.
+
+---
+
+### v1.3.2 — Crash-recovery stitching fix (2026-07-20)
+
+**Bug:** "invalid or out-of-range index" error when stitching crash-recovered recordings.
+
+**Root cause:** When the browser closes mid-recording, the last chunk stored in IndexedDB is truncated (the browser died before finishing it). The EBML parser's `ebmlReadUInt()` function had no bounds checking, so it would try to read past the end of the truncated buffer, crashing with a RangeError. Additionally, `webmScan()` used `segEnd` (based on the Segment element's declared size) without clamping it to the actual buffer length, which could also cause out-of-bounds reads on truncated files.
+
+**Fixes:**
+
+1. **`ebmlReadUInt` bounds check:** Returns 0 instead of throwing when reading past the buffer end.
+2. **`safeEnd` clamping:** All element boundary calculations in `webmScan()` now use `Math.min(declaredEnd, buffer.byteLength)` to handle truncated files.
+3. **Per-segment scan failure tolerance:** `concatenateWebM()` wraps each `webmScan()` call in try-catch. If a corrupted segment can't be parsed, it falls back to including raw bytes rather than crashing the whole stitch.
+
+---
+
+### v1.4 — Webcam preview + draggable/resizable PiP (2026-07-20)
+
+**New features:**
+
+1. **Webcam preview before recording:** Toggling the Webcam button now immediately starts the camera and shows it on the canvas — no need to hit Record first. Works in both screen+camera and camera-only modes. The camera stream is reused when recording starts (no double-capture).
+
+2. **Draggable PiP window:** Click and drag the webcam overlay to reposition it anywhere on the preview canvas. Cursor changes to a grab hand when hovering over the PiP.
+
+3. **Resizable PiP window:** A grip pattern in the bottom-right corner of the PiP can be dragged to resize the webcam overlay. Clamped between 8% and 50% of canvas width. The grip only shows during preview and disappears during recording so it doesn't appear in the output.
+
+4. **Persistent layout:** PiP position and size are saved to `localStorage` as fractions of canvas dimensions. Survives page reloads, different screen resolutions, and recording sessions.
+
+**Architecture decisions:**
+
+- **Fractional coordinates:** PiP position (`xFrac`, `yFrac`) and size (`widthFrac`) are stored as fractions of canvas dimensions (0–1), not pixels. This means the layout adapts correctly when screen resolution changes or a different screen is selected.
+- **Mouse coordinate mapping:** Canvas display size differs from internal resolution. Mouse events are mapped using `(clientX - rect.left) * (canvas.width / rect.width)` to get accurate canvas-space coordinates.
+- **localStorage for persistence:** Chosen over IndexedDB because the data is tiny (3 numbers) and IndexedDB is already doing heavy lifting for crash-resilient chunk storage. localStorage is synchronous and simpler for this use case.
+- **Preview-only resize handle:** The grip lines are rendered in the `drawFrame()` loop but only when `!state.recording`. During recording, the canvas output is clean — the PiP is there but the handle isn't burned into the video.
+
+**New functions:** `startCameraPreview()`, `stopCameraPreview()`, `canvasCoords()`, `getPipRect()`, `isInPip()`, `isInResizeHandle()`, `savePipLayout()`, `endPipInteraction()`.
+
+**State addition:** `pipState` object with `xFrac`, `yFrac`, `widthFrac`, `dragging`, `resizing`, `dragOffsetX`, `dragOffsetY`.
+
+---
+
 ## Known limitations
 
 1. **Memory usage during stitching:** All segment blobs are loaded into memory for concatenation. For very long recordings (multiple hours), this could hit browser memory limits. Future improvement: stream-based stitching.
@@ -131,7 +186,7 @@ This is **remuxing, not re-encoding** — the actual compressed video/audio data
 
 ## Future features (roadmap)
 
-- **Webcam preview before recording** — show camera feed in canvas during the Select Screen / pre-record phase
+- ~~**Webcam preview before recording**~~ — ✓ Done in v1.4
 - **Screen switching mid-recording** — swap the screen source without stopping (browser picker interrupts briefly; produces black frames at the cut)
 - **Black frame removal** — detect and trim black frames at stitch points (requires WebCodecs decode or canvas analysis)
 - **mediabunny integration** — replace MediaRecorder with WebCodecs + mediabunny for MP4 output, streaming-to-disk, and proper Cues/seeking
@@ -145,7 +200,7 @@ This is **remuxing, not re-encoding** — the actual compressed video/audio data
 
 ```
 screen-recorder/
-├── index.html      # The entire app (HTML + CSS + JS, ~1500 lines)
+├── index.html      # The entire app (HTML + CSS + JS, ~2100 lines)
 ├── README.md       # Project description and usage
 ├── LICENSE         # MIT License
 └── BUILD_LOG.md    # This file
@@ -166,6 +221,7 @@ screen-recorder/
 - `IndexedDB` — crash-resilient chunk storage
 - `File System Access API` (`showSaveFilePicker`) — save to disk
 - `navigator.mediaDevices.enumerateDevices` — device selection
+- `localStorage` — PiP layout persistence
 
 **Development:** No build tools, no package manager, no transpilation. Edit the HTML file, push to GitHub, GitHub Pages deploys automatically.
 
