@@ -816,6 +816,146 @@ const cameraVideo = document.createElement('video');
 cameraVideo.muted = true;
 cameraVideo.playsInline = true;
 
+// ============================================================
+// PiP position and size (draggable + resizable)
+// ============================================================
+// Stored as fractions of canvas size (0–1) so they survive resolution changes.
+// Defaults: bottom-right corner, 20% of canvas width.
+const pipState = {
+  // Position is the PiP's top-left corner as a fraction of canvas size
+  xFrac: 0.78,    // ~(1 - 0.2 - margin)
+  yFrac: 0.72,
+  widthFrac: 0.2, // fraction of canvas width
+  dragging: false,
+  resizing: false,
+  dragOffsetX: 0,
+  dragOffsetY: 0,
+};
+
+// Load saved PiP layout from localStorage
+try {
+  const saved = localStorage.getItem('pipLayout');
+  if (saved) {
+    const parsed = JSON.parse(saved);
+    if (typeof parsed.xFrac === 'number') pipState.xFrac = parsed.xFrac;
+    if (typeof parsed.yFrac === 'number') pipState.yFrac = parsed.yFrac;
+    if (typeof parsed.widthFrac === 'number') pipState.widthFrac = Math.max(0.08, Math.min(0.5, parsed.widthFrac));
+  }
+} catch (e) { /* ignore */ }
+
+function savePipLayout() {
+  try {
+    localStorage.setItem('pipLayout', JSON.stringify({
+      xFrac: pipState.xFrac,
+      yFrac: pipState.yFrac,
+      widthFrac: pipState.widthFrac,
+    }));
+  } catch (e) { /* ignore */ }
+}
+
+// Convert mouse event to canvas-internal coordinates
+function canvasCoords(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - rect.left) * (canvas.width / rect.width),
+    y: (e.clientY - rect.top) * (canvas.height / rect.height),
+  };
+}
+
+// Get the current PiP rectangle in canvas pixels
+function getPipRect() {
+  const w = Math.round(canvas.width * pipState.widthFrac);
+  const aspect = cameraVideo.videoHeight / cameraVideo.videoWidth || 0.75;
+  const h = Math.round(w * aspect);
+  const x = Math.round(canvas.width * pipState.xFrac);
+  const y = Math.round(canvas.height * pipState.yFrac);
+  return { x, y, w, h };
+}
+
+// Resize handle: bottom-right corner of PiP, 18×18 px hit area
+function isInResizeHandle(mx, my) {
+  const r = getPipRect();
+  const handleSize = 18;
+  return mx >= r.x + r.w - handleSize && mx <= r.x + r.w &&
+         my >= r.y + r.h - handleSize && my <= r.y + r.h;
+}
+
+function isInPip(mx, my) {
+  const r = getPipRect();
+  return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  if (!state.cameraStream || !state.sources.screen) return;
+  const { x, y } = canvasCoords(e);
+
+  if (isInResizeHandle(x, y)) {
+    pipState.resizing = true;
+    canvas.style.cursor = 'nwse-resize';
+    e.preventDefault();
+  } else if (isInPip(x, y)) {
+    pipState.dragging = true;
+    const r = getPipRect();
+    pipState.dragOffsetX = x - r.x;
+    pipState.dragOffsetY = y - r.y;
+    canvas.style.cursor = 'grabbing';
+    e.preventDefault();
+  }
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  if (!state.cameraStream || !state.sources.screen) {
+    canvas.style.cursor = '';
+    return;
+  }
+  const { x, y } = canvasCoords(e);
+
+  if (pipState.dragging) {
+    // Move PiP, clamping to canvas bounds
+    const r = getPipRect();
+    let newX = x - pipState.dragOffsetX;
+    let newY = y - pipState.dragOffsetY;
+    newX = Math.max(0, Math.min(canvas.width - r.w, newX));
+    newY = Math.max(0, Math.min(canvas.height - r.h, newY));
+    pipState.xFrac = newX / canvas.width;
+    pipState.yFrac = newY / canvas.height;
+  } else if (pipState.resizing) {
+    // Resize PiP: new width = mouse X - PiP left edge
+    const r = getPipRect();
+    let newW = x - r.x;
+    newW = Math.max(canvas.width * 0.08, Math.min(canvas.width * 0.5, newW));
+    pipState.widthFrac = newW / canvas.width;
+    // Keep top-left corner fixed; recalc bottom based on new height
+    const aspect = cameraVideo.videoHeight / cameraVideo.videoWidth || 0.75;
+    const newH = newW * aspect;
+    // Clamp if it goes off the bottom
+    if (r.y + newH > canvas.height) {
+      pipState.yFrac = (canvas.height - newH) / canvas.height;
+    }
+  } else {
+    // Update cursor
+    if (isInResizeHandle(x, y)) {
+      canvas.style.cursor = 'nwse-resize';
+    } else if (isInPip(x, y)) {
+      canvas.style.cursor = 'grab';
+    } else {
+      canvas.style.cursor = '';
+    }
+  }
+});
+
+function endPipInteraction() {
+  if (pipState.dragging || pipState.resizing) {
+    pipState.dragging = false;
+    pipState.resizing = false;
+    canvas.style.cursor = '';
+    savePipLayout();
+  }
+}
+
+canvas.addEventListener('mouseup', endPipInteraction);
+canvas.addEventListener('mouseleave', endPipInteraction);
+
 function startCompositing() {
   // Set canvas to match screen resolution
   const screenTrack = state.screenStream?.getVideoTracks()[0];
@@ -845,35 +985,45 @@ function startCompositing() {
         // Camera-only mode: draw full canvas, no clip
         ctx.drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
       } else {
-        // PiP overlay (bottom-right, ~1/5 of canvas width)
-        const pipWidth = Math.round(canvas.width * 0.2);
-        const pipHeight = Math.round(pipWidth * (cameraVideo.videoHeight / cameraVideo.videoWidth || 0.75));
-        const margin = 20;
-        const x = canvas.width - pipWidth - margin;
-        const y = canvas.height - pipHeight - margin;
+        // PiP overlay — position and size from pipState (draggable/resizable)
+        const pip = getPipRect();
 
         // Rounded rectangle clip
         const radius = 12;
         ctx.save();
         ctx.beginPath();
-        ctx.moveTo(x + radius, y);
-        ctx.lineTo(x + pipWidth - radius, y);
-        ctx.quadraticCurveTo(x + pipWidth, y, x + pipWidth, y + radius);
-        ctx.lineTo(x + pipWidth, y + pipHeight - radius);
-        ctx.quadraticCurveTo(x + pipWidth, y + pipHeight, x + pipWidth - radius, y + pipHeight);
-        ctx.lineTo(x + radius, y + pipHeight);
-        ctx.quadraticCurveTo(x, y + pipHeight, x, y + pipHeight - radius);
-        ctx.lineTo(x, y + radius);
-        ctx.quadraticCurveTo(x, y, x + radius, y);
+        ctx.moveTo(pip.x + radius, pip.y);
+        ctx.lineTo(pip.x + pip.w - radius, pip.y);
+        ctx.quadraticCurveTo(pip.x + pip.w, pip.y, pip.x + pip.w, pip.y + radius);
+        ctx.lineTo(pip.x + pip.w, pip.y + pip.h - radius);
+        ctx.quadraticCurveTo(pip.x + pip.w, pip.y + pip.h, pip.x + pip.w - radius, pip.y + pip.h);
+        ctx.lineTo(pip.x + radius, pip.y + pip.h);
+        ctx.quadraticCurveTo(pip.x, pip.y + pip.h, pip.x, pip.y + pip.h - radius);
+        ctx.lineTo(pip.x, pip.y + radius);
+        ctx.quadraticCurveTo(pip.x, pip.y, pip.x + radius, pip.y);
         ctx.closePath();
         ctx.clip();
-        ctx.drawImage(cameraVideo, x, y, pipWidth, pipHeight);
+        ctx.drawImage(cameraVideo, pip.x, pip.y, pip.w, pip.h);
 
         // Border
         ctx.strokeStyle = 'rgba(255,255,255,0.3)';
         ctx.lineWidth = 2;
         ctx.stroke();
         ctx.restore();
+
+        // Resize handle — small triangle in bottom-right corner (only during preview, not recording)
+        if (!state.recording) {
+          ctx.save();
+          ctx.beginPath();
+          const hs = 14; // handle size
+          ctx.moveTo(pip.x + pip.w, pip.y + pip.h);
+          ctx.lineTo(pip.x + pip.w - hs, pip.y + pip.h);
+          ctx.lineTo(pip.x + pip.w, pip.y + pip.h - hs);
+          ctx.closePath();
+          ctx.fillStyle = 'rgba(255,255,255,0.5)';
+          ctx.fill();
+          ctx.restore();
+        }
       }
     }
 
