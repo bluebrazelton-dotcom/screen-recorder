@@ -411,6 +411,11 @@
         <select class="device-select" id="cameraSelect" onchange="onDeviceSelected('camera')">
           <option value="">Default camera</option>
         </select>
+        <select class="device-select" id="pipShapeSelect" onchange="onPipShapeChanged()">
+          <option value="rectangle">Rectangle</option>
+          <option value="square">Square</option>
+          <option value="circle">Circle</option>
+        </select>
       </div>
       <div class="source-group">
         <button class="toggle-btn active" id="toggleMic" onclick="toggleSource('mic')">
@@ -698,6 +703,7 @@ function updateToggleUI() {
   document.getElementById('toggleCamera').disabled = disabled;
   document.getElementById('toggleMic').disabled = disabled;
   document.getElementById('cameraSelect').disabled = disabled || !state.sources.camera;
+  document.getElementById('pipShapeSelect').disabled = disabled || !state.sources.camera;
   document.getElementById('micSelect').disabled = disabled || !state.sources.mic;
 }
 
@@ -755,6 +761,11 @@ function onDeviceSelected(type) {
   } else if (type === 'mic') {
     state.selectedMic = document.getElementById('micSelect').value;
   }
+}
+
+function onPipShapeChanged() {
+  pipState.shape = document.getElementById('pipShapeSelect').value;
+  savePipLayout();
 }
 
 // Re-enumerate when devices change (plugging in a USB mic, etc.)
@@ -826,6 +837,7 @@ const pipState = {
   xFrac: 0.78,    // ~(1 - 0.2 - margin)
   yFrac: 0.72,
   widthFrac: 0.2, // fraction of canvas width
+  shape: 'rectangle', // 'rectangle', 'square', or 'circle'
   dragging: false,
   resizing: false,
   dragOffsetX: 0,
@@ -840,6 +852,7 @@ try {
     if (typeof parsed.xFrac === 'number') pipState.xFrac = parsed.xFrac;
     if (typeof parsed.yFrac === 'number') pipState.yFrac = parsed.yFrac;
     if (typeof parsed.widthFrac === 'number') pipState.widthFrac = Math.max(0.08, Math.min(0.5, parsed.widthFrac));
+    if (['rectangle', 'square', 'circle'].includes(parsed.shape)) pipState.shape = parsed.shape;
   }
 } catch (e) { /* ignore */ }
 
@@ -849,6 +862,7 @@ function savePipLayout() {
       xFrac: pipState.xFrac,
       yFrac: pipState.yFrac,
       widthFrac: pipState.widthFrac,
+      shape: pipState.shape,
     }));
   } catch (e) { /* ignore */ }
 }
@@ -865,8 +879,13 @@ function canvasCoords(e) {
 // Get the current PiP rectangle in canvas pixels
 function getPipRect() {
   const w = Math.round(canvas.width * pipState.widthFrac);
-  const aspect = cameraVideo.videoHeight / cameraVideo.videoWidth || 0.75;
-  const h = Math.round(w * aspect);
+  let h;
+  if (pipState.shape === 'square' || pipState.shape === 'circle') {
+    h = w; // 1:1 aspect ratio
+  } else {
+    const aspect = cameraVideo.videoHeight / cameraVideo.videoWidth || 0.75;
+    h = Math.round(w * aspect);
+  }
   const x = Math.round(canvas.width * pipState.xFrac);
   const y = Math.round(canvas.height * pipState.yFrac);
   return { x, y, w, h };
@@ -882,6 +901,14 @@ function isInResizeHandle(mx, my) {
 
 function isInPip(mx, my) {
   const r = getPipRect();
+  if (pipState.shape === 'circle') {
+    // Point-in-circle test
+    const cx = r.x + r.w / 2;
+    const cy = r.y + r.h / 2;
+    const dx = mx - cx;
+    const dy = my - cy;
+    return (dx * dx + dy * dy) <= (r.w / 2) * (r.w / 2);
+  }
   return mx >= r.x && mx <= r.x + r.w && my >= r.y && my <= r.y + r.h;
 }
 
@@ -988,22 +1015,47 @@ function startCompositing() {
         // PiP overlay — position and size from pipState (draggable/resizable)
         const pip = getPipRect();
 
-        // Rounded rectangle clip
-        const radius = 12;
         ctx.save();
         ctx.beginPath();
-        ctx.moveTo(pip.x + radius, pip.y);
-        ctx.lineTo(pip.x + pip.w - radius, pip.y);
-        ctx.quadraticCurveTo(pip.x + pip.w, pip.y, pip.x + pip.w, pip.y + radius);
-        ctx.lineTo(pip.x + pip.w, pip.y + pip.h - radius);
-        ctx.quadraticCurveTo(pip.x + pip.w, pip.y + pip.h, pip.x + pip.w - radius, pip.y + pip.h);
-        ctx.lineTo(pip.x + radius, pip.y + pip.h);
-        ctx.quadraticCurveTo(pip.x, pip.y + pip.h, pip.x, pip.y + pip.h - radius);
-        ctx.lineTo(pip.x, pip.y + radius);
-        ctx.quadraticCurveTo(pip.x, pip.y, pip.x + radius, pip.y);
+
+        if (pipState.shape === 'circle') {
+          // Circle clip — centered in the pip bounding box
+          const cx = pip.x + pip.w / 2;
+          const cy = pip.y + pip.h / 2;
+          const r = pip.w / 2;
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        } else if (pipState.shape === 'square') {
+          // Square — sharp corners
+          ctx.rect(pip.x, pip.y, pip.w, pip.h);
+        } else {
+          // Rectangle — rounded corners
+          const radius = 12;
+          ctx.moveTo(pip.x + radius, pip.y);
+          ctx.lineTo(pip.x + pip.w - radius, pip.y);
+          ctx.quadraticCurveTo(pip.x + pip.w, pip.y, pip.x + pip.w, pip.y + radius);
+          ctx.lineTo(pip.x + pip.w, pip.y + pip.h - radius);
+          ctx.quadraticCurveTo(pip.x + pip.w, pip.y + pip.h, pip.x + pip.w - radius, pip.y + pip.h);
+          ctx.lineTo(pip.x + radius, pip.y + pip.h);
+          ctx.quadraticCurveTo(pip.x, pip.y + pip.h, pip.x, pip.y + pip.h - radius);
+          ctx.lineTo(pip.x, pip.y + radius);
+          ctx.quadraticCurveTo(pip.x, pip.y, pip.x + radius, pip.y);
+        }
+
         ctx.closePath();
         ctx.clip();
-        ctx.drawImage(cameraVideo, pip.x, pip.y, pip.w, pip.h);
+
+        // For square and circle, center-crop the camera feed to fill 1:1
+        if (pipState.shape === 'square' || pipState.shape === 'circle') {
+          const vw = cameraVideo.videoWidth || 1;
+          const vh = cameraVideo.videoHeight || 1;
+          // Crop the narrower dimension to make a square source region
+          const cropSize = Math.min(vw, vh);
+          const sx = (vw - cropSize) / 2;
+          const sy = (vh - cropSize) / 2;
+          ctx.drawImage(cameraVideo, sx, sy, cropSize, cropSize, pip.x, pip.y, pip.w, pip.h);
+        } else {
+          ctx.drawImage(cameraVideo, pip.x, pip.y, pip.w, pip.h);
+        }
 
         // Border
         ctx.strokeStyle = 'rgba(255,255,255,0.3)';
@@ -1018,7 +1070,7 @@ function startCompositing() {
           const hx = pip.x + pip.w;
           const hy = pip.y + pip.h;
 
-          // Two diagonal lines (grip pattern)
+          // Three diagonal lines (grip pattern)
           ctx.strokeStyle = 'rgba(255,255,255,0.8)';
           ctx.lineWidth = Math.max(2, Math.round(pip.w * 0.01));
           ctx.beginPath();
@@ -2079,6 +2131,9 @@ function updateTimerDisplay() {
 window.addEventListener('load', () => {
   checkForRecovery();
   enumerateDevices();
+
+  // Restore saved PiP shape in the dropdown
+  document.getElementById('pipShapeSelect').value = pipState.shape;
 
   // Feature detection
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
