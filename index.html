@@ -926,8 +926,13 @@ function ebmlWriteSize(value) {
   if (value <= 0x3FFE)     return new Uint8Array([0x40 | (value >> 8), value & 0xFF]);
   if (value <= 0x1FFFFE)   return new Uint8Array([0x20 | (value >> 16), (value >> 8) & 0xFF, value & 0xFF]);
   if (value <= 0x0FFFFFFE) return new Uint8Array([0x10 | (value >> 24), (value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF]);
-  throw new Error('EBML size too large');
+  // Value too large for 4-byte VINT — use "unknown size" (all-ones).
+  // WebM players handle unknown-size clusters correctly.
+  return new Uint8Array([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
 }
+
+// Convenience: the 8-byte "unknown size" VINT used by MediaRecorder
+const EBML_UNKNOWN_SIZE = new Uint8Array([0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
 
 // Write an unsigned integer into `size` bytes
 function ebmlWriteUInt(value, size) {
@@ -982,39 +987,28 @@ function webmScan(buffer) {
     if (elemId.value === EBML_IDS.CLUSTER) {
       // Parse Cluster's Timestamp child (always the first child element)
       let clusterTs = 0;
-      if (!sizeField.isUnknown) {
-        const tsId = ebmlReadId(view, dataStart);
-        if (tsId && tsId.value === EBML_IDS.TIMESTAMP) {
-          const tsSize = ebmlReadSize(view, dataStart + tsId.length);
-          clusterTs = ebmlReadUInt(view, dataStart + tsId.length + tsSize.length, tsSize.value);
-        }
+      const tsId = ebmlReadId(view, dataStart);
+      if (tsId && tsId.value === EBML_IDS.TIMESTAMP) {
+        const tsSize = ebmlReadSize(view, dataStart + tsId.length);
+        clusterTs = ebmlReadUInt(view, dataStart + tsId.length + tsSize.length, tsSize.value);
       }
 
-      // For unknown-size clusters, scan forward for the next top-level element
+      // Determine where this cluster ends
       let clusterEnd;
+      let clusterSizeIsUnknown = sizeField.isUnknown;
       if (sizeField.isUnknown) {
-        clusterEnd = segEnd; // default: extends to end
-        let scanPos = dataStart;
-        // Skip past the Timestamp element
-        const tsId = ebmlReadId(view, scanPos);
-        if (tsId && tsId.value === EBML_IDS.TIMESTAMP) {
-          const tsSize = ebmlReadSize(view, scanPos + tsId.length);
-          scanPos = scanPos + tsId.length + tsSize.length + tsSize.value;
-        }
-        // Scan for next Cluster or Segment-level element
-        while (scanPos < segEnd) {
-          const nextId = ebmlReadId(view, scanPos);
-          if (!nextId) break;
-          // Check if this is a Segment-level element (Cluster, Info, Tracks, Cues, etc.)
-          if (nextId.value === EBML_IDS.CLUSTER || nextId.value === EBML_IDS.INFO ||
-              nextId.value === EBML_IDS.TRACKS) {
+        // Byte-scan for the next Cluster ID (0x1F 0x43 0xB6 0x75)
+        // or any other Segment-level element. This is more robust than
+        // trying to parse child elements (which can also have unknown sizes).
+        clusterEnd = segEnd; // default: extends to end of segment
+        for (let scanPos = dataStart + 1; scanPos < segEnd - 3; scanPos++) {
+          if (view.getUint8(scanPos)     === 0x1F &&
+              view.getUint8(scanPos + 1) === 0x43 &&
+              view.getUint8(scanPos + 2) === 0xB6 &&
+              view.getUint8(scanPos + 3) === 0x75) {
             clusterEnd = scanPos;
             break;
           }
-          // Otherwise it's a Cluster child — skip it
-          const childSize = ebmlReadSize(view, scanPos + nextId.length);
-          if (!childSize || childSize.isUnknown) break;
-          scanPos = scanPos + nextId.length + childSize.length + childSize.value;
         }
       } else {
         clusterEnd = dataStart + sizeField.value;
@@ -1024,6 +1018,7 @@ function webmScan(buffer) {
         offset: pos,
         totalSize: clusterEnd - pos,
         timestamp: clusterTs,
+        sizeIsUnknown: clusterSizeIsUnknown,
       });
       info.lastTimestamp = Math.max(info.lastTimestamp, clusterTs);
       pos = clusterEnd;
@@ -1103,7 +1098,12 @@ function webmRewriteCluster(buffer, cluster, timeOffset) {
   // New cluster data size = new timestamp element + rest
   const newTsElemLen = 1 + newTsSizeField.length + newTsWidth; // 0xE7 + size + value
   const newClusterDataSize = newTsElemLen + restLen;
-  const newClusterSizeField = ebmlWriteSize(newClusterDataSize);
+
+  // If the original cluster had unknown size, preserve that — don't try to
+  // compute a known size (which can exceed the 4-byte VINT limit).
+  const newClusterSizeField = cluster.sizeIsUnknown
+    ? EBML_UNKNOWN_SIZE
+    : ebmlWriteSize(newClusterDataSize);
 
   // Assemble: Cluster ID + new size + new Timestamp element + rest of data
   const clusterIdBytes = new Uint8Array([0x1F, 0x43, 0xB6, 0x75]);
