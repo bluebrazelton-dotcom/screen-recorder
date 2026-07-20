@@ -190,6 +190,50 @@
 
   .toggle-btn svg { width: 16px; height: 16px; }
 
+  /* Source groups: toggle + device selector stacked */
+  .source-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .device-select {
+    width: 100%;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-dim);
+    font-size: 0.7rem;
+    cursor: pointer;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%238892a4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.4rem center;
+    padding-right: 1.4rem;
+    text-overflow: ellipsis;
+    max-width: 160px;
+  }
+
+  .device-select:focus {
+    outline: none;
+    border-color: var(--green-dim);
+  }
+
+  .device-select:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .screen-hint {
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    opacity: 0.7;
+    padding: 0.15rem 0.5rem;
+    max-width: 160px;
+  }
+
   .action-btns {
     display: flex;
     gap: 0.5rem;
@@ -332,24 +376,37 @@
   <!-- Controls -->
   <div class="controls">
     <div class="source-toggles">
-      <button class="toggle-btn active" id="toggleScreen" onclick="toggleSource('screen')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
-        </svg>
-        Screen
-      </button>
-      <button class="toggle-btn active" id="toggleCamera" onclick="toggleSource('camera')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <circle cx="12" cy="13" r="3"/><path d="M17 6.33h2.72a2 2 0 012 2v9.34a2 2 0 01-2 2H4.28a2 2 0 01-2-2V8.33a2 2 0 012-2H7l1.04-2.1A1 1 0 019 3.67h6a1 1 0 01.9.56L17 6.33z"/>
-        </svg>
-        Webcam
-      </button>
-      <button class="toggle-btn active" id="toggleMic" onclick="toggleSource('mic')">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <rect x="9" y="1" width="6" height="11" rx="3"/><path d="M19 10a7 7 0 01-14 0M12 18v4M8 22h8"/>
-        </svg>
-        Mic
-      </button>
+      <div class="source-group">
+        <button class="toggle-btn active" id="toggleScreen" onclick="toggleSource('screen')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
+          </svg>
+          Screen
+        </button>
+        <span class="screen-hint">Browser picks the source</span>
+      </div>
+      <div class="source-group">
+        <button class="toggle-btn active" id="toggleCamera" onclick="toggleSource('camera')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="13" r="3"/><path d="M17 6.33h2.72a2 2 0 012 2v9.34a2 2 0 01-2 2H4.28a2 2 0 01-2-2V8.33a2 2 0 012-2H7l1.04-2.1A1 1 0 019 3.67h6a1 1 0 01.9.56L17 6.33z"/>
+          </svg>
+          Webcam
+        </button>
+        <select class="device-select" id="cameraSelect" onchange="onDeviceSelected('camera')">
+          <option value="">Default camera</option>
+        </select>
+      </div>
+      <div class="source-group">
+        <button class="toggle-btn active" id="toggleMic" onclick="toggleSource('mic')">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="9" y="1" width="6" height="11" rx="3"/><path d="M19 10a7 7 0 01-14 0M12 18v4M8 22h8"/>
+          </svg>
+          Mic
+        </button>
+        <select class="device-select" id="micSelect" onchange="onDeviceSelected('mic')">
+          <option value="">Default microphone</option>
+        </select>
+      </div>
     </div>
     <div class="action-btns">
       <button class="primary btn-pause" id="btnPause" onclick="pauseResume()" style="display:none;">Pause</button>
@@ -360,7 +417,8 @@
 </main>
 
 <footer>
-  Open source &middot; MIT License &middot; No account, no server, no watermark, no time limits
+  <div>When you click Record, your browser will ask which screen, window, or tab you'd like to share. This is a browser security step — the app cannot bypass it.</div>
+  <div style="margin-top: 0.5rem;">Open source &middot; MIT License &middot; No account, no server, no watermark, no time limits</div>
 </footer>
 
 <script>
@@ -369,6 +427,8 @@
 // ============================================================
 const state = {
   sources: { screen: true, camera: true, mic: true },
+  selectedCamera: '',  // deviceId, empty = default
+  selectedMic: '',     // deviceId, empty = default
   recording: false,
   paused: false,
   mediaRecorder: null,
@@ -545,11 +605,74 @@ function updateToggleUI() {
   document.getElementById('toggleScreen').classList.toggle('active', state.sources.screen);
   document.getElementById('toggleCamera').classList.toggle('active', state.sources.camera);
   document.getElementById('toggleMic').classList.toggle('active', state.sources.mic);
-  // Disable toggles during recording
+  // Disable toggles and selectors during recording
   const disabled = state.recording;
   document.getElementById('toggleScreen').disabled = disabled;
   document.getElementById('toggleCamera').disabled = disabled;
   document.getElementById('toggleMic').disabled = disabled;
+  document.getElementById('cameraSelect').disabled = disabled || !state.sources.camera;
+  document.getElementById('micSelect').disabled = disabled || !state.sources.mic;
+}
+
+// ============================================================
+// Device enumeration
+// ============================================================
+async function enumerateDevices() {
+  try {
+    // Request a brief permission so labels are visible (Chrome hides labels until granted)
+    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).catch(() => null);
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+
+    // Release the temp stream immediately
+    if (tempStream) tempStream.getTracks().forEach(t => t.stop());
+
+    const cameras = devices.filter(d => d.kind === 'videoinput');
+    const mics = devices.filter(d => d.kind === 'audioinput');
+
+    // Populate camera dropdown
+    const camSelect = document.getElementById('cameraSelect');
+    camSelect.innerHTML = '<option value="">Default camera</option>';
+    cameras.forEach((cam, i) => {
+      const opt = document.createElement('option');
+      opt.value = cam.deviceId;
+      opt.textContent = cam.label || `Camera ${i + 1}`;
+      camSelect.appendChild(opt);
+    });
+
+    // Populate mic dropdown
+    const micSelect = document.getElementById('micSelect');
+    micSelect.innerHTML = '<option value="">Default microphone</option>';
+    mics.forEach((mic, i) => {
+      const opt = document.createElement('option');
+      opt.value = mic.deviceId;
+      opt.textContent = mic.label || `Microphone ${i + 1}`;
+      micSelect.appendChild(opt);
+    });
+
+    // Restore previous selections if still available
+    if (state.selectedCamera && camSelect.querySelector(`option[value="${state.selectedCamera}"]`)) {
+      camSelect.value = state.selectedCamera;
+    }
+    if (state.selectedMic && micSelect.querySelector(`option[value="${state.selectedMic}"]`)) {
+      micSelect.value = state.selectedMic;
+    }
+  } catch (err) {
+    console.warn('Could not enumerate devices:', err);
+  }
+}
+
+function onDeviceSelected(type) {
+  if (type === 'camera') {
+    state.selectedCamera = document.getElementById('cameraSelect').value;
+  } else if (type === 'mic') {
+    state.selectedMic = document.getElementById('micSelect').value;
+  }
+}
+
+// Re-enumerate when devices change (plugging in a USB mic, etc.)
+if (navigator.mediaDevices?.addEventListener) {
+  navigator.mediaDevices.addEventListener('devicechange', enumerateDevices);
 }
 
 // ============================================================
@@ -563,15 +686,30 @@ async function captureScreen() {
 }
 
 async function captureCamera() {
-  return navigator.mediaDevices.getUserMedia({
-    video: { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 30 } },
+  const constraints = {
+    video: {
+      width: { ideal: 320 },
+      height: { ideal: 240 },
+      frameRate: { ideal: 30 },
+    },
     audio: false,
-  });
+  };
+  if (state.selectedCamera) {
+    constraints.video.deviceId = { exact: state.selectedCamera };
+  }
+  return navigator.mediaDevices.getUserMedia(constraints);
 }
 
 async function captureMic() {
+  const audioConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+  };
+  if (state.selectedMic) {
+    audioConstraints.deviceId = { exact: state.selectedMic };
+  }
   return navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true },
+    audio: audioConstraints,
     video: false,
   });
 }
@@ -1104,6 +1242,7 @@ function updateTimerDisplay() {
 // ============================================================
 window.addEventListener('load', () => {
   checkForRecovery();
+  enumerateDevices();
 
   // Feature detection
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
