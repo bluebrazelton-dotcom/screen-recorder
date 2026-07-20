@@ -636,6 +636,56 @@ function toggleSource(source) {
       btnSelect.textContent = 'Select Screen';
     }
   }
+
+  // Start or stop camera preview immediately
+  if (source === 'camera') {
+    if (state.sources.camera) {
+      startCameraPreview();
+    } else {
+      stopCameraPreview();
+    }
+  }
+}
+
+// Start the webcam and show it on the canvas immediately (for preview before recording)
+async function startCameraPreview() {
+  try {
+    if (state.cameraStream) return; // already running
+    state.cameraStream = await captureCamera();
+    cameraVideo.srcObject = state.cameraStream;
+    await cameraVideo.play();
+
+    // If screen is selected or camera-only, restart compositing to show the feed
+    if (state.screenStream || !state.sources.screen) {
+      stopCompositing();
+      startCompositing();
+      if (!state.sources.screen) {
+        document.getElementById('placeholder').classList.add('hidden');
+      }
+    }
+  } catch (err) {
+    console.error('Camera preview failed:', err);
+    showError('Could not start camera: ' + err.message);
+  }
+}
+
+// Stop the webcam preview (when toggling camera off before recording)
+function stopCameraPreview() {
+  if (state.cameraStream) {
+    state.cameraStream.getTracks().forEach(t => t.stop());
+    state.cameraStream = null;
+    cameraVideo.srcObject = null;
+  }
+  // Restart compositing without camera (screen-only), or hide canvas if nothing is showing
+  if (state.screenStream) {
+    stopCompositing();
+    startCompositing();
+  } else {
+    stopCompositing();
+    if (!state.sources.screen) {
+      document.getElementById('placeholder').classList.remove('hidden');
+    }
+  }
 }
 
 function updateToggleUI() {
@@ -1237,7 +1287,18 @@ async function selectScreen() {
       }
     });
 
-    // Start preview compositing
+    // Start camera preview too if webcam is toggled on
+    if (state.sources.camera && !state.cameraStream) {
+      try {
+        state.cameraStream = await captureCamera();
+        cameraVideo.srcObject = state.cameraStream;
+        await cameraVideo.play();
+      } catch (camErr) {
+        console.warn('Camera preview failed during screen select:', camErr);
+      }
+    }
+
+    // Start preview compositing (includes camera PiP if running)
     startCompositing();
     document.getElementById('placeholder').classList.add('hidden');
 
@@ -1292,13 +1353,14 @@ async function startRecording() {
       return;
     }
 
-    if (state.sources.camera) {
+    if (state.sources.camera && !state.cameraStream) {
+      // Camera wasn't started during preview — start it now
       state.cameraStream = await captureCamera();
       cameraVideo.srcObject = state.cameraStream;
       await cameraVideo.play();
     }
 
-    // Restart compositing to include camera
+    // Restart compositing to ensure recording captures the current layout
     stopCompositing();
     startCompositing();
 
