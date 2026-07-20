@@ -1,4 +1,4 @@
-# Screen Recorder — Build Log
+# DidaRec — Build Log
 
 *For handoff to future agents (Fable 5 review, etc.). Documents every version, decision, bug, and architectural choice.*
 
@@ -6,7 +6,7 @@
 
 ## Project overview
 
-A free, open-source, browser-based screen recorder for faculty. Single HTML file, zero dependencies (v1). Crash-resilient by design: every second of recording is saved to disk as it happens via IndexedDB. If the browser crashes, the recording survives.
+**DidaRec** — a free, open-source, browser-based screen recorder, part of the **DidaWorks** productivity suite. Built for faculty. Single HTML file, zero dependencies (v1). Crash-resilient by design: every second of recording is saved to disk as it happens via IndexedDB. If the browser crashes, the recording survives.
 
 **Repo:** github.com/bluebrazelton-dotcom/screen-recorder
 **License:** MIT
@@ -168,6 +168,24 @@ This is **remuxing, not re-encoding** — the actual compressed video/audio data
 
 ---
 
+### v1.5 — PiP shape selector + branding (2026-07-20)
+
+**New feature:** Webcam shape selector dropdown under the Webcam toggle with three options:
+
+1. **Rectangle** — natural camera aspect ratio with rounded corners (default, same as before)
+2. **Square** — 1:1 crop with sharp corners
+3. **Circle** — 1:1 crop clipped to a perfect circle
+
+For square and circle shapes, the camera feed is center-cropped to 1:1 using `drawImage`'s source-rectangle parameters (`sx`, `sy`, `cropSize`) so the face stays centered rather than getting stretched. The circle uses a `ctx.arc()` clip path; the square uses `ctx.rect()`.
+
+Shape selection is saved to localStorage alongside position and size. The dropdown is disabled during recording and when the webcam is toggled off.
+
+**Hit detection:** `isInPip()` updated with a point-in-circle test for the circle shape (distance from center ≤ radius).
+
+**Branding:** Project renamed from "Screen Recorder" to **DidaRec**, part of the **DidaWorks** productivity suite. Updated page title, header, footer, README, and build log.
+
+---
+
 ## Known limitations
 
 1. **Memory usage during stitching:** All segment blobs are loaded into memory for concatenation. For very long recordings (multiple hours), this could hit browser memory limits. Future improvement: stream-based stitching.
@@ -192,7 +210,7 @@ This is **remuxing, not re-encoding** — the actual compressed video/audio data
 - **mediabunny integration** — replace MediaRecorder with WebCodecs + mediabunny for MP4 output, streaming-to-disk, and proper Cues/seeking
 - **Trimming** — basic start/end trim before saving
 - **Two-step tool** — separate lightweight video editor page for stitching, trimming, and cleanup (keeps the recorder simple)
-- **Project name** — still using "screen-recorder" as working name; final name deferred
+- ~~**Project name**~~ — ✓ Named **DidaRec** (part of DidaWorks) in v1.5
 
 ---
 
