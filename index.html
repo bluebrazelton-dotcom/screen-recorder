@@ -915,6 +915,7 @@ function ebmlReadSize(view, pos) {
 
 // Read an unsigned integer of `size` bytes from a DataView
 function ebmlReadUInt(view, pos, size) {
+  if (pos + size > view.byteLength) return 0; // truncated data — return 0 rather than throwing
   let val = 0;
   for (let i = 0; i < size; i++) val = val * 256 + view.getUint8(pos + i);
   return val;
@@ -976,8 +977,11 @@ function webmScan(buffer) {
   pos += segSize.length;
   const segEnd = segSize.isUnknown ? buffer.byteLength : pos + segSize.value;
 
+  // Clamp segEnd to actual buffer length (handles truncated files from crashes)
+  const safeEnd = Math.min(segEnd, buffer.byteLength);
+
   // --- Scan Segment children ---
-  while (pos < segEnd && pos < buffer.byteLength) {
+  while (pos < safeEnd) {
     const elemId = ebmlReadId(view, pos);
     if (!elemId) break;
     const sizeField = ebmlReadSize(view, pos + elemId.length);
@@ -1001,8 +1005,8 @@ function webmScan(buffer) {
         // The 4-byte pattern can appear in compressed video data (false positive),
         // so we validate each match: the bytes after the ID must form a valid
         // EBML size VINT (leading byte has a marker bit set, i.e. >= 0x01).
-        clusterEnd = segEnd; // default: extends to end of segment
-        for (let scanPos = dataStart + 1; scanPos < segEnd - 3; scanPos++) {
+        clusterEnd = safeEnd; // default: extends to end of segment/buffer
+        for (let scanPos = dataStart + 1; scanPos < safeEnd - 3; scanPos++) {
           if (view.getUint8(scanPos)     === 0x1F &&
               view.getUint8(scanPos + 1) === 0x43 &&
               view.getUint8(scanPos + 2) === 0xB6 &&
@@ -1010,7 +1014,7 @@ function webmScan(buffer) {
             // Validate: after the 4-byte ID, the next byte must start a valid
             // EBML size VINT. Also check that a Timestamp element (0xE7) follows
             // at a plausible position.
-            if (scanPos + 4 < segEnd) {
+            if (scanPos + 4 < safeEnd) {
               const sizeStart = scanPos + 4;
               const candidateSize = ebmlReadSize(view, sizeStart);
               if (candidateSize) {
@@ -1023,7 +1027,7 @@ function webmScan(buffer) {
           }
         }
       } else {
-        clusterEnd = dataStart + sizeField.value;
+        clusterEnd = Math.min(dataStart + sizeField.value, safeEnd);
       }
 
       info.clusters.push({
@@ -1038,7 +1042,7 @@ function webmScan(buffer) {
     } else if (elemId.value === EBML_IDS.INFO) {
       // Look for TimestampScale inside Info
       let inner = dataStart;
-      const infoEnd = dataStart + sizeField.value;
+      const infoEnd = Math.min(dataStart + sizeField.value, safeEnd);
       while (inner < infoEnd) {
         const iId = ebmlReadId(view, inner);
         if (!iId) break;
@@ -1055,7 +1059,7 @@ function webmScan(buffer) {
     } else {
       // Skip other elements (Tracks, Cues, Tags, etc.)
       if (sizeField.isUnknown) break;
-      const elemEnd = dataStart + sizeField.value;
+      const elemEnd = Math.min(dataStart + sizeField.value, safeEnd);
       // Track the end of non-Cluster elements as the preamble boundary
       if (elemId.value === EBML_IDS.TRACKS) {
         info.preambleEnd = elemEnd;
@@ -1156,7 +1160,18 @@ async function concatenateWebM(blobs) {
   if (blobs.length === 1) return blobs[0];
 
   const buffers = await Promise.all(blobs.map(b => b.arrayBuffer()));
-  const scans = buffers.map(buf => webmScan(buf));
+
+  // Scan each segment, tolerating truncated/corrupt data (e.g. from a crash).
+  // If a scan fails entirely, we still include that segment's raw bytes.
+  const scans = [];
+  for (const buf of buffers) {
+    try {
+      scans.push(webmScan(buf));
+    } catch (e) {
+      console.warn('concatenateWebM: scan failed for a segment, using raw fallback', e);
+      scans.push({ preambleEnd: 0, clusters: [], timestampScale: 1000000, lastTimestamp: 0 });
+    }
+  }
 
   // Start with the entire first file (header + clusters)
   const parts = [new Uint8Array(buffers[0])];
@@ -1168,8 +1183,17 @@ async function concatenateWebM(blobs) {
   for (let i = 1; i < buffers.length; i++) {
     timeOffset += scans[i - 1].lastTimestamp + 1000; // +1000 for last cluster's ~1s duration
 
-    for (const cluster of scans[i].clusters) {
-      parts.push(webmRewriteCluster(buffers[i], cluster, timeOffset));
+    if (scans[i].clusters.length > 0) {
+      for (const cluster of scans[i].clusters) {
+        parts.push(webmRewriteCluster(buffers[i], cluster, timeOffset));
+      }
+    } else {
+      // Scan found no clusters (corrupt/truncated segment) — append raw data
+      // after the preamble, or the whole buffer if we couldn't even parse that.
+      const start = scans[i].preambleEnd || 0;
+      if (start < buffers[i].byteLength) {
+        parts.push(new Uint8Array(buffers[i], start));
+      }
     }
   }
 
