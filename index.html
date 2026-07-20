@@ -259,6 +259,21 @@
     cursor: not-allowed;
   }
 
+  .btn-select-screen {
+    background: var(--surface);
+    color: var(--green);
+    border: 1px solid var(--green-dim);
+  }
+  .btn-select-screen:hover { background: var(--surface-hover); }
+  .btn-select-screen:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .btn-select-screen.selected {
+    background: rgba(78, 204, 163, 0.15);
+    border-color: var(--green);
+  }
+
   .btn-stop {
     background: var(--border);
     color: var(--text);
@@ -361,7 +376,7 @@
         <rect x="2" y="3" width="20" height="14" rx="2"/>
         <path d="M8 21h8M12 17v4"/>
       </svg>
-      <span>Click Record to begin</span>
+      <span>Select a screen to preview, then click Record</span>
     </div>
   </div>
 
@@ -411,13 +426,14 @@
     <div class="action-btns">
       <button class="primary btn-pause" id="btnPause" onclick="pauseResume()" style="display:none;">Pause</button>
       <button class="primary btn-stop" id="btnStop" onclick="stopRecording()" style="display:none;">Stop &amp; save</button>
-      <button class="primary btn-record" id="btnRecord" onclick="startRecording()">Record</button>
+      <button class="primary btn-select-screen" id="btnSelectScreen" onclick="selectScreen()">Select Screen</button>
+      <button class="primary btn-record" id="btnRecord" onclick="startRecording()" disabled>Record</button>
     </div>
   </div>
 </main>
 
 <footer>
-  <div>When you click Record, your browser will ask which screen, window, or tab you'd like to share. This is a browser security step — the app cannot bypass it.</div>
+  <div>Click "Select Screen" to choose which screen, window, or tab to record. Your browser will show a popup — this is a required security step the app cannot bypass.</div>
   <div style="margin-top: 0.5rem;">Open source &middot; MIT License &middot; No account, no server, no watermark, no time limits</div>
 </footer>
 
@@ -594,11 +610,30 @@ async function cleanupCompleted() {
 function toggleSource(source) {
   if (state.recording) return; // Can't toggle mid-recording
   state.sources[source] = !state.sources[source];
-  // At least screen must be on
+  // At least one video source must be on
   if (!state.sources.screen && !state.sources.camera) {
     state.sources.screen = true;
   }
   updateToggleUI();
+  updateRecordButton();
+
+  // Show/hide Select Screen button based on whether screen source is active
+  const btnSelect = document.getElementById('btnSelectScreen');
+  if (state.sources.screen) {
+    btnSelect.style.display = '';
+  } else {
+    btnSelect.style.display = 'none';
+    // If switching to camera-only, stop any existing screen stream
+    if (state.screenStream) {
+      state.screenStream.getTracks().forEach(t => t.stop());
+      state.screenStream = null;
+      screenVideo.srcObject = null;
+      stopCompositing();
+      document.getElementById('placeholder').classList.remove('hidden');
+      btnSelect.classList.remove('selected');
+      btnSelect.textContent = 'Select Screen';
+    }
+  }
 }
 
 function updateToggleUI() {
@@ -822,6 +857,76 @@ function createAudioMix(streams) {
 }
 
 // ============================================================
+// Screen selection (two-step flow)
+// ============================================================
+async function selectScreen() {
+  showError('');
+  const btnSelect = document.getElementById('btnSelectScreen');
+  btnSelect.disabled = true;
+  btnSelect.textContent = 'Selecting...';
+
+  try {
+    // Stop any existing screen stream first
+    if (state.screenStream) {
+      state.screenStream.getTracks().forEach(t => t.stop());
+      state.screenStream = null;
+      stopCompositing();
+    }
+
+    state.screenStream = await captureScreen();
+    screenVideo.srcObject = state.screenStream;
+    await screenVideo.play();
+
+    // If user stops screen share via browser UI, reset
+    state.screenStream.getVideoTracks()[0].addEventListener('ended', () => {
+      if (state.recording) {
+        stopRecording();
+      } else {
+        // Screen share ended before recording started — reset
+        state.screenStream = null;
+        screenVideo.srcObject = null;
+        stopCompositing();
+        document.getElementById('placeholder').classList.remove('hidden');
+        document.getElementById('btnSelectScreen').classList.remove('selected');
+        document.getElementById('btnSelectScreen').textContent = 'Select Screen';
+        updateRecordButton();
+      }
+    });
+
+    // Start preview compositing
+    startCompositing();
+    document.getElementById('placeholder').classList.add('hidden');
+
+    // Update button states
+    btnSelect.classList.add('selected');
+    btnSelect.textContent = 'Change Screen';
+    btnSelect.disabled = false;
+    updateRecordButton();
+
+  } catch (err) {
+    console.error('Screen selection failed:', err);
+    if (err.name === 'NotAllowedError') {
+      showError('Screen selection was cancelled. Click "Select Screen" to try again.');
+    } else {
+      showError('Could not access screen: ' + err.message);
+    }
+    btnSelect.disabled = false;
+    btnSelect.textContent = 'Select Screen';
+  }
+}
+
+function updateRecordButton() {
+  const btnRecord = document.getElementById('btnRecord');
+  if (state.sources.screen) {
+    // Screen mode: require screen to be selected first
+    btnRecord.disabled = !state.screenStream;
+  } else {
+    // Camera-only mode: always enabled
+    btnRecord.disabled = false;
+  }
+}
+
+// ============================================================
 // Recording
 // ============================================================
 async function startRecording() {
@@ -834,16 +939,13 @@ async function startRecording() {
     // Cleanup any old completed sessions
     await cleanupCompleted();
 
-    // Capture sources
-    if (state.sources.screen) {
-      state.screenStream = await captureScreen();
-      screenVideo.srcObject = state.screenStream;
-      await screenVideo.play();
-
-      // If user stops screen share via browser UI, stop recording
-      state.screenStream.getVideoTracks()[0].addEventListener('ended', () => {
-        if (state.recording) stopRecording();
-      });
+    // Screen stream should already be captured via selectScreen()
+    // If camera-only mode (no screen), skip screen capture
+    if (state.sources.screen && !state.screenStream) {
+      showError('Please select a screen first.');
+      btnRecord.disabled = false;
+      btnRecord.textContent = 'Record';
+      return;
     }
 
     if (state.sources.camera) {
@@ -852,7 +954,8 @@ async function startRecording() {
       await cameraVideo.play();
     }
 
-    // Start canvas compositing
+    // Restart compositing to include camera
+    stopCompositing();
     startCompositing();
 
     // Build combined stream: canvas video + mixed audio
@@ -942,6 +1045,7 @@ async function startRecording() {
     // Update UI
     document.getElementById('placeholder').classList.add('hidden');
     btnRecord.style.display = 'none';
+    document.getElementById('btnSelectScreen').style.display = 'none';
     document.getElementById('btnStop').style.display = '';
     document.getElementById('btnPause').style.display = '';
     updateToggleUI();
@@ -957,7 +1061,21 @@ async function startRecording() {
     } else {
       showError('Failed to start: ' + err.message);
     }
-    cleanupStreams();
+    // Don't clean up screen stream on failure — user already selected it
+    if (state.cameraStream) {
+      state.cameraStream.getTracks().forEach(t => t.stop());
+      state.cameraStream = null;
+    }
+    if (state.micStream) {
+      state.micStream.getTracks().forEach(t => t.stop());
+      state.micStream = null;
+    }
+    if (state.audioContext) {
+      state.audioContext.close().catch(() => {});
+      state.audioContext = null;
+    }
+    state.recording = false;
+    state.paused = false;
     btnRecord.disabled = false;
     btnRecord.textContent = 'Record';
   }
@@ -1166,15 +1284,19 @@ function cleanupStreams() {
 // ============================================================
 function resetUI() {
   document.getElementById('btnRecord').style.display = '';
-  document.getElementById('btnRecord').disabled = false;
   document.getElementById('btnRecord').textContent = 'Record';
   document.getElementById('btnStop').style.display = 'none';
   document.getElementById('btnStop').disabled = false;
   document.getElementById('btnStop').textContent = 'Stop & save';
   document.getElementById('btnPause').style.display = 'none';
   document.getElementById('btnPause').textContent = 'Pause';
+  document.getElementById('btnSelectScreen').style.display = '';
+  document.getElementById('btnSelectScreen').disabled = false;
+  document.getElementById('btnSelectScreen').textContent = 'Select Screen';
+  document.getElementById('btnSelectScreen').classList.remove('selected');
   document.getElementById('placeholder').classList.remove('hidden');
   updateToggleUI();
+  updateRecordButton();
   updateStatus('idle', 'Ready');
   updateChunkCount(0);
   stopTimer();
