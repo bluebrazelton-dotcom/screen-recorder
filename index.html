@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Screen Recorder</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #1a1a2e;
+    --surface: #16213e;
+    --surface-hover: #1a2744;
+    --border: #2a3a5c;
+    --text: #e0e0e0;
+    --text-dim: #8892a4;
+    --accent: #e94560;
+    --accent-hover: #ff6b81;
+    --green: #4ecca3;
+    --green-dim: #2d8a6e;
+    --yellow: #f0c040;
+    --radius: 8px;
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  header {
+    width: 100%;
+    padding: 1.25rem 2rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+  }
+
+  header h1 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+
+  header .badge {
+    font-size: 0.7rem;
+    padding: 0.2rem 0.5rem;
+    border-radius: 999px;
+    background: var(--border);
+    color: var(--text-dim);
+  }
+
+  main {
+    flex: 1;
+    width: 100%;
+    max-width: 960px;
+    padding: 1.5rem 2rem;
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  /* Preview area */
+  .preview-container {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16/9;
+    background: #0d0d1a;
+    border-radius: var(--radius);
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+
+  .preview-container canvas {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+  }
+
+  .preview-placeholder {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-dim);
+    gap: 0.5rem;
+    font-size: 0.9rem;
+  }
+
+  .preview-placeholder.hidden { display: none; }
+
+  .preview-placeholder svg {
+    width: 48px;
+    height: 48px;
+    opacity: 0.4;
+  }
+
+  /* Status bar */
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    padding: 0.75rem 1rem;
+    background: var(--surface);
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    font-size: 0.85rem;
+  }
+
+  .status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--text-dim);
+    flex-shrink: 0;
+  }
+
+  .status-dot.recording {
+    background: var(--accent);
+    animation: pulse 1.5s ease-in-out infinite;
+  }
+
+  .status-dot.paused {
+    background: var(--yellow);
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+  }
+
+  .timer {
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    font-size: 1rem;
+    min-width: 5.5em;
+  }
+
+  .status-text {
+    color: var(--text-dim);
+    flex: 1;
+  }
+
+  .chunk-count {
+    color: var(--text-dim);
+    font-size: 0.8rem;
+  }
+
+  /* Controls */
+  .controls {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .source-toggles {
+    display: flex;
+    gap: 0.5rem;
+    flex: 1;
+  }
+
+  .toggle-btn {
+    padding: 0.5rem 0.9rem;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-dim);
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .toggle-btn:hover { background: var(--surface-hover); }
+  .toggle-btn.active {
+    border-color: var(--green-dim);
+    color: var(--green);
+    background: rgba(78, 204, 163, 0.08);
+  }
+
+  .toggle-btn svg { width: 16px; height: 16px; }
+
+  .action-btns {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  button.primary {
+    padding: 0.6rem 1.5rem;
+    border-radius: var(--radius);
+    border: none;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .btn-record {
+    background: var(--accent);
+    color: white;
+  }
+  .btn-record:hover { background: var(--accent-hover); }
+  .btn-record:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .btn-stop {
+    background: var(--border);
+    color: var(--text);
+  }
+  .btn-stop:hover { background: #3a4a6c; }
+
+  .btn-pause {
+    background: var(--border);
+    color: var(--text);
+  }
+
+  .btn-save {
+    background: var(--green);
+    color: #111;
+  }
+  .btn-save:hover { background: #6fe0bb; }
+
+  button.primary:not(:disabled):active { transform: scale(0.97); }
+
+  /* Recovery banner */
+  .recovery-banner {
+    padding: 1rem 1.25rem;
+    background: rgba(240, 192, 64, 0.1);
+    border: 1px solid rgba(240, 192, 64, 0.3);
+    border-radius: var(--radius);
+    display: none;
+  }
+
+  .recovery-banner.visible { display: block; }
+
+  .recovery-banner h3 {
+    font-size: 0.9rem;
+    color: var(--yellow);
+    margin-bottom: 0.4rem;
+  }
+
+  .recovery-banner p {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 0.75rem;
+  }
+
+  .recovery-banner .recovery-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  /* Error display */
+  .error-banner {
+    padding: 0.75rem 1rem;
+    background: rgba(233, 69, 96, 0.1);
+    border: 1px solid rgba(233, 69, 96, 0.3);
+    border-radius: var(--radius);
+    font-size: 0.8rem;
+    color: var(--accent-hover);
+    display: none;
+  }
+
+  .error-banner.visible { display: block; }
+
+  /* Footer */
+  footer {
+    width: 100%;
+    padding: 1rem 2rem;
+    border-top: 1px solid var(--border);
+    text-align: center;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+  }
+
+  footer a { color: var(--text-dim); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Screen Recorder</h1>
+  <span class="badge">v1 — walking skeleton</span>
+</header>
+
+<main>
+  <!-- Recovery banner (shown on load if interrupted recording found) -->
+  <div class="recovery-banner" id="recoveryBanner">
+    <h3>Interrupted recording found</h3>
+    <p id="recoveryInfo">A previous recording was interrupted. You can recover it or discard it.</p>
+    <div class="recovery-actions">
+      <button class="primary btn-save" onclick="recoverRecording()">Recover &amp; save</button>
+      <button class="primary btn-stop" onclick="discardRecovery()">Discard</button>
+    </div>
+  </div>
+
+  <!-- Error display -->
+  <div class="error-banner" id="errorBanner"></div>
+
+  <!-- Preview -->
+  <div class="preview-container">
+    <canvas id="previewCanvas"></canvas>
+    <div class="preview-placeholder" id="placeholder">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <rect x="2" y="3" width="20" height="14" rx="2"/>
+        <path d="M8 21h8M12 17v4"/>
+      </svg>
+      <span>Click Record to begin</span>
+    </div>
+  </div>
+
+  <!-- Status bar -->
+  <div class="status-bar">
+    <div class="status-dot" id="statusDot"></div>
+    <div class="timer" id="timer">00:00:00</div>
+    <div class="status-text" id="statusText">Ready</div>
+    <div class="chunk-count" id="chunkCount"></div>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <div class="source-toggles">
+      <button class="toggle-btn active" id="toggleScreen" onclick="toggleSource('screen')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/>
+        </svg>
+        Screen
+      </button>
+      <button class="toggle-btn active" id="toggleCamera" onclick="toggleSource('camera')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="13" r="3"/><path d="M17 6.33h2.72a2 2 0 012 2v9.34a2 2 0 01-2 2H4.28a2 2 0 01-2-2V8.33a2 2 0 012-2H7l1.04-2.1A1 1 0 019 3.67h6a1 1 0 01.9.56L17 6.33z"/>
+        </svg>
+        Webcam
+      </button>
+      <button class="toggle-btn active" id="toggleMic" onclick="toggleSource('mic')">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="9" y="1" width="6" height="11" rx="3"/><path d="M19 10a7 7 0 01-14 0M12 18v4M8 22h8"/>
+        </svg>
+        Mic
+      </button>
+    </div>
+    <div class="action-btns">
+      <button class="primary btn-pause" id="btnPause" onclick="pauseResume()" style="display:none;">Pause</button>
+      <button class="primary btn-stop" id="btnStop" onclick="stopRecording()" style="display:none;">Stop &amp; save</button>
+      <button class="primary btn-record" id="btnRecord" onclick="startRecording()">Record</button>
+    </div>
+  </div>
+</main>
+
+<footer>
+  Open source &middot; MIT License &middot; No account, no server, no watermark, no time limits
+</footer>
+
+<script>
+// ============================================================
+// State
+// ============================================================
+const state = {
+  sources: { screen: true, camera: true, mic: true },
+  recording: false,
+  paused: false,
+  mediaRecorder: null,
+  screenStream: null,
+  cameraStream: null,
+  audioContext: null,
+  micStream: null,
+  compositeStream: null,
+  animFrameId: null,
+  timerInterval: null,
+  startTime: null,
+  pausedDuration: 0,
+  pauseStart: null,
+  sessionId: null,
+  chunkIndex: 0,
+};
+
+// ============================================================
+// IndexedDB — crash-resilient chunk storage
+// ============================================================
+const DB_NAME = 'screen-recorder-db';
+const DB_VERSION = 1;
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('sessions')) {
+        db.createObjectStore('sessions', { keyPath: 'id' });
+      }
+      if (!db.objectStoreNames.contains('chunks')) {
+        const store = db.createObjectStore('chunks', { keyPath: ['sessionId', 'index'] });
+        store.createIndex('bySession', 'sessionId', { unique: false });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function createSession(mimeType) {
+  const db = await openDB();
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  const session = { id, mimeType, startTime: Date.now(), completed: false };
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('sessions', 'readwrite');
+    tx.objectStore('sessions').put(session);
+    tx.oncomplete = () => { db.close(); resolve(id); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+async function addChunk(sessionId, index, blob) {
+  const db = await openDB();
+  // Store as ArrayBuffer for reliable serialization
+  const buffer = await blob.arrayBuffer();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('chunks', 'readwrite');
+    tx.objectStore('chunks').put({ sessionId, index, data: buffer, timestamp: Date.now() });
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+async function completeSession(sessionId) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('sessions', 'readwrite');
+    const store = tx.objectStore('sessions');
+    const req = store.get(sessionId);
+    req.onsuccess = () => {
+      const session = req.result;
+      if (session) {
+        session.completed = true;
+        store.put(session);
+      }
+    };
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+async function getIncompleteSession() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('sessions', 'readonly');
+    const req = tx.objectStore('sessions').getAll();
+    req.onsuccess = () => {
+      db.close();
+      const incomplete = req.result.filter(s => !s.completed);
+      resolve(incomplete.length > 0 ? incomplete[incomplete.length - 1] : null);
+    };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
+}
+
+async function getSessionChunks(sessionId) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('chunks', 'readonly');
+    const index = tx.objectStore('chunks').index('bySession');
+    const req = index.getAll(sessionId);
+    req.onsuccess = () => {
+      db.close();
+      const sorted = req.result.sort((a, b) => a.index - b.index);
+      resolve(sorted);
+    };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
+}
+
+async function deleteSession(sessionId) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['sessions', 'chunks'], 'readwrite');
+    tx.objectStore('sessions').delete(sessionId);
+    // Delete all chunks for this session
+    const chunkStore = tx.objectStore('chunks');
+    const index = chunkStore.index('bySession');
+    const req = index.openCursor(sessionId);
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        cursor.delete();
+        cursor.continue();
+      }
+    };
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+// Delete all completed sessions (cleanup)
+async function cleanupCompleted() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(['sessions', 'chunks'], 'readwrite');
+    const sessionStore = tx.objectStore('sessions');
+    const chunkStore = tx.objectStore('chunks');
+    const req = sessionStore.getAll();
+    req.onsuccess = () => {
+      for (const session of req.result) {
+        if (session.completed) {
+          sessionStore.delete(session.id);
+          const idx = chunkStore.index('bySession');
+          const cursorReq = idx.openCursor(session.id);
+          cursorReq.onsuccess = (e) => {
+            const cursor = e.target.result;
+            if (cursor) { cursor.delete(); cursor.continue(); }
+          };
+        }
+      }
+    };
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+// ============================================================
+// Source toggles
+// ============================================================
+function toggleSource(source) {
+  if (state.recording) return; // Can't toggle mid-recording
+  state.sources[source] = !state.sources[source];
+  // At least screen must be on
+  if (!state.sources.screen && !state.sources.camera) {
+    state.sources.screen = true;
+  }
+  updateToggleUI();
+}
+
+function updateToggleUI() {
+  document.getElementById('toggleScreen').classList.toggle('active', state.sources.screen);
+  document.getElementById('toggleCamera').classList.toggle('active', state.sources.camera);
+  document.getElementById('toggleMic').classList.toggle('active', state.sources.mic);
+  // Disable toggles during recording
+  const disabled = state.recording;
+  document.getElementById('toggleScreen').disabled = disabled;
+  document.getElementById('toggleCamera').disabled = disabled;
+  document.getElementById('toggleMic').disabled = disabled;
+}
+
+// ============================================================
+// Media capture
+// ============================================================
+async function captureScreen() {
+  return navigator.mediaDevices.getDisplayMedia({
+    video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } },
+    audio: true, // System audio if user allows
+  });
+}
+
+async function captureCamera() {
+  return navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 30 } },
+    audio: false,
+  });
+}
+
+async function captureMic() {
+  return navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true },
+    video: false,
+  });
+}
+
+// ============================================================
+// Video compositing — screen + webcam PiP on canvas
+// ============================================================
+const canvas = document.getElementById('previewCanvas');
+const ctx = canvas.getContext('2d');
+
+// Hidden video elements for drawing
+const screenVideo = document.createElement('video');
+screenVideo.muted = true;
+screenVideo.playsInline = true;
+
+const cameraVideo = document.createElement('video');
+cameraVideo.muted = true;
+cameraVideo.playsInline = true;
+
+function startCompositing() {
+  // Set canvas to match screen resolution
+  const screenTrack = state.screenStream?.getVideoTracks()[0];
+  if (screenTrack) {
+    const settings = screenTrack.getSettings();
+    canvas.width = settings.width || 1920;
+    canvas.height = settings.height || 1080;
+  } else if (state.cameraStream) {
+    // Camera only mode
+    canvas.width = 1280;
+    canvas.height = 720;
+  }
+
+  function drawFrame() {
+    // Clear
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Draw screen (full canvas)
+    if (state.screenStream && screenVideo.readyState >= 2) {
+      ctx.drawImage(screenVideo, 0, 0, canvas.width, canvas.height);
+    }
+
+    // Draw webcam — full-canvas if camera-only, PiP overlay if screen is on
+    if (state.cameraStream && cameraVideo.readyState >= 2) {
+      if (!state.sources.screen) {
+        // Camera-only mode: draw full canvas, no clip
+        ctx.drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
+      } else {
+        // PiP overlay (bottom-right, ~1/5 of canvas width)
+        const pipWidth = Math.round(canvas.width * 0.2);
+        const pipHeight = Math.round(pipWidth * (cameraVideo.videoHeight / cameraVideo.videoWidth || 0.75));
+        const margin = 20;
+        const x = canvas.width - pipWidth - margin;
+        const y = canvas.height - pipHeight - margin;
+
+        // Rounded rectangle clip
+        const radius = 12;
+        ctx.save();
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.lineTo(x + pipWidth - radius, y);
+        ctx.quadraticCurveTo(x + pipWidth, y, x + pipWidth, y + radius);
+        ctx.lineTo(x + pipWidth, y + pipHeight - radius);
+        ctx.quadraticCurveTo(x + pipWidth, y + pipHeight, x + pipWidth - radius, y + pipHeight);
+        ctx.lineTo(x + radius, y + pipHeight);
+        ctx.quadraticCurveTo(x, y + pipHeight, x, y + pipHeight - radius);
+        ctx.lineTo(x, y + radius);
+        ctx.quadraticCurveTo(x, y, x + radius, y);
+        ctx.closePath();
+        ctx.clip();
+        ctx.drawImage(cameraVideo, x, y, pipWidth, pipHeight);
+
+        // Border
+        ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    state.animFrameId = requestAnimationFrame(drawFrame);
+  }
+
+  drawFrame();
+}
+
+function stopCompositing() {
+  if (state.animFrameId) {
+    cancelAnimationFrame(state.animFrameId);
+    state.animFrameId = null;
+  }
+}
+
+// ============================================================
+// Audio mixing
+// ============================================================
+function createAudioMix(streams) {
+  const audioCtx = new AudioContext();
+  const dest = audioCtx.createMediaStreamDestination();
+
+  for (const stream of streams) {
+    for (const track of stream.getAudioTracks()) {
+      const source = audioCtx.createMediaStreamSource(new MediaStream([track]));
+      source.connect(dest);
+    }
+  }
+
+  state.audioContext = audioCtx;
+  return dest.stream;
+}
+
+// ============================================================
+// Recording
+// ============================================================
+async function startRecording() {
+  showError('');
+  const btnRecord = document.getElementById('btnRecord');
+  btnRecord.disabled = true;
+  btnRecord.textContent = 'Starting...';
+
+  try {
+    // Cleanup any old completed sessions
+    await cleanupCompleted();
+
+    // Capture sources
+    if (state.sources.screen) {
+      state.screenStream = await captureScreen();
+      screenVideo.srcObject = state.screenStream;
+      await screenVideo.play();
+
+      // If user stops screen share via browser UI, stop recording
+      state.screenStream.getVideoTracks()[0].addEventListener('ended', () => {
+        if (state.recording) stopRecording();
+      });
+    }
+
+    if (state.sources.camera) {
+      state.cameraStream = await captureCamera();
+      cameraVideo.srcObject = state.cameraStream;
+      await cameraVideo.play();
+    }
+
+    // Start canvas compositing
+    startCompositing();
+
+    // Build combined stream: canvas video + mixed audio
+    const canvasStream = canvas.captureStream(30);
+    const audioStreams = [];
+
+    if (state.sources.mic) {
+      state.micStream = await captureMic();
+      audioStreams.push(state.micStream);
+    }
+
+    // System audio from screen share (if available)
+    if (state.screenStream) {
+      const screenAudio = state.screenStream.getAudioTracks();
+      if (screenAudio.length > 0) {
+        audioStreams.push(new MediaStream(screenAudio));
+      }
+    }
+
+    // Mix audio
+    let combinedStream;
+    if (audioStreams.length > 0) {
+      const audioMix = createAudioMix(audioStreams);
+      combinedStream = new MediaStream([
+        ...canvasStream.getVideoTracks(),
+        ...audioMix.getAudioTracks(),
+      ]);
+    } else {
+      combinedStream = canvasStream;
+    }
+
+    state.compositeStream = combinedStream;
+
+    // Choose codec
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+      ? 'video/webm;codecs=vp9,opus'
+      : MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
+        ? 'video/webm;codecs=vp8,opus'
+        : 'video/webm';
+
+    // Create session in IndexedDB
+    state.sessionId = await createSession(mimeType);
+    state.chunkIndex = 0;
+
+    // Create MediaRecorder with 1-second chunks
+    const recorder = new MediaRecorder(combinedStream, {
+      mimeType,
+      videoBitsPerSecond: 2_500_000,
+    });
+
+    // Track the last chunk write so we can await it before finalizing
+    let lastChunkWrite = Promise.resolve();
+
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) {
+        const idx = state.chunkIndex++;
+        lastChunkWrite = lastChunkWrite.then(async () => {
+          try {
+            await addChunk(state.sessionId, idx, e.data);
+            updateChunkCount(idx + 1);
+          } catch (err) {
+            console.error('Failed to store chunk:', err);
+          }
+        });
+      }
+    };
+
+    recorder.onstop = async () => {
+      // Wait for the final chunk to be written before saving
+      await lastChunkWrite;
+      await finalizeRecording();
+    };
+
+    recorder.onerror = (e) => {
+      console.error('MediaRecorder error:', e);
+      showError('Recording error: ' + (e.error?.message || 'Unknown error'));
+    };
+
+    // Start recording with 1-second timeslice
+    recorder.start(1000);
+    state.mediaRecorder = recorder;
+    state.recording = true;
+    state.paused = false;
+    state.startTime = Date.now();
+    state.pausedDuration = 0;
+
+    // Update UI
+    document.getElementById('placeholder').classList.add('hidden');
+    btnRecord.style.display = 'none';
+    document.getElementById('btnStop').style.display = '';
+    document.getElementById('btnPause').style.display = '';
+    updateToggleUI();
+    updateStatus('recording', 'Recording');
+    startTimer();
+
+  } catch (err) {
+    console.error('Failed to start recording:', err);
+    if (err.name === 'NotAllowedError') {
+      showError('Permission denied. Please allow screen, camera, or microphone access and try again.');
+    } else if (err.name === 'NotReadableError') {
+      showError('Could not access your camera or microphone. Another app may be using it.');
+    } else {
+      showError('Failed to start: ' + err.message);
+    }
+    cleanupStreams();
+    btnRecord.disabled = false;
+    btnRecord.textContent = 'Record';
+  }
+}
+
+function pauseResume() {
+  if (!state.mediaRecorder) return;
+
+  if (state.paused) {
+    state.mediaRecorder.resume();
+    state.paused = false;
+    state.pausedDuration += Date.now() - state.pauseStart;
+    document.getElementById('btnPause').textContent = 'Pause';
+    updateStatus('recording', 'Recording');
+  } else {
+    state.mediaRecorder.pause();
+    state.paused = true;
+    state.pauseStart = Date.now();
+    document.getElementById('btnPause').textContent = 'Resume';
+    updateStatus('paused', 'Paused');
+  }
+}
+
+async function stopRecording() {
+  if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') return;
+
+  document.getElementById('btnStop').disabled = true;
+  document.getElementById('btnStop').textContent = 'Saving...';
+
+  // Request the final chunk, then stop fires
+  state.mediaRecorder.stop();
+}
+
+async function finalizeRecording() {
+  try {
+    // Read mimeType BEFORE marking session complete (otherwise getIncompleteSession won't find it)
+    const db = await openDB();
+    const sessionMimeType = await new Promise((resolve) => {
+      const tx = db.transaction('sessions', 'readonly');
+      const req = tx.objectStore('sessions').get(state.sessionId);
+      req.onsuccess = () => resolve(req.result?.mimeType || 'video/webm');
+      req.onerror = () => resolve('video/webm');
+      tx.oncomplete = () => db.close();
+    });
+
+    // Mark session complete
+    await completeSession(state.sessionId);
+
+    // Get all chunks
+    const chunks = await getSessionChunks(state.sessionId);
+    if (chunks.length === 0) {
+      showError('No recording data found.');
+      resetUI();
+      return;
+    }
+
+    // Build blob from stored chunks
+    const blobs = chunks.map(c => new Blob([c.data]));
+    const fullBlob = new Blob(blobs, { type: sessionMimeType });
+
+    // Save via File System Access API
+    await saveFile(fullBlob);
+
+    // Clean up the session from IndexedDB
+    await deleteSession(state.sessionId);
+
+  } catch (err) {
+    console.error('Failed to finalize:', err);
+    showError('Save failed: ' + err.message + '. Your recording is safe — refresh and use Recovery.');
+  } finally {
+    cleanupStreams();
+    resetUI();
+  }
+}
+
+async function saveFile(blob) {
+  // Try File System Access API first
+  if ('showSaveFilePicker' in window) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: `recording-${formatDateForFilename()}.webm`,
+        types: [{
+          description: 'WebM Video',
+          accept: { 'video/webm': ['.webm'] },
+        }],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      updateStatus('idle', 'Saved successfully');
+      return;
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        // User cancelled — that's fine, recording is still in IndexedDB
+        updateStatus('idle', 'Save cancelled — recording preserved, click Record to start a new one');
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // Fallback: download link
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `recording-${formatDateForFilename()}.webm`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  updateStatus('idle', 'Downloaded');
+}
+
+function formatDateForFilename() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}_${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}`;
+}
+
+// ============================================================
+// Recovery
+// ============================================================
+async function checkForRecovery() {
+  try {
+    const session = await getIncompleteSession();
+    if (session) {
+      const chunks = await getSessionChunks(session.id);
+      if (chunks.length > 0) {
+        const totalBytes = chunks.reduce((sum, c) => sum + c.data.byteLength, 0);
+        const sizeMB = (totalBytes / (1024 * 1024)).toFixed(1);
+        const elapsed = chunks.length; // Rough seconds (1 chunk ≈ 1 second)
+        const mins = Math.floor(elapsed / 60);
+        const secs = elapsed % 60;
+
+        document.getElementById('recoveryInfo').textContent =
+          `Found ${chunks.length} chunks (~${mins}m ${secs}s, ${sizeMB} MB) from ${new Date(session.startTime).toLocaleString()}.`;
+        document.getElementById('recoveryBanner').classList.add('visible');
+        window._recoverySessionId = session.id;
+        window._recoveryMimeType = session.mimeType;
+      }
+    }
+  } catch (err) {
+    console.error('Recovery check failed:', err);
+  }
+}
+
+async function recoverRecording() {
+  try {
+    const chunks = await getSessionChunks(window._recoverySessionId);
+    const blobs = chunks.map(c => new Blob([c.data]));
+    const blob = new Blob(blobs, { type: window._recoveryMimeType || 'video/webm' });
+
+    await saveFile(blob);
+    await deleteSession(window._recoverySessionId);
+    document.getElementById('recoveryBanner').classList.remove('visible');
+  } catch (err) {
+    console.error('Recovery failed:', err);
+    showError('Recovery failed: ' + err.message);
+  }
+}
+
+async function discardRecovery() {
+  try {
+    await deleteSession(window._recoverySessionId);
+    document.getElementById('recoveryBanner').classList.remove('visible');
+  } catch (err) {
+    console.error('Discard failed:', err);
+  }
+}
+
+// ============================================================
+// Cleanup
+// ============================================================
+function cleanupStreams() {
+  stopCompositing();
+
+  if (state.screenStream) {
+    state.screenStream.getTracks().forEach(t => t.stop());
+    state.screenStream = null;
+  }
+  if (state.cameraStream) {
+    state.cameraStream.getTracks().forEach(t => t.stop());
+    state.cameraStream = null;
+  }
+  if (state.micStream) {
+    state.micStream.getTracks().forEach(t => t.stop());
+    state.micStream = null;
+  }
+  if (state.audioContext) {
+    state.audioContext.close().catch(() => {});
+    state.audioContext = null;
+  }
+  if (state.compositeStream) {
+    state.compositeStream.getTracks().forEach(t => t.stop());
+    state.compositeStream = null;
+  }
+
+  screenVideo.srcObject = null;
+  cameraVideo.srcObject = null;
+  state.mediaRecorder = null;
+  state.recording = false;
+  state.paused = false;
+}
+
+// ============================================================
+// UI helpers
+// ============================================================
+function resetUI() {
+  document.getElementById('btnRecord').style.display = '';
+  document.getElementById('btnRecord').disabled = false;
+  document.getElementById('btnRecord').textContent = 'Record';
+  document.getElementById('btnStop').style.display = 'none';
+  document.getElementById('btnStop').disabled = false;
+  document.getElementById('btnStop').textContent = 'Stop & save';
+  document.getElementById('btnPause').style.display = 'none';
+  document.getElementById('btnPause').textContent = 'Pause';
+  document.getElementById('placeholder').classList.remove('hidden');
+  updateToggleUI();
+  updateStatus('idle', 'Ready');
+  updateChunkCount(0);
+  stopTimer();
+
+  // Clear canvas
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+}
+
+function updateStatus(mode, text) {
+  const dot = document.getElementById('statusDot');
+  dot.className = 'status-dot';
+  if (mode === 'recording') dot.classList.add('recording');
+  if (mode === 'paused') dot.classList.add('paused');
+  document.getElementById('statusText').textContent = text;
+}
+
+function updateChunkCount(n) {
+  document.getElementById('chunkCount').textContent = n > 0 ? `${n} chunks saved` : '';
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorBanner');
+  if (msg) {
+    el.textContent = msg;
+    el.classList.add('visible');
+  } else {
+    el.textContent = '';
+    el.classList.remove('visible');
+  }
+}
+
+// Timer
+function startTimer() {
+  updateTimerDisplay();
+  state.timerInterval = setInterval(updateTimerDisplay, 200);
+}
+
+function stopTimer() {
+  if (state.timerInterval) {
+    clearInterval(state.timerInterval);
+    state.timerInterval = null;
+  }
+}
+
+function updateTimerDisplay() {
+  if (!state.startTime) return;
+  let elapsed = Date.now() - state.startTime - state.pausedDuration;
+  if (state.paused && state.pauseStart) {
+    elapsed -= (Date.now() - state.pauseStart);
+  }
+  elapsed = Math.max(0, elapsed);
+
+  const totalSec = Math.floor(elapsed / 1000);
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = totalSec % 60;
+
+  document.getElementById('timer').textContent =
+    `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+}
+
+// ============================================================
+// Init
+// ============================================================
+window.addEventListener('load', () => {
+  checkForRecovery();
+
+  // Feature detection
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    showError('Screen recording is not supported in this browser. Use Chrome or Edge.');
+  }
+});
+
+// Warn before leaving during recording
+window.addEventListener('beforeunload', (e) => {
+  if (state.recording) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
+});
+</script>
+
+</body>
+</html>
