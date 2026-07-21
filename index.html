@@ -1216,6 +1216,22 @@ const EBML_IDS = {
   CLUSTER:   0x1F43B675,
   TIMESTAMP: 0xE7,
   TIMESCALE: 0x2AD7B1,
+  // --- used by the save-time finalize pass (Duration + Cues for seeking) ---
+  DURATION:     0x4489,     // Info child; value is an IEEE float, not a uint
+  SEEKHEAD:     0x114D9B74,
+  SEEK:         0x4DBB,
+  SEEKID:       0x53AB,
+  SEEKPOS:      0x53AC,
+  CUES:         0x1C53BB6B,
+  CUEPOINT:     0xBB,
+  CUETIME:      0xB3,
+  CUETRACKPOS:  0xB7,
+  CUETRACK:     0xF7,
+  CUECLUSTERPOS:0xF1,
+  TRACKENTRY:   0xAE,
+  TRACKNUMBER:  0xD7,
+  TRACKTYPE:    0x83,       // 1 = video, 2 = audio
+  SIMPLEBLOCK:  0xA3,
 };
 
 // Read an EBML variable-length integer from a DataView.
@@ -1235,12 +1251,21 @@ function ebmlReadVarInt(view, pos, stripLeadingBit) {
     value = value * 256 + view.getUint8(pos + i);
   }
 
-  // Check for "unknown size" (all value bits set)
+  // Check for "unknown size" (all value bits set). This must be a BYTE-PATTERN
+  // check, not a numeric comparison: for width 8 the all-ones value and the
+  // largest known value round to the same float64, so `value > max` misses it
+  // (REVIEW.md P2 #9). Chrome writes 1-byte unknown markers (0xFF) for clusters,
+  // but FIREFOX writes 8-byte markers (0x01 FF FF FF FF FF FF FF) — the numeric
+  // check made Firefox recordings parse as one giant cluster, which v1.8's
+  // Duration/Cues writer then indexed as a recording that ends at the first
+  // cluster boundary.
   let isUnknown = false;
   if (stripLeadingBit) {
-    const maxKnown = [0x7E, 0x3FFE, 0x1FFFFE, 0x0FFFFFFE, 0x07FFFFFFFE,
-                      0x03FFFFFFFFFE, 0x01FFFFFFFFFFFE, 0x00FFFFFFFFFFFFFE];
-    isUnknown = value > maxKnown[width - 1];
+    const firstValueMask = (0x80 >> (width - 1)) - 1; // value bits within byte 0
+    isUnknown = (b0 & firstValueMask) === firstValueMask;
+    for (let i = 1; i < width && isUnknown; i++) {
+      if (view.getUint8(pos + i) !== 0xFF) isUnknown = false;
+    }
   }
 
   return { value, length: width, isUnknown };
@@ -1299,6 +1324,13 @@ function webmScan(buffer) {
     clusters: [],         // { offset, totalSize, timestamp }
     timestampScale: 1000000, // nanoseconds per tick (default 1ms)
     lastTimestamp: 0,
+    // Regions used by makeSeekable() (all offsets are file-relative; null if not found
+    // or if the element had an unknown size and can't be safely relocated):
+    headerEnd: 0,         // end of the EBML Header element
+    segmentDataStart: 0,  // first byte after the Segment element's size VINT
+    infoStart: null, infoDataStart: null, infoDataEnd: null,       // Info element
+    tracksStart: null, tracksDataStart: null, tracksDataEnd: null, // Tracks element
+    scanEnd: 0,           // how far the top-level scan got before stopping
   };
 
   let pos = 0;
@@ -1309,6 +1341,7 @@ function webmScan(buffer) {
   pos += hdrId.length;
   const hdrSize = ebmlReadSize(view, pos);
   pos += hdrSize.length + hdrSize.value;
+  info.headerEnd = pos;
 
   // --- Segment ---
   const segId = ebmlReadId(view, pos);
@@ -1316,6 +1349,7 @@ function webmScan(buffer) {
   pos += segId.length;
   const segSize = ebmlReadSize(view, pos);
   pos += segSize.length;
+  info.segmentDataStart = pos;
   const segEnd = segSize.isUnknown ? buffer.byteLength : pos + segSize.value;
 
   // Clamp segEnd to actual buffer length (handles truncated files from crashes)
@@ -1358,10 +1392,19 @@ function webmScan(buffer) {
             if (scanPos + 4 < safeEnd) {
               const sizeStart = scanPos + 4;
               const candidateSize = ebmlReadSize(view, sizeStart);
+              // A real Cluster starts with a Timestamp element (0xE7) as its first
+              // child (Chrome always writes it first). Requiring it cuts false-positive
+              // boundaries in compressed data, which matters now that makeSeekable()
+              // builds the seek index from these boundaries. (REVIEW.md P2 #8.)
+              // A truncated file can end mid-boundary; treat "0xE7 would be past the
+              // end" as plausible rather than rejecting the final boundary.
               if (candidateSize) {
-                // Looks like a real Cluster element
-                clusterEnd = scanPos;
-                break;
+                const tsBytePos = sizeStart + candidateSize.length;
+                if (tsBytePos >= safeEnd || view.getUint8(tsBytePos) === EBML_IDS.TIMESTAMP) {
+                  // Looks like a real Cluster element
+                  clusterEnd = scanPos;
+                  break;
+                }
               }
             }
             // If validation failed, it's a false positive — keep scanning
@@ -1384,6 +1427,9 @@ function webmScan(buffer) {
       // Look for TimestampScale inside Info
       let inner = dataStart;
       const infoEnd = Math.min(dataStart + sizeField.value, safeEnd);
+      if (!sizeField.isUnknown) {
+        info.infoStart = pos; info.infoDataStart = dataStart; info.infoDataEnd = infoEnd;
+      }
       while (inner < infoEnd) {
         const iId = ebmlReadId(view, inner);
         if (!iId) break;
@@ -1404,10 +1450,13 @@ function webmScan(buffer) {
       // Track the end of non-Cluster elements as the preamble boundary
       if (elemId.value === EBML_IDS.TRACKS) {
         info.preambleEnd = elemEnd;
+        info.tracksStart = pos; info.tracksDataStart = dataStart; info.tracksDataEnd = elemEnd;
       }
       pos = elemEnd;
     }
   }
+
+  info.scanEnd = pos;
 
   // If no clusters were found, preambleEnd is the whole file
   if (info.clusters.length > 0 && info.preambleEnd === 0) {
@@ -1539,6 +1588,251 @@ async function concatenateWebM(blobs) {
   }
 
   return new Blob(parts, { type: 'video/webm' });
+}
+
+// ============================================================
+// Save-time finalize: Duration + Cues (seek index)
+// ============================================================
+// MediaRecorder writes a "live" WebM: unknown Segment size, no Duration, no Cues.
+// Players then don't know the total length and can't jump around. makeSeekable()
+// remuxes METADATA ONLY at save time — cluster bytes are copied verbatim, nothing
+// is re-encoded. Final layout:
+//   [EBML Header][Segment( SeekHead → Info(+Duration) → Tracks → Clusters… → Cues )]
+// The Segment keeps its unknown-size marker (players read to EOF; SeekHead points
+// them at the Cues element at the end). On ANY failure the original blob is
+// returned unchanged — a recording that saves un-seekable is acceptable; a
+// recording that fails to save is not.
+
+// Encode an element ID as its byte sequence (IDs keep their marker bits, so the
+// numeric value already contains the full byte pattern).
+function ebmlIdBytes(id) {
+  const bytes = [];
+  while (id > 0) { bytes.unshift(id % 256); id = Math.floor(id / 256); }
+  return new Uint8Array(bytes);
+}
+
+// Build an EBML element from an ID and data parts (size VINT computed).
+function ebmlElement(id) {
+  const idBytes = ebmlIdBytes(id);
+  let dataLen = 0;
+  for (let i = 1; i < arguments.length; i++) dataLen += arguments[i].length;
+  const sizeBytes = ebmlWriteSize(dataLen);
+  const out = new Uint8Array(idBytes.length + sizeBytes.length + dataLen);
+  let w = 0;
+  out.set(idBytes, w); w += idBytes.length;
+  out.set(sizeBytes, w); w += sizeBytes.length;
+  for (let i = 1; i < arguments.length; i++) { out.set(arguments[i], w); w += arguments[i].length; }
+  return out;
+}
+
+// Duration is an IEEE float (8-byte big-endian) — ebmlWriteUInt is wrong for it.
+function ebmlWriteFloat64(value) {
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setFloat64(0, value, false);
+  return out;
+}
+
+// Walk Tracks → TrackEntry children, return the TrackNumber of the video track.
+function webmFindVideoTrack(view, scan) {
+  if (scan.tracksDataStart === null) return null;
+  let pos = scan.tracksDataStart;
+  while (pos < scan.tracksDataEnd) {
+    const id = ebmlReadId(view, pos);
+    if (!id) break;
+    const size = ebmlReadSize(view, pos + id.length);
+    if (!size || size.isUnknown) break;
+    const dataStart = pos + id.length + size.length;
+    const dataEnd = Math.min(dataStart + size.value, scan.tracksDataEnd);
+    if (id.value === EBML_IDS.TRACKENTRY) {
+      let trackNum = null, trackType = null, inner = dataStart;
+      while (inner < dataEnd) {
+        const iId = ebmlReadId(view, inner);
+        if (!iId) break;
+        const iSize = ebmlReadSize(view, inner + iId.length);
+        if (!iSize || iSize.isUnknown) break;
+        const iData = inner + iId.length + iSize.length;
+        if (iId.value === EBML_IDS.TRACKNUMBER) trackNum = ebmlReadUInt(view, iData, iSize.value);
+        if (iId.value === EBML_IDS.TRACKTYPE)   trackType = ebmlReadUInt(view, iData, iSize.value);
+        inner = iData + iSize.value;
+      }
+      if (trackType === 1 && trackNum) return trackNum;
+    }
+    pos = dataEnd;
+  }
+  return null;
+}
+
+// Walk one cluster's SimpleBlocks: cb(trackNumber, relativeTimestamp, flags) per
+// block; return false from cb to stop. Tolerates truncated clusters (stops at the
+// buffer end). SimpleBlock layout: [track VINT][int16 rel. timestamp][flags][data].
+function webmWalkClusterBlocks(view, cluster, cb) {
+  const clusterEnd = Math.min(cluster.offset + cluster.totalSize, view.byteLength);
+  const cId = ebmlReadId(view, cluster.offset);
+  if (!cId) return;
+  const cSize = ebmlReadSize(view, cluster.offset + cId.length);
+  if (!cSize) return;
+  let pos = cluster.offset + cId.length + cSize.length;
+  while (pos < clusterEnd) {
+    const id = ebmlReadId(view, pos);
+    if (!id) break;
+    const size = ebmlReadSize(view, pos + id.length);
+    if (!size || size.isUnknown) break;
+    const dataStart = pos + id.length + size.length;
+    const dataEnd = dataStart + size.value;
+    if (dataEnd > clusterEnd) break; // truncated block (crash tail) — stop cleanly
+    if (id.value === EBML_IDS.SIMPLEBLOCK) {
+      const tn = ebmlReadSize(view, dataStart); // track number VINT (marker stripped)
+      if (tn && dataStart + tn.length + 3 <= dataEnd) {
+        const relTs = view.getInt16(dataStart + tn.length, false);
+        const flags = view.getUint8(dataStart + tn.length + 2);
+        if (cb(tn.value, relTs, flags) === false) return;
+      }
+    }
+    pos = dataEnd;
+  }
+}
+
+// A cluster is cue-worthy only if its FIRST video block is a keyframe
+// (flags & 0x80). MediaRecorder normally starts each cluster on a keyframe, but
+// we verify per cluster and skip rather than cue a non-keyframe cluster.
+function webmClusterHasVideoKeyframe(view, cluster, videoTrack) {
+  let isKey = false;
+  webmWalkClusterBlocks(view, cluster, (track, relTs, flags) => {
+    if (track !== videoTrack) return true; // audio etc. — keep looking
+    isKey = (flags & 0x80) !== 0;
+    return false;                          // first video block decides
+  });
+  return isKey;
+}
+
+// Highest absolute block timestamp in a cluster (ticks), for Duration.
+function webmMaxBlockTime(view, cluster) {
+  let max = cluster.timestamp;
+  webmWalkClusterBlocks(view, cluster, (track, relTs) => {
+    const t = cluster.timestamp + relTs;
+    if (t > max) max = t;
+    return true;
+  });
+  return max;
+}
+
+// The save-time finalize pass. Returns a new indexed Blob, or the ORIGINAL blob
+// unchanged if anything about the file resists parsing. Never throws.
+async function makeSeekable(blob) {
+  try {
+    const buffer = await blob.arrayBuffer();
+    const scan = webmScan(buffer);
+    const view = new DataView(buffer);
+
+    // Bail out (unindexed but saveable) unless the structure is what we expect.
+    if (scan.clusters.length === 0) return blob;
+    if (scan.infoStart === null || scan.tracksStart === null) return blob;
+    if (scan.infoDataEnd - scan.infoStart > 10000 ||
+        scan.tracksDataEnd - scan.tracksStart > 100000) return blob; // implausible → don't trust the scan
+    if (scan.clusters[0].offset < scan.infoDataEnd ||
+        scan.clusters[0].offset < scan.tracksDataEnd) return blob;
+    // Coverage guard: if the top-level scan stopped early (something it couldn't
+    // parse), rebuilding from what it DID parse would silently drop the rest of
+    // the recording. Better to save un-indexed than to truncate. Slack covers
+    // small trailing elements a player would ignore anyway.
+    if (buffer.byteLength - scan.scanEnd > 4096) return blob;
+
+    const videoTrack = webmFindVideoTrack(view, scan);
+
+    // --- Duration, in timestampScale ticks (default scale 1,000,000ns ⇒ ms).
+    // Max block time across the last cluster, guarded by the highest cluster
+    // timestamp seen anywhere, plus one ~30fps frame.
+    const lastCluster = scan.clusters[scan.clusters.length - 1];
+    const durationTicks = Math.max(webmMaxBlockTime(view, lastCluster), scan.lastTimestamp) + 33;
+
+    // --- Rebuild Info: original children minus any existing Duration, plus ours.
+    const infoParts = [];
+    let ip = scan.infoDataStart;
+    while (ip < scan.infoDataEnd) {
+      const id = ebmlReadId(view, ip);
+      if (!id) break;
+      const size = ebmlReadSize(view, ip + id.length);
+      if (!size || size.isUnknown) break;
+      const end = Math.min(ip + id.length + size.length + size.value, scan.infoDataEnd);
+      if (id.value !== EBML_IDS.DURATION) infoParts.push(new Uint8Array(buffer, ip, end - ip));
+      ip = end;
+    }
+    infoParts.push(ebmlElement(EBML_IDS.DURATION, ebmlWriteFloat64(durationTicks)));
+    const newInfo = ebmlElement.apply(null, [EBML_IDS.INFO].concat(infoParts));
+
+    const tracksBytes = new Uint8Array(buffer, scan.tracksStart, scan.tracksDataEnd - scan.tracksStart);
+
+    // --- Which clusters get CuePoints (needs videoTrack; without one, Duration-only).
+    const keyClusters = [];
+    if (videoTrack) {
+      for (const c of scan.clusters) {
+        if (webmClusterHasVideoKeyframe(view, c, videoTrack)) keyClusters.push(c);
+      }
+    }
+    const includeCues = keyClusters.length > 0;
+
+    // --- Layout. All positions are relative to the Segment DATA start (the byte
+    // after the Segment size VINT) in the FINAL file. SeekHead size is
+    // deterministic because SeekPosition values are fixed-width 8-byte uints:
+    // Seek entry = 21 bytes; SeekHead = 4(ID) + 1(size) + 21×entries.
+    const seekHeadLen = 5 + 21 * (includeCues ? 3 : 2);
+    const infoPos = seekHeadLen;
+    const tracksPos = infoPos + newInfo.length;
+    const clustersPos = tracksPos + tracksBytes.length;
+
+    // Final position of each cluster: clusters are appended verbatim in scan
+    // order, so walk the same order the assembly below uses.
+    const clusterFinalPos = new Map();
+    let runningPos = clustersPos;
+    for (const c of scan.clusters) {
+      clusterFinalPos.set(c, runningPos);
+      runningPos += Math.min(c.totalSize, buffer.byteLength - c.offset);
+    }
+    const cuesPos = runningPos;
+
+    // --- Cues: one CuePoint per keyframe cluster.
+    let cues = null;
+    if (includeCues) {
+      const cuePoints = [];
+      for (const c of keyClusters) {
+        cuePoints.push(ebmlElement(EBML_IDS.CUEPOINT,
+          ebmlElement(EBML_IDS.CUETIME, ebmlWriteUInt(c.timestamp, ebmlUIntWidth(c.timestamp))),
+          ebmlElement(EBML_IDS.CUETRACKPOS,
+            ebmlElement(EBML_IDS.CUETRACK, ebmlWriteUInt(videoTrack, ebmlUIntWidth(videoTrack))),
+            ebmlElement(EBML_IDS.CUECLUSTERPOS, ebmlWriteUInt(clusterFinalPos.get(c), 8)))));
+      }
+      cues = ebmlElement.apply(null, [EBML_IDS.CUES].concat(cuePoints));
+    }
+
+    // --- SeekHead pointing at Info, Tracks (and Cues when present).
+    const seekEntry = (targetId, position) => ebmlElement(EBML_IDS.SEEK,
+      ebmlElement(EBML_IDS.SEEKID, ebmlIdBytes(targetId)),
+      ebmlElement(EBML_IDS.SEEKPOS, ebmlWriteUInt(position, 8)));
+    const seekEntries = [seekEntry(EBML_IDS.INFO, infoPos), seekEntry(EBML_IDS.TRACKS, tracksPos)];
+    if (includeCues) seekEntries.push(seekEntry(EBML_IDS.CUES, cuesPos));
+    const seekHead = ebmlElement.apply(null, [EBML_IDS.SEEKHEAD].concat(seekEntries));
+    if (seekHead.length !== seekHeadLen) return blob; // layout math broke — don't emit a bad index
+
+    // --- Assemble. Cluster bytes are copied verbatim; SimpleBlock timestamps are
+    // cluster-relative and are not touched.
+    const parts = [
+      new Uint8Array(buffer, 0, scan.headerEnd),                                        // EBML Header
+      new Uint8Array(buffer, scan.headerEnd, scan.segmentDataStart - scan.headerEnd),   // Segment ID + unknown-size VINT
+      seekHead,
+      newInfo,
+      tracksBytes,
+    ];
+    for (const c of scan.clusters) {
+      parts.push(new Uint8Array(buffer, c.offset, Math.min(c.totalSize, buffer.byteLength - c.offset)));
+    }
+    if (cues) parts.push(cues);
+    return new Blob(parts, { type: blob.type || 'video/webm' });
+
+  } catch (e) {
+    // Saving must never fail because indexing failed.
+    console.warn('makeSeekable: indexing failed, saving the un-indexed file', e);
+    return blob;
+  }
 }
 
 // ============================================================
@@ -1954,6 +2248,10 @@ async function stitchAndSave(currentBlob, currentMimeType) {
 
 async function saveFile(blob, suggestedName) {
   suggestedName = suggestedName || `recording-${formatDateForFilename()}.webm`;
+  // Inject Duration + Cues so the saved file is seekable. Every save path (single,
+  // stitched, recovered, separate-part fallback) funnels through here, so hooking
+  // once covers them all. Falls back to the original blob internally on any failure.
+  blob = await makeSeekable(blob);
   // Try File System Access API first
   if ('showSaveFilePicker' in window) {
     try {

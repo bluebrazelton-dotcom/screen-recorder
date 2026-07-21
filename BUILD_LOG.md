@@ -10,7 +10,7 @@
 
 **Repo:** github.com/bluebrazelton-dotcom/screen-recorder
 **License:** MIT
-**Target browsers:** Chrome 86+, Edge 86+ (requires File System Access API + getDisplayMedia)
+**Target browsers:** Chrome 86+, Edge 86+ (File System Access API + getDisplayMedia); Firefox supported since v1.8.1 (saves via download fallback; writes 8-byte unknown-size cluster VINTs — see v1.8.1)
 **Architecture:** Single `index.html` file, inline CSS + JS, no build step, no server
 
 ---
@@ -267,11 +267,121 @@ selector value reaches `videoBitsPerSecond`, audio is pinned, and the canvas cap
 
 ---
 
+### v1.8 — Seekable output: save-time Duration + Cues (2026-07-21)
+
+**Commit:** `make saved recordings seekable (save-time Duration + Cues remux)`
+
+Closes REVIEW.md P1 #6 and Known Limitation #2. MediaRecorder writes a "live" WebM:
+unknown Segment size, no `Duration` in `Info`, no `Cues` (seek index) — so players
+don't know the total length and can't jump around (confirmed on a 38-minute
+recording: no scrubbing at all). **Option A** was chosen deliberately: a
+zero-dependency finalize pass reusing the existing EBML toolkit, instead of adding
+mediabunny (Option B, rejected to keep the zero-dependency architecture).
+
+**`makeSeekable(blob)`** runs once at the top of `saveFile()`. Because every save
+path funnels through `saveFile` (single, stitched, recovered, separate-part
+fallback), all saved files get indexed automatically. It is **metadata-only
+remuxing** — cluster bytes are copied verbatim, nothing is re-encoded. Final layout:
+
+```
+[EBML Header][Segment( SeekHead → Info(+Duration) → Tracks → Clusters… → Cues )]
+```
+
+1. **Duration** (`0x4489`, an IEEE float — 8-byte big-endian, in timestampScale
+   ticks): max block timestamp in the last cluster, guarded by the highest cluster
+   timestamp seen anywhere, plus one ~30fps frame (33ms). This alone makes the
+   scrubber show total length.
+2. **Cues:** one CuePoint per cluster whose FIRST video `SimpleBlock` is a keyframe
+   (`flags & 0x80`) — non-keyframe clusters are skipped, not cued. Positions are
+   relative to the Segment DATA start in the final layout, written as fixed-width
+   8-byte uints (stable element sizes ⇒ one-pass layout math).
+3. **SeekHead** first in the Segment, pointing at Info, Tracks, and Cues (players
+   need it to find Cues at the end of a Segment with unknown size).
+4. **Segment size stays UNKNOWN** (the 8-byte marker MediaRecorder writes). A known
+   size isn't needed for seeking and would exceed `ebmlWriteSize`'s 4-byte cap on
+   recordings over ~268 MB.
+
+**Safety contract:** the whole pass is wrapped in try/catch plus structural sanity
+checks (missing/oversized Info or Tracks, clusters before the preamble, layout math
+mismatch → bail). On ANY failure the ORIGINAL blob is returned unchanged — a
+recording that saves un-seekable is acceptable; a recording that fails to save is
+not. The recording pipeline (`addChunk`, timeslice, recovery) is untouched; the ~1s
+crash-loss guarantee is unaffected.
+
+**Also in this change:** `webmScan` now records the EBML header end, Segment data
+start, and Info/Tracks regions (used by `makeSeekable`), and its unknown-size
+cluster byte-scan requires a Timestamp element (`0xE7`) as the first child of a
+candidate Cluster — closing REVIEW.md P2 #8 (false-positive cluster boundaries in
+compressed data), which matters now that the seek index is built from those
+boundaries.
+
+**Verification:** Node harness extended to 16 scenarios / 64 assertions. New: a
+synthetic Chrome-shaped WebM (unknown-size Segment + 1-byte unknown-size clusters,
+video+audio tracks, keyframe and non-keyframe clusters) is indexed and re-verified
+structurally — Duration float correct, SeekHead entries resolve, every
+`CueClusterPosition` lands exactly on a Cluster ID, non-keyframe cluster skipped;
+the full `finalizeRecording` path writes an indexed file; corrupt input returns the
+identical original blob; a truncated (crash-tail) file still indexes from its intact
+clusters. All 12 prior scenarios pass unchanged (their fake blobs exercise the
+fallback path through `saveFile`). Independent check: `ffprobe` reads the injected
+duration exactly and reports zero container errors. Real-recording seek tests in
+Chrome (short + 5–10 min, single/stitched/recovered): see manual acceptance tests.
+
+---
+
+### v1.8.1 — Firefox pause/resume truncation fix (2026-07-21)
+
+**Commit:** `fix Firefox truncation: byte-pattern unknown-size VINT detection + coverage guard`
+
+**Bug (found by Blue in real Firefox testing):** a paused-and-resumed recording saved
+in Firefox played only up to the pause point. Forensics on the failing file showed
+ALL the data present (cluster timestamps 0 → 67,521ms) but `Duration` stamped as
+7,519ms — the length of the first cluster. Firefox's player trusts the metadata and
+refuses to play past the declared end, so v1.8's new Duration field walled off
+everything after the first cluster. (v1.7 had no Duration, so Firefox derived length
+itself — which is why this never showed before.)
+
+**Root cause — REVIEW.md P2 #9, no longer harmless:** Firefox writes every Cluster
+with the 8-byte unknown-size VINT (`0x01 FF FF FF FF FF FF FF`); Chrome uses the
+1-byte form (`0xFF`). `ebmlReadVarInt`'s unknown-size check compared numeric values,
+and for width 8 the all-ones value and the largest known value round to the same
+float64 — so the marker parsed as a huge KNOWN size, `webmScan` clamped it to EOF and
+saw the whole recording as ONE cluster, and the Duration walk stopped at the second
+cluster's header.
+
+**Fixes:**
+
+1. **Byte-pattern unknown-size detection** in `ebmlReadVarInt`: a size is unknown iff
+   all value bits are set — checked on the bytes, not the parsed number. Closes P2
+   #9 for real. Chrome files are unaffected (1-byte markers were already detected);
+   the Segment's 8-byte marker is now detected directly instead of being rescued by
+   `safeEnd` clamping.
+
+2. **Coverage guard in `makeSeekable`:** `webmScan` now reports `scanEnd` (how far
+   the top-level scan got). If more than 4KB of the file lies beyond it, the rebuild
+   is skipped and the original blob is saved un-indexed — indexing must never
+   silently drop tail data it didn't understand.
+
+**Verification:** harness now 18 scenarios / 81 assertions — new: byte-pattern VINT
+detection cases (1/2/8-byte unknown markers; legit 8-byte known size keeps its exact
+value); a Firefox-shaped synthetic file (8-byte cluster markers) fully indexes with
+Duration from the LAST cluster and per-cluster CuePoints; a coverage-guard scenario
+proves early-scan-stop returns the original blob. On the real failing file: fixed
+scan finds 10 clusters (0→67,521ms), re-index writes Duration 74,539ms, and ffprobe
+independently reads 74.539s. Previously saved v1.8 Firefox files can be repaired by
+re-running them through the fixed `makeSeekable`.
+
+**Scope note:** Firefox is now a supported target (it's the project owner's primary
+browser). Firefox saves via the download fallback (no File System Access API);
+recording, crash recovery, stitching, and seeking all apply.
+
+---
+
 ## Known limitations
 
 1. **Memory usage during stitching:** All segment blobs are loaded into memory for concatenation. For very long recordings (multiple hours), this could hit browser memory limits. Future improvement: stream-based stitching.
 
-2. **No seeking in output:** MediaRecorder-produced WebM files lack a Cues element (seek index), so players can't seek precisely. This affects both single and stitched recordings. Fix would require writing Cues at save time.
+2. ~~**No seeking in output:** MediaRecorder-produced WebM files lack a Cues element (seek index), so players can't seek precisely. This affects both single and stitched recordings. Fix would require writing Cues at save time.~~ — ✓ Fixed in v1.8: `makeSeekable()` writes Duration + Cues at save time (zero-dependency remux in `saveFile`). Files that fail indexing still save, just un-seekable.
 
 3. **WebM only:** No MP4 output. Some platforms (iOS, older Android) have limited WebM support. mediabunny could add MP4 output in a future version.
 
@@ -288,7 +398,7 @@ selector value reaches `videoBitsPerSecond`, audio is pinned, and the canvas cap
 - ~~**Webcam preview before recording**~~ — ✓ Done in v1.4
 - **Screen switching mid-recording** — swap the screen source without stopping (browser picker interrupts briefly; produces black frames at the cut)
 - **Black frame removal** — detect and trim black frames at stitch points (requires WebCodecs decode or canvas analysis)
-- **mediabunny integration** — replace MediaRecorder with WebCodecs + mediabunny for MP4 output, streaming-to-disk, and proper Cues/seeking
+- **mediabunny integration** — replace MediaRecorder with WebCodecs + mediabunny for MP4 output and streaming-to-disk (Cues/seeking no longer needs it — done zero-dependency in v1.8)
 - **Trimming** — basic start/end trim before saving
 - **Two-step tool** — separate lightweight video editor page for stitching, trimming, and cleanup (keeps the recorder simple)
 - ~~**Project name**~~ — ✓ Named **DidaRec** (part of DidaWorks) in v1.5
@@ -357,6 +467,14 @@ screen-recorder/
 4. Status should confirm the recording was preserved (not deleted)
 5. Reload the page — the recovery banner should reappear with the recording,
    which can then be recovered and saved
+
+**Manual acceptance test (seeking, v1.8):**
+1. Record a short (~15s) clip and a longer (~5–10 min) one; save normally
+2. Open each saved file in Chrome — the scrubber must show the total length
+3. Click around the timeline and use arrow keys — playback must jump correctly
+   both forward and backward, landing cleanly (keyframe-aligned)
+4. Repeat for a stitched (Continue Recording) file and a crash-recovered file —
+   both also pass through `saveFile` and must be seekable
 
 **Manual acceptance test (background-tab draw loop):**
 1. Start recording screen + mic with something animating on screen (a video or timer)
