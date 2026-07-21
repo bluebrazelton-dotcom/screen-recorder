@@ -234,6 +234,14 @@
     max-width: 160px;
   }
 
+  .control-label {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    font-weight: 500;
+    padding: 0.5rem 0.2rem;
+    white-space: nowrap;
+  }
+
   .action-btns {
     display: flex;
     gap: 0.5rem;
@@ -428,6 +436,14 @@
           <option value="">Default microphone</option>
         </select>
       </div>
+      <div class="source-group">
+        <span class="control-label">Quality</span>
+        <select class="device-select" id="qualitySelect" onchange="onQualityChanged()">
+          <option value="800000">Smaller file</option>
+          <option value="1200000" selected>Balanced</option>
+          <option value="2500000">Best quality</option>
+        </select>
+      </div>
     </div>
     <div class="action-btns">
       <button class="primary btn-pause" id="btnPause" onclick="pauseResume()" style="display:none;">Pause</button>
@@ -460,6 +476,9 @@ const state = {
   micStream: null,
   compositeStream: null,
   animFrameId: null,
+  drawFrame: null,      // current one-frame draw fn while compositing (also a sentinel)
+  drawWorker: null,     // Web Worker timer that drives the draw loop when the tab is hidden
+  drawWorkerUrl: null,  // object URL for the inline worker (revoked on stop)
   timerInterval: null,
   startTime: null,
   pausedDuration: 0,
@@ -705,6 +724,7 @@ function updateToggleUI() {
   document.getElementById('cameraSelect').disabled = disabled || !state.sources.camera;
   document.getElementById('pipShapeSelect').disabled = disabled || !state.sources.camera;
   document.getElementById('micSelect').disabled = disabled || !state.sources.mic;
+  document.getElementById('qualitySelect').disabled = disabled;
 }
 
 // ============================================================
@@ -766,6 +786,10 @@ function onDeviceSelected(type) {
 function onPipShapeChanged() {
   pipState.shape = document.getElementById('pipShapeSelect').value;
   savePipLayout();
+}
+
+function onQualityChanged() {
+  try { localStorage.setItem('videoBitrate', document.getElementById('qualitySelect').value); } catch (e) { /* ignore */ }
 }
 
 // Re-enumerate when devices change (plugging in a USB mic, etc.)
@@ -988,15 +1012,26 @@ function startCompositing() {
   const screenTrack = state.screenStream?.getVideoTracks()[0];
   if (screenTrack) {
     const settings = screenTrack.getSettings();
-    canvas.width = settings.width || 1920;
-    canvas.height = settings.height || 1080;
+    // Cap the recorded resolution at 1080p. On a 1440p/4K screen this keeps the
+    // file size and encoder load down and makes the lower bitrate look clean; the
+    // PiP uses fractional coordinates so it is unaffected.
+    const sw = settings.width || 1920;
+    const sh = settings.height || 1080;
+    const maxH = 1080;
+    if (sh > maxH) {
+      canvas.width = Math.round(sw * (maxH / sh));
+      canvas.height = maxH;
+    } else {
+      canvas.width = sw;
+      canvas.height = sh;
+    }
   } else if (state.cameraStream) {
     // Camera only mode
     canvas.width = 1280;
     canvas.height = 720;
   }
 
-  function drawFrame() {
+  function drawOneFrame() {
     // Clear
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -1086,18 +1121,65 @@ function startCompositing() {
       }
     }
 
-    state.animFrameId = requestAnimationFrame(drawFrame);
   }
 
-  drawFrame();
+  state.drawFrame = drawOneFrame;   // sentinel + entry point for the clock
+  startDrawClock();
 }
 
-function stopCompositing() {
+// ------------------------------------------------------------
+// Draw-loop clock (background-tab safe)
+// ------------------------------------------------------------
+// Chrome pauses requestAnimationFrame in hidden/occluded tabs, which would freeze
+// the recorded video when a user switches to full-screen slides (audio keeps going).
+// Drive the draw loop from a Web Worker timer while the tab is hidden (worker timers
+// keep firing when the page isn't visible) and from rAF while it's visible. Switch on
+// visibilitychange.
+function startDrawClock() {
+  stopDrawClock();
+  if (document.hidden) startWorkerClock();
+  else startRafClock();
+}
+
+function startRafClock() {
+  const tick = () => {
+    if (state.drawFrame) state.drawFrame();
+    state.animFrameId = requestAnimationFrame(tick);
+  };
+  state.animFrameId = requestAnimationFrame(tick);
+}
+
+function startWorkerClock() {
+  if (!state.drawWorker) {
+    // Inline, zero-dependency worker: a bare timer that pings the main thread.
+    const src =
+      'let id=null;onmessage=function(e){var d=e.data||{};' +
+      'if(d.type==="start"){clearInterval(id);id=setInterval(function(){postMessage(0);},d.interval||33);}' +
+      'else if(d.type==="stop"){clearInterval(id);id=null;}};';
+    state.drawWorkerUrl = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    state.drawWorker = new Worker(state.drawWorkerUrl);
+    state.drawWorker.onmessage = () => { if (state.drawFrame) state.drawFrame(); };
+  }
+  state.drawWorker.postMessage({ type: 'start', interval: 33 });   // ~30 fps
+}
+
+function stopDrawClock() {
   if (state.animFrameId) {
     cancelAnimationFrame(state.animFrameId);
     state.animFrameId = null;
   }
+  if (state.drawWorker) state.drawWorker.postMessage({ type: 'stop' });
 }
+
+function stopCompositing() {
+  stopDrawClock();
+  state.drawFrame = null;
+  if (state.drawWorker) { state.drawWorker.terminate(); state.drawWorker = null; }
+  if (state.drawWorkerUrl) { URL.revokeObjectURL(state.drawWorkerUrl); state.drawWorkerUrl = null; }
+}
+
+// Switch clocks when the tab is hidden/shown, but only while compositing.
+document.addEventListener('visibilitychange', () => { if (state.drawFrame) startDrawClock(); });
 
 // ============================================================
 // Audio mixing
@@ -1616,23 +1698,46 @@ async function startRecording() {
     state.chunkIndex = 0;
 
     // Create MediaRecorder with 1-second chunks
+    // Video bitrate from the Quality selector (default Balanced ~1.2 Mbps).
+    const videoBitrate = parseInt(document.getElementById('qualitySelect').value, 10) || 1_200_000;
     const recorder = new MediaRecorder(combinedStream, {
       mimeType,
-      videoBitsPerSecond: 2_500_000,
+      videoBitsPerSecond: videoBitrate,
+      audioBitsPerSecond: 128_000,
     });
 
     // Track the last chunk write so we can await it before finalizing
     let lastChunkWrite = Promise.resolve();
+    let writeFailed = false;
+
+    // A chunk that can't be written (most likely the IndexedDB quota is full on a long
+    // recording) must stop recording — further chunks would drop silently and corrupt the
+    // WebM. Surface a plain-language error, stop, and let onstop -> finalize save what we have
+    // (the file goes to disk via the File System Access API, which the full quota doesn't block).
+    const handleWriteFailure = (err) => {
+      if (writeFailed) return;      // react only once
+      writeFailed = true;
+      console.error('Failed to store chunk:', err);
+      const quotaFull = err && (err.name === 'QuotaExceededError' ||
+        err.name === 'NS_ERROR_DOM_QUOTA_REACHED' || (err.inner && err.inner.name === 'QuotaExceededError'));
+      showError(quotaFull
+        ? 'Storage full — stopping now and saving everything recorded so far.'
+        : 'Could not write the recording to storage — stopping now and saving everything recorded so far.');
+      try { if (recorder.state !== 'inactive') recorder.stop(); }   // -> onstop -> finalizeRecording()
+      catch (stopErr) { console.error('Could not stop recorder after write failure:', stopErr); }
+    };
 
     recorder.ondataavailable = (e) => {
+      if (writeFailed) return;      // drop nothing new after a failure (avoids gaps)
       if (e.data && e.data.size > 0) {
         const idx = state.chunkIndex++;
         lastChunkWrite = lastChunkWrite.then(async () => {
+          if (writeFailed) return;  // an earlier chunk already failed — stop writing
           try {
             await addChunk(state.sessionId, idx, e.data);
             updateChunkCount(idx + 1);
           } catch (err) {
-            console.error('Failed to store chunk:', err);
+            handleWriteFailure(err);
           }
         });
       }
@@ -1726,7 +1831,7 @@ async function stopRecording() {
 
 async function finalizeRecording() {
   try {
-    // Read mimeType BEFORE marking session complete (otherwise getIncompleteSession won't find it)
+    // Read the session's mimeType so we can rebuild the blob with the right codec.
     const db = await openDB();
     const sessionMimeType = await new Promise((resolve) => {
       const tx = db.transaction('sessions', 'readonly');
@@ -1736,8 +1841,10 @@ async function finalizeRecording() {
       tx.oncomplete = () => db.close();
     });
 
-    // Mark session complete
-    await completeSession(state.sessionId);
+    // NOTE: we no longer mark the session complete before saving. A recording stays
+    // "recoverable" until its bytes are actually on disk, so a cancelled or interrupted
+    // save leaves it in the recovery banner instead of being dropped. deleteSession (on a
+    // confirmed save) is now the only thing that retires a session. completeSession() is unused.
 
     // Get all chunks for the current session
     const chunks = await getSessionChunks(state.sessionId);
@@ -1754,9 +1861,13 @@ async function finalizeRecording() {
       // Multi-segment: stitch prior segments + current into one file
       await stitchAndSave(currentBlob, sessionMimeType);
     } else {
-      // Single segment: save directly
-      await saveFile(currentBlob);
-      await deleteSession(state.sessionId);
+      // Single segment: save directly. Only delete the session once it's on disk.
+      const saved = await saveFile(currentBlob);
+      if (saved) {
+        await deleteSession(state.sessionId);
+      } else {
+        showError('Save cancelled — your recording is still here. Reload the page to recover it.');
+      }
     }
 
   } catch (err) {
@@ -1786,21 +1897,26 @@ async function stitchAndSave(currentBlob, currentMimeType) {
     // Add the current recording as the final segment
     segmentBlobs.push(currentBlob);
 
+    let saved;
     if (segmentBlobs.length < 2) {
       // Only one segment has data — save directly
-      await saveFile(segmentBlobs[0] || currentBlob);
+      saved = await saveFile(segmentBlobs[0] || currentBlob);
     } else {
       // Concatenate using the EBML parser
       const stitched = await concatenateWebM(segmentBlobs);
-      await saveFile(stitched);
+      saved = await saveFile(stitched);
     }
 
-    // Clean up all sessions from IndexedDB
-    for (const seg of state.priorSegments) {
-      await deleteSession(seg.sessionId);
+    if (saved) {
+      // Only delete once the stitched file is actually on disk.
+      for (const seg of state.priorSegments) {
+        await deleteSession(seg.sessionId);
+      }
+      await deleteSession(state.sessionId);
+      state.priorSegments = [];
+    } else {
+      showError('Save cancelled — all segments preserved. Reload the page to recover them.');
     }
-    await deleteSession(state.sessionId);
-    state.priorSegments = [];
 
   } catch (err) {
     console.error('Stitching failed:', err);
@@ -1811,22 +1927,25 @@ async function stitchAndSave(currentBlob, currentMimeType) {
     );
     if (fallback) {
       let fileNum = 1;
+      let allSaved = true;
       for (const seg of state.priorSegments) {
         const chunks = await getSessionChunks(seg.sessionId);
-        if (chunks.length > 0) {
-          const blob = new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType });
-          await saveFile(blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
-          fileNum++;
-        }
+        if (chunks.length === 0) { await deleteSession(seg.sessionId); continue; }
+        const blob = new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType });
+        const ok = await saveFile(blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+        if (ok) { await deleteSession(seg.sessionId); fileNum++; }
+        else { allSaved = false; break; }
       }
-      await saveFile(currentBlob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
-
-      // Clean up
-      for (const seg of state.priorSegments) {
-        await deleteSession(seg.sessionId);
+      if (allSaved) {
+        const ok = await saveFile(currentBlob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+        if (ok) await deleteSession(state.sessionId);
+        else allSaved = false;
       }
-      await deleteSession(state.sessionId);
-      state.priorSegments = [];
+      if (allSaved) {
+        state.priorSegments = [];
+      } else {
+        showError('Save cancelled — remaining segments are still here. Reload the page to recover them.');
+      }
     } else {
       showError('Stitching failed. Your recordings are safe in the browser — refresh and use Recovery.');
     }
@@ -1849,18 +1968,18 @@ async function saveFile(blob, suggestedName) {
       await writable.write(blob);
       await writable.close();
       updateStatus('idle', 'Saved successfully');
-      return;
+      return true;                              // saved
     } catch (err) {
       if (err.name === 'AbortError') {
-        // User cancelled — that's fine, recording is still in IndexedDB
-        updateStatus('idle', 'Save cancelled — recording preserved, click Record to start a new one');
-        return;
+        // User cancelled the picker — recording is still in IndexedDB, keep it.
+        updateStatus('idle', 'Save cancelled — recording preserved, reload to recover it');
+        return false;                           // cancelled, NOT saved
       }
       throw err;
     }
   }
 
-  // Fallback: download link
+  // Fallback: download link (browsers without File System Access API)
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -1870,6 +1989,7 @@ async function saveFile(blob, suggestedName) {
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 60000);
   updateStatus('idle', 'Downloaded');
+  return true;                                  // download triggered
 }
 
 function formatDateForFilename() {
@@ -1936,43 +2056,76 @@ async function recoverRecording() {
   try {
     const sessions = window._recoverySessions || [{ id: window._recoverySessionId, mimeType: window._recoveryMimeType }];
 
-    if (sessions.length === 1) {
-      // Single segment: save directly
-      const chunks = await getSessionChunks(sessions[0].id);
-      const blob = new Blob(chunks.map(c => new Blob([c.data])), { type: sessions[0].mimeType || 'video/webm' });
-      await saveFile(blob);
-      await deleteSession(sessions[0].id);
-    } else {
-      // Multiple segments from repeated crashes: stitch them together
-      updateStatus('idle', 'Stitching recovered segments...');
-      const segmentBlobs = [];
-      for (const sess of sessions) {
-        const chunks = await getSessionChunks(sess.id);
-        if (chunks.length > 0) {
-          segmentBlobs.push(new Blob(chunks.map(c => new Blob([c.data])), { type: sess.mimeType || 'video/webm' }));
-        }
-      }
-
-      let finalBlob;
-      if (segmentBlobs.length > 1) {
-        try {
-          finalBlob = await concatenateWebM(segmentBlobs);
-        } catch (stitchErr) {
-          console.warn('Stitch failed during recovery, saving last segment:', stitchErr);
-          finalBlob = segmentBlobs[segmentBlobs.length - 1];
-          showError('Could not stitch segments — saving the most recent one.');
-        }
+    // Build a blob for each session that actually has chunks, remembering which session
+    // each blob came from so we only delete what we successfully save.
+    const segments = [];
+    for (const sess of sessions) {
+      const chunks = await getSessionChunks(sess.id);
+      if (chunks.length > 0) {
+        segments.push({ id: sess.id, blob: new Blob(chunks.map(c => new Blob([c.data])), { type: sess.mimeType || 'video/webm' }) });
       } else {
-        finalBlob = segmentBlobs[0];
-      }
-
-      await saveFile(finalBlob);
-      for (const sess of sessions) {
-        await deleteSession(sess.id);
+        await deleteSession(sess.id);   // empty session — safe to drop
       }
     }
 
-    document.getElementById('recoveryBanner').classList.remove('visible');
+    if (segments.length === 0) {
+      showError('No recording data found to recover.');
+      document.getElementById('recoveryBanner').classList.remove('visible');
+      return;
+    }
+
+    if (segments.length === 1) {
+      // Single segment: save directly, delete only if saved.
+      const saved = await saveFile(segments[0].blob);
+      if (saved) {
+        await deleteSession(segments[0].id);
+        document.getElementById('recoveryBanner').classList.remove('visible');
+      } else {
+        showError('Save cancelled — your recording stays in the list until you save it.');
+      }
+      return;
+    }
+
+    // Multiple segments from repeated crashes: try to stitch them into one file.
+    updateStatus('idle', 'Stitching recovered segments...');
+    let stitched = null;
+    try {
+      stitched = await concatenateWebM(segments.map(s => s.blob));
+    } catch (stitchErr) {
+      console.warn('Stitch failed during recovery:', stitchErr);
+    }
+
+    if (stitched) {
+      const saved = await saveFile(stitched);
+      if (saved) {
+        for (const s of segments) await deleteSession(s.id);
+        document.getElementById('recoveryBanner').classList.remove('visible');
+      } else {
+        showError('Save cancelled — all segments stay in the list until you save them.');
+      }
+      return;
+    }
+
+    // Stitching failed — save each segment as its own numbered file instead of silently
+    // keeping only the newest. Delete only the segments we actually write.
+    showError('Could not stitch the segments — saving each part as a separate file.');
+    let fileNum = 1;
+    let allSaved = true;
+    for (const s of segments) {
+      const saved = await saveFile(s.blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+      if (saved) {
+        await deleteSession(s.id);
+        fileNum++;
+      } else {
+        allSaved = false;
+        break;   // stop at the first cancel; remaining segments stay recoverable
+      }
+    }
+    if (allSaved) {
+      document.getElementById('recoveryBanner').classList.remove('visible');
+    } else {
+      showError('Save cancelled — the remaining parts stay in the list until you save them.');
+    }
   } catch (err) {
     console.error('Recovery failed:', err);
     showError('Recovery failed: ' + err.message);
@@ -2134,6 +2287,12 @@ window.addEventListener('load', () => {
 
   // Restore saved PiP shape in the dropdown
   document.getElementById('pipShapeSelect').value = pipState.shape;
+
+  // Restore saved recording quality (video bitrate)
+  try {
+    const savedBitrate = localStorage.getItem('videoBitrate');
+    if (savedBitrate) document.getElementById('qualitySelect').value = savedBitrate;
+  } catch (e) { /* ignore */ }
 
   // Feature detection
   if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {

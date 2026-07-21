@@ -186,6 +186,87 @@ Shape selection is saved to localStorage alongside position and size. The dropdo
 
 ---
 
+### v1.6 — Data-loss fixes + background-tab freeze fix (2026-07-20)
+
+**Commit:** `fix P0 save-flow data loss and background-tab freeze`
+
+Fixes the three P0 data-loss bugs from the Fable 5 review (REVIEW.md) plus the P1
+background-tab freeze (#4). All three data-loss bugs were in the SAVE flow, not the
+recording pipeline — the crash guarantee (~1s max loss) is unchanged.
+
+1. **Cancel-save no longer deletes the recording.** `saveFile()` now returns `true`
+   (saved) / `false` (cancelled). `finalizeRecording()`, `stitchAndSave()` (main +
+   separate-files fallback) and `recoverRecording()` delete sessions only after a
+   confirmed write. A cancelled save keeps the recording; it reappears in the
+   recovery banner on reload.
+
+2. **Sessions are no longer marked complete before saving.** A recording stays
+   "recoverable" until its bytes are on disk — `deleteSession` (on a confirmed save)
+   is the only thing that retires it. Closes the window where a cancelled or
+   interrupted save left a `completed` session that the recovery banner skipped and
+   `cleanupCompleted()` swept. `completeSession()` is now unused.
+
+3. **Multi-crash recovery saves every segment.** When stitching fails during
+   recovery, each segment is saved as its own numbered file (was: only the newest
+   segment saved, then ALL sessions deleted — losing the earlier segments). Only
+   sessions whose data was actually written are deleted.
+
+4. **Silent chunk-write failures now stop gracefully.** On an `addChunk` failure
+   (most likely `QuotaExceededError` when IndexedDB fills on a long recording), the
+   app shows a plain-language error, stops the recorder, and routes through the
+   normal finalize path so everything recorded so far is written to disk (via the
+   File System Access API, which the full IndexedDB quota does not block). Refuses
+   further chunks after the first failure so the stream can't develop a gap.
+
+5. **Background-tab freeze fixed (#4).** Compositing no longer freezes when the tab
+   is hidden (e.g. switching to full-screen slides). Chrome pauses
+   `requestAnimationFrame` in hidden tabs, which froze the recorded video while
+   audio kept going. The draw loop now runs on a Web Worker timer while the tab is
+   hidden and on rAF while visible, switching on `visibilitychange`. The worker is
+   an inline blob — still zero external dependencies, still one file.
+
+**Architecture note:** the draw loop is split from its clock. `drawOneFrame()` draws
+exactly one composited frame; `startDrawClock()` selects rAF (visible) or a Web
+Worker `setInterval(33ms)` (hidden) and swaps on `visibilitychange`. New `state`
+fields: `drawFrame`, `drawWorker`, `drawWorkerUrl`.
+
+**Verification:** the save-flow and clock logic were extracted and tested in Node
+with a mocked File System Access API, MediaRecorder, Worker and an in-memory
+IndexedDB (10 scenarios, 32 assertions): cancel-keeps / save-deletes for the single,
+stitch and recovery paths; recovery-stitch-fail saves each part and deletes only
+what was written; a quota failure stops and finalizes with the good chunks; the
+clock switches rAF↔worker on visibility. The background-tab freeze itself needs the
+manual test below (a real hidden-tab screen recording can't run headless).
+
+---
+
+### v1.7 — Recording size controls (2026-07-20)
+
+**Commit:** `add quality selector + 1080p cap to control file size`
+
+Addresses the "huge output" report (a 38-minute recording was ~500 MB at the old
+fixed 2.5 Mbps). At a fixed target, file size tracks bitrate × duration, so the lever
+is bitrate.
+
+1. **Quality selector.** A new dropdown by the Mic controls: Smaller file (~0.8 Mbps)
+   / Balanced (~1.2, default) / Best quality (2.5). Drives `videoBitsPerSecond`. The
+   choice is saved to localStorage and disabled during recording. Balanced roughly
+   halves the file for slide/lecture content.
+
+2. **Audio bitrate pinned** at 128 kbps (`audioBitsPerSecond`) for predictable total
+   size.
+
+3. **1080p capture cap.** `startCompositing()` caps the canvas at 1080p height
+   (aspect preserved) when the screen is larger (1440p/4K). Fewer pixels means the
+   lower bitrate looks clean and the encoder spends less. PiP is unaffected (it uses
+   fractional coordinates). Screens at or below 1080p are untouched.
+
+Verification: extended the Node harness (now 12 scenarios, 38 assertions) — the
+selector value reaches `videoBitsPerSecond`, audio is pinned, and the canvas caps to
+1920×1080 for 4K/1440p while passing 1080p/720p through unchanged.
+
+---
+
 ## Known limitations
 
 1. **Memory usage during stitching:** All segment blobs are loaded into memory for concatenation. For very long recordings (multiple hours), this could hit browser memory limits. Future improvement: stream-based stitching.
@@ -268,6 +349,20 @@ screen-recorder/
 2. Record again, crash again, reopen — banner should show 2 prior segments
 3. Click "Continue Recording" again, record, stop normally
 4. Saved file should contain all three segments stitched in order
+
+**Manual acceptance test (cancel-save preserves recording):**
+1. Start recording, record for 10+ seconds
+2. Click "Stop & save"
+3. When the browser's save dialog opens, click Cancel
+4. Status should confirm the recording was preserved (not deleted)
+5. Reload the page — the recovery banner should reappear with the recording,
+   which can then be recovered and saved
+
+**Manual acceptance test (background-tab draw loop):**
+1. Start recording screen + mic with something animating on screen (a video or timer)
+2. Fully cover or minimize the tab for ~60s while the on-screen content keeps moving
+3. Stop and save, then scrub the portion recorded while the tab was hidden
+4. The video should keep updating through that window (not a frozen frame)
 
 ---
 
