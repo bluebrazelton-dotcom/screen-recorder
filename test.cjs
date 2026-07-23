@@ -17,6 +17,8 @@ let rafQueue = [];
 let rafId = 0;
 let addChunkCalls = 0;
 let downloadClicks = [];
+let getUserMediaCalls = []; // every getUserMedia(constraints) call, for permission-prompt assertions
+let mockDevices = [];       // controllable enumerateDevices() result for label-upgrade tests
 
 // ---------- DOM / platform mocks ----------
 const ctxStub = new Proxy({}, {
@@ -35,6 +37,7 @@ function makeStream(tracks) {
 }
 function makeEl(id) {
   const cls = new Set();
+  const children = [];
   return {
     id, style: {}, _cls: cls,
     classList: {
@@ -46,10 +49,24 @@ function makeEl(id) {
     set className(v) { this._cn = v; }, get className() { return this._cn || ''; },
     set disabled(v) { this._d = v; }, get disabled() { return this._d; },
     set value(v) { this._v = v; }, get value() { return this._v || ''; },
-    set innerHTML(v) { this._h = v; }, get innerHTML() { return this._h || ''; },
+    // innerHTML clears tracked children — matches real DOM semantics closely enough
+    // for the dropdown-rebuild pattern enumerateDevices() uses (clear then appendChild).
+    set innerHTML(v) { this._h = v; children.length = 0; }, get innerHTML() { return this._h || ''; },
     set srcObject(v) { this._s = v; }, get srcObject() { return this._s; },
-    appendChild() {}, removeChild() {}, click() {},
-    querySelector() { return null; },
+    appendChild(child) { children.push(child); return child; },
+    removeChild(child) { const i = children.indexOf(child); if (i >= 0) children.splice(i, 1); },
+    // Minimal selector support: only what enumerateDevices() needs —
+    // option[value] / option[value="X"] over appended children.
+    querySelector(sel) {
+      const m = /^option\[value(?:="([^"]*)")?\]$/.exec(sel);
+      if (!m) return null;
+      if (m[1] !== undefined) return children.find(c => c.value === m[1]) || null;
+      return children.find(c => c.value !== undefined) || null;
+    },
+    querySelectorAll(sel) {
+      return /^option\[value\]$/.test(sel) ? children.filter(c => c.value !== undefined) : [];
+    },
+    click() {},
     addEventListener() {}, removeEventListener() {},
     getContext() { return ctxStub; },
     getBoundingClientRect() { return { left: 0, top: 0, width: 1280, height: 720 }; },
@@ -107,7 +124,13 @@ const sandbox = {
   IDBKeyRange: globalThis.IDBKeyRange,   // used by the streamed save's chunk cursor
   document: documentMock,
   window: windowMock,
-  navigator: { mediaDevices: { addEventListener() {}, getUserMedia: async () => makeStream([]), getDisplayMedia: async () => makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]), enumerateDevices: async () => [] } },
+  navigator: { mediaDevices: {
+    _handlers: {},
+    addEventListener(type, fn) { (this._handlers[type] = this._handlers[type] || []).push(fn); },
+    getUserMedia: async (c) => { getUserMediaCalls.push(c); return makeStream([{ kind: 'video', stop() {} }, { kind: 'audio', stop() {} }]); },
+    getDisplayMedia: async () => makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]),
+    enumerateDevices: async () => mockDevices,
+  } },
   localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
   URL: { createObjectURL: (b) => { objectUrlBlobs.push(b); return 'blob:mock'; }, revokeObjectURL: () => {} },
   requestAnimationFrame: (cb) => { rafId++; rafQueue.push({ id: rafId, cb }); return rafId; },
@@ -141,6 +164,7 @@ const ORIG_CARRY_CAP = sandbox.STREAM_CARRY_CAP;
 function flushRaf() { const q = rafQueue; rafQueue = []; for (const { cb } of q) cb(16); }
 const drain = async (n = 60) => { for (let i = 0; i < n; i++) await new Promise(r => setImmediate(r)); };
 function resetDB() { return new Promise((res) => { const r = gidb.deleteDatabase('screen-recorder-db'); r.onsuccess = r.onerror = r.onblocked = () => res(); }); }
+function dispatchDeviceChange() { (sandbox.navigator.mediaDevices._handlers.devicechange || []).forEach(fn => fn({})); }
 function readStore(name) {
   return new Promise((resolve) => {
     const req = gidb.open('screen-recorder-db');
@@ -196,6 +220,7 @@ async function resetState() {
   lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0; downloadClicks = [];
   writeCalls = []; abortCalls = 0; closedFiles = 0; failWriteAfter = -1;
   statusHistory = []; objectUrlBlobs = [];
+  getUserMediaCalls = []; mockDevices = [];
   sandbox.STREAM_CARRY_CAP = ORIG_CARRY_CAP;
 }
 
@@ -916,6 +941,95 @@ async function scenario(name, fn) {
     const fsa = await runStreamedFSA(id);
     assert(fsa.r === 'saved', 'still saves');
     assert(Buffer.compare(fsa.bytes, src) === 0, 'raw un-indexed output, byte-for-byte the recording');
+  });
+
+  // ============================================================
+  // Permission-prompt fix (REVIEW P2 #7) — v1.12
+  // ============================================================
+  await scenario('AA enumerateDevices() at load requests no media permission', async () => {
+    mockDevices = [{ kind: 'videoinput', deviceId: 'cam1', label: '' }, { kind: 'audioinput', deviceId: 'mic1', label: '' }];
+    await sandbox.enumerateDevices();
+    await drain();
+    assert(getUserMediaCalls.length === 0, 'no getUserMedia call from enumerateDevices (got ' + getUserMediaCalls.length + ')');
+  });
+
+  await scenario('AB devicechange re-enumeration is also prompt-free', async () => {
+    mockDevices = [{ kind: 'videoinput', deviceId: 'cam1', label: '' }];
+    dispatchDeviceChange();
+    await drain();
+    assert(getUserMediaCalls.length === 0, 'devicechange-triggered enumerate makes no getUserMedia call');
+  });
+
+  await scenario('AC toggling Webcam on requests camera permission lazily (not before)', async () => {
+    state.sources = { screen: true, camera: false, mic: true };
+    await sandbox.enumerateDevices();
+    await drain();
+    assert(getUserMediaCalls.length === 0, 'still zero after initial enumerate');
+    sandbox.toggleSource('camera');
+    await drain();
+    assert(getUserMediaCalls.length === 1, 'exactly one getUserMedia call from the toggle (got ' + getUserMediaCalls.length + ')');
+    assert(getUserMediaCalls[0].video && getUserMediaCalls[0].audio === false, 'camera toggle requests video only');
+  });
+
+  await scenario('AD captureMic() requests mic permission only', async () => {
+    await sandbox.captureMic();
+    await drain();
+    assert(getUserMediaCalls.length === 1, 'exactly one getUserMedia call (got ' + getUserMediaCalls.length + ')');
+    assert(getUserMediaCalls[0].video === false && getUserMediaCalls[0].audio, 'mic-only constraints');
+  });
+
+  await scenario('AE a blank re-enumerated label never overwrites a known-good one', async () => {
+    mockDevices = [{ kind: 'videoinput', deviceId: 'cam1', label: 'Logitech BRIO' }];
+    await sandbox.enumerateDevices();
+    await drain();
+    const camSelect = documentMock.getElementById('cameraSelect');
+    let opt = camSelect.querySelector('option[value="cam1"]');
+    assert(opt && opt.textContent === 'Logitech BRIO', 'label populated on first enumerate (got: ' + (opt && opt.textContent) + ')');
+
+    mockDevices = [{ kind: 'videoinput', deviceId: 'cam1', label: '' }];  // Firefox: blanks once the stream stops
+    await sandbox.enumerateDevices();
+    await drain();
+    opt = camSelect.querySelector('option[value="cam1"]');
+    assert(opt && opt.textContent === 'Logitech BRIO', 'known-good label survives a blank re-enumerate (got: ' + (opt && opt.textContent) + ')');
+  });
+
+  await scenario('AF device selection survives the label-upgrade re-enumerate', async () => {
+    mockDevices = [{ kind: 'videoinput', deviceId: 'cam1', label: '' }, { kind: 'videoinput', deviceId: 'cam2', label: '' }];
+    await sandbox.enumerateDevices();
+    await drain();
+    state.selectedCamera = 'cam2';
+    mockDevices = [{ kind: 'videoinput', deviceId: 'cam1', label: 'Front camera' }, { kind: 'videoinput', deviceId: 'cam2', label: 'USB webcam' }];
+    await sandbox.enumerateDevices();
+    await drain();
+    assert(documentMock.getElementById('cameraSelect').value === 'cam2', 'selection preserved through label upgrade');
+  });
+
+  // ============================================================
+  // Camera-only discoverability (v1.12)
+  // ============================================================
+  await scenario('AG screen-off with camera off is a no-op with a visible explanation', async () => {
+    state.sources = { screen: true, camera: false, mic: true };
+    sandbox.toggleSource('screen');
+    assert(state.sources.screen === true, 'screen forced back on (guard still enforced)');
+    assert(recordedErrors.length > 0 && /screen/i.test(recordedErrors[recordedErrors.length - 1]), 'a message explains the revert (got: ' + JSON.stringify(recordedErrors) + ')');
+  });
+
+  await scenario('AH camera-only is reachable: screen-off with camera already on', async () => {
+    state.sources = { screen: true, camera: true, mic: true };
+    sandbox.toggleSource('screen');
+    assert(state.sources.screen === false && state.sources.camera === true, 'camera-only state reached');
+    assert(recordedErrors[recordedErrors.length - 1] === '', 'no stale hint shown for a real toggle');
+  });
+
+  await scenario('AI toggling camera off in camera-only mode reverts with an explanation', async () => {
+    state.sources = { screen: false, camera: true, mic: true };
+    sandbox.toggleSource('camera');
+    assert(state.sources.screen === true && state.sources.camera === false, 'reverted to screen mode');
+    assert(recordedErrors.length > 0 && /screen/i.test(recordedErrors[recordedErrors.length - 1]), 'the snap-back is explained, not silent');
+  });
+
+  await scenario('AJ camera defaults off (no stream at load, so the toggle is truthful)', async () => {
+    assert(state.sources.camera === false, 'state.sources.camera defaults to false (got ' + state.sources.camera + ')');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

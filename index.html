@@ -526,7 +526,7 @@
 // State
 // ============================================================
 const state = {
-  sources: { screen: true, camera: true, mic: true },
+  sources: { screen: true, camera: false, mic: true },
   selectedCamera: '',  // deviceId, empty = default
   selectedMic: '',     // deviceId, empty = default
   recording: false,
@@ -758,6 +758,9 @@ function toggleSource(source) {
   // At least one video source must be on
   if (!state.sources.screen && !state.sources.camera) {
     state.sources.screen = true;
+    showError('At least one of Screen or Webcam has to stay on, so Screen was turned back on.');
+  } else {
+    showError('');
   }
   updateToggleUI();
   updateRecordButton();
@@ -852,34 +855,36 @@ function updateToggleUI() {
 // ============================================================
 async function enumerateDevices() {
   try {
-    // Request a brief permission so labels are visible (Chrome hides labels until granted)
-    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).catch(() => null);
-
+    // No temp getUserMedia here anymore — enumerate as-is; labels come back
+    // blank pre-grant and that's fine (fallbacks below). Grant happens lazily
+    // at first use (captureCamera/captureMic), which re-enumerates afterward.
     const devices = await navigator.mediaDevices.enumerateDevices();
-
-    // Release the temp stream immediately
-    if (tempStream) tempStream.getTracks().forEach(t => t.stop());
 
     const cameras = devices.filter(d => d.kind === 'videoinput');
     const mics = devices.filter(d => d.kind === 'audioinput');
 
-    // Populate camera dropdown
+    // Populate camera dropdown — never let a blank label overwrite a known-good
+    // one (Firefox blanks labels again once the granting stream stops)
     const camSelect = document.getElementById('cameraSelect');
+    const priorCamLabels = {};
+    camSelect.querySelectorAll('option[value]').forEach(opt => { if (opt.value) priorCamLabels[opt.value] = opt.textContent; });
     camSelect.innerHTML = '<option value="">Default camera</option>';
     cameras.forEach((cam, i) => {
       const opt = document.createElement('option');
       opt.value = cam.deviceId;
-      opt.textContent = cam.label || `Camera ${i + 1}`;
+      opt.textContent = cam.label || priorCamLabels[cam.deviceId] || `Camera ${i + 1}`;
       camSelect.appendChild(opt);
     });
 
-    // Populate mic dropdown
+    // Populate mic dropdown — same rule
     const micSelect = document.getElementById('micSelect');
+    const priorMicLabels = {};
+    micSelect.querySelectorAll('option[value]').forEach(opt => { if (opt.value) priorMicLabels[opt.value] = opt.textContent; });
     micSelect.innerHTML = '<option value="">Default microphone</option>';
     mics.forEach((mic, i) => {
       const opt = document.createElement('option');
       opt.value = mic.deviceId;
-      opt.textContent = mic.label || `Microphone ${i + 1}`;
+      opt.textContent = mic.label || priorMicLabels[mic.deviceId] || `Microphone ${i + 1}`;
       micSelect.appendChild(opt);
     });
 
@@ -944,7 +949,9 @@ async function captureCamera() {
   if (state.selectedCamera) {
     constraints.video.deviceId = { exact: state.selectedCamera };
   }
-  return navigator.mediaDevices.getUserMedia(constraints);
+  const stream = await navigator.mediaDevices.getUserMedia(constraints);
+  enumerateDevices(); // camera permission is live now — upgrade labels (fire-and-forget)
+  return stream;
 }
 
 async function captureMic() {
@@ -955,10 +962,12 @@ async function captureMic() {
   if (state.selectedMic) {
     audioConstraints.deviceId = { exact: state.selectedMic };
   }
-  return navigator.mediaDevices.getUserMedia({
+  const stream = await navigator.mediaDevices.getUserMedia({
     audio: audioConstraints,
     video: false,
   });
+  enumerateDevices(); // mic permission is live now — upgrade labels (fire-and-forget)
+  return stream;
 }
 
 // ============================================================
@@ -3295,6 +3304,7 @@ function updateTimerDisplay() {
 window.addEventListener('load', () => {
   checkForRecovery();
   enumerateDevices();
+  updateToggleUI(); // sync toggle buttons + selectors with real state (camera starts off)
 
   // Restore saved PiP shape in the dropdown
   document.getElementById('pipShapeSelect').value = pipState.shape;

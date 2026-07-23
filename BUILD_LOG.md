@@ -538,6 +538,83 @@ test below.
 
 ---
 
+### v1.12 — Permission-prompt fix + camera-only discoverability (2026-07-23)
+
+**Commit:** `fix load-time permission prompt (REVIEW #7) + camera-only discoverability`
+
+Closes REVIEW.md P2 #7. `enumerateDevices()` requested a temporary camera+mic
+stream on every page load and on every `devicechange` event purely to read device
+labels, then released it. Chrome persists the resulting grant so this only ever
+prompted once; Firefox does not persist grants by default, so faculty saw a
+camera+mic permission dialog on every single load — the worst possible first
+impression for a privacy-minded audience, and Firefox is now the primary browser.
+
+1. **No media request at load.** `enumerateDevices()` now calls
+   `navigator.mediaDevices.enumerateDevices()` directly. Pre-grant, labels come
+   back blank; the existing `Camera N` / `Microphone N` fallbacks cover that.
+2. **Lazy grant through existing use sites.** `captureCamera()` and `captureMic()`
+   — already the only two `getUserMedia` call sites, reached via the Webcam
+   toggle and record-start respectively — each call `enumerateDevices()`
+   immediately after a successful grant to upgrade labels while the permission
+   is live.
+3. **Blank labels never clobber a known-good one.** `enumerateDevices()` now
+   snapshots each dropdown's current option labels before rebuilding it; if a
+   re-enumerate returns a blank label for a deviceId that already has a real
+   name, the real name is kept. This matters specifically for Firefox, which
+   blanks labels again once the granting stream's tracks stop.
+4. Selection restore (`state.selectedCamera`/`selectedMic` → dropdown value) is
+   unchanged and verified to survive the label-upgrade path.
+
+The `devicechange` listener needed no changes — it already calls
+`enumerateDevices()`, which is prompt-free after this fix.
+
+**Camera-only discoverability.** Blue's report ("webcam on, screen off exists in
+code but I can't reach it") traced to a root cause the original hypothesis didn't
+quite capture: `state.sources.camera` defaulted to `true` at page load even though
+no camera stream is ever started until the Webcam toggle is explicitly clicked.
+An earlier version of this fix tried to paper over that by auto-starting the
+camera preview whenever camera-only was entered via Screen-off — but Blue caught
+in real-browser testing that this made clicking Screen silently trigger a camera
+permission request and take over the viewer, with no message, in both Firefox and
+Chrome. That's worse than the original bug and fights the whole point of this
+session (no surprise permission requests from a control the user didn't touch).
+
+**Actual fix:** make the default match reality instead of compensating for the
+mismatch.
+
+- `state.sources.camera` now defaults to `false` (line ~529) — matching that no
+  camera stream is running at load.
+- The load handler now calls `updateToggleUI()` (it never had before), so the
+  Camera button, `cameraSelect`, `pipShapeSelect`, and `mirrorToggle` all reflect
+  the real default state visually from the start instead of relying on a
+  hardcoded `active` class in the HTML.
+- The at-least-one-source guard still forces Screen back on when both would be
+  off, but now always calls `showError()` explaining the revert instead of
+  staying silent — this is the part that actually needed a message: a genuinely
+  fresh load, click Screen off with nothing else touched, both sources would go
+  off, guard fires, message shown.
+- Clicking Webcam is now the *only* place a camera stream starts — one clean,
+  explicit-gesture permission request, same as before this fix. Camera-only is
+  then reached normally: turn Webcam on (preview starts), turn Screen off (guard
+  doesn't fire, camera's already on, preview's already showing). No auto-start
+  hack needed or present.
+
+**Verification:** harness now 40 scenarios / 200 assertions. New: no
+`getUserMedia` call from `enumerateDevices()` at load or on `devicechange`; the
+Webcam toggle makes exactly one lazy camera request; `captureMic()` makes a
+mic-only request; a blank re-enumerate never overwrites a populated label;
+device selection survives the label-upgrade re-enumerate; the guard's revert is
+explained via `showError()`; camera-only is reached cleanly when camera is
+already on; toggling camera off in camera-only mode reverts with an explanation;
+`state.sources.camera` defaults to `false`. All 30 prior scenarios pass
+unchanged. Real-browser acceptance (zero-prompt Firefox load, no surprise camera
+activation, camera-only end-to-end in both browsers, device labels populating in
+Chrome) is the manual test below — owner's step; the auto-start version of this
+fix was caught exactly this way, so it's worth re-running fully rather than
+spot-checking.
+
+---
+
 ## Known limitations
 
 1. **Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.
@@ -581,7 +658,7 @@ screen-recorder/
 ├── LICENSE         # MIT License
 ├── BUILD_LOG.md    # This file
 ├── REVIEW.md       # Fable 5 code review — tracked items + build queue
-└── test.cjs        # Node harness (30 scenarios / 183 assertions; npm i fake-indexeddb)
+└── test.cjs        # Node harness (40 scenarios / 200 assertions; npm i fake-indexeddb)
 ```
 
 ---
@@ -660,6 +737,18 @@ screen-recorder/
 4. Kill the tab mid-recording on a long session, reload, Recover & save — the
    recovery save must also complete without a memory spike
 5. Finish with a short (~15 s) sanity clip in each browser
+
+**Manual acceptance test (zero-prompt load + camera-only, v1.12 — Firefox primary):**
+1. In a Firefox profile with no persisted camera/mic grants, load the page — zero
+   permission prompts.
+2. Click Webcam — exactly one camera prompt fires; the preview appears; the device
+   label upgrades from generic ("Camera 1") to the real name once granted.
+3. Reload the page — still zero prompts.
+4. Click Screen off (leaving Webcam on) — camera-only mode, live preview visible,
+   Record enabled; record a short clip, save, confirm it plays.
+5. From the default state, click Screen off first — the app explains you need
+   Webcam on first; click Webcam, then Screen off — camera-only reached correctly.
+6. Repeat steps 1–2 in Chrome — no regression.
 
 **Manual acceptance test (Firefox cancel/failed download, v1.9):**
 1. In Firefox, set "Always ask you where to save files" (Settings → General → Downloads)

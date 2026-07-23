@@ -89,12 +89,19 @@ at save time only. Do NOT switch recording to non-fragmented MP4 — see build l
 
 ## P2 — Robustness and UX
 
-7. **Permission prompt on page load** (`enumerateDevices()` ~line 716 calls
+7. — ✓ FIXED v1.12 (dropped the load-time temp `getUserMedia`; `enumerateDevices()`
+   enumerates directly; `captureCamera`/`captureMic` re-enumerate on grant to upgrade
+   labels; a blank re-enumerate never overwrites a known-good label) **Permission
+   prompt on page load** (`enumerateDevices()` ~line 716 calls
    `getUserMedia({audio:true,video:true})` on load). Privacy-minded faculty see a
    camera+mic prompt before touching anything. Enumerate without labels initially;
    request permission lazily on first toggle/use, then re-enumerate for labels.
    (Elevated by the v1.9 Firefox-first pass: Firefox doesn't persist mic/camera grants
    by default, so this prompt shows on every load in the now-primary browser.)
+   *(Camera-only discoverability — flagged as an open item in the Firefox-first pass —
+   resolved in the same v1.12 session: the at-least-one-source guard now explains
+   itself via `showError()` instead of failing silently, and entering camera-only via
+   Screen-off auto-starts the camera preview. Full diagnosis in BUILD_LOG v1.12.)*
 8. — ✓ FIXED v1.8 (byte-scan now requires a Timestamp element `0xE7` as the first child of a candidate Cluster; done alongside the Cues writer, which builds the seek index from these boundaries) **EBML byte-scan validation is weaker than its comment claims** (~lines 1263–1287).
    The comment says a Timestamp element should follow "at a plausible position" but the
    code only checks that a size VINT parses (almost any byte ≥ 0x01 passes). Add the
