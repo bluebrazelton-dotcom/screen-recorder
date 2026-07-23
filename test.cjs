@@ -5,8 +5,14 @@ require('fake-indexeddb/auto'); // registers globalThis.indexedDB in the main re
 const gidb = globalThis.indexedDB;
 
 // ---------- shared spies / captures ----------
-let lastWritten = [];
+let lastWritten = [];     // one combined Blob per SAVED FILE (pushed on close())
+let writeCalls = [];      // every individual write() payload, across files
+let abortCalls = 0;       // writable.abort() invocations
+let closedFiles = 0;      // writable.close() invocations
+let failWriteAfter = -1;  // >=0: the FSA mock throws on the Nth write() call
 let recordedErrors = [];
+let statusHistory = [];   // every updateStatus() text, in order
+let objectUrlBlobs = [];  // every Blob handed to URL.createObjectURL (downloads)
 let rafQueue = [];
 let rafId = 0;
 let addChunkCalls = 0;
@@ -98,11 +104,12 @@ class AudioContextMock {
 const sandbox = {
   console, Blob, setTimeout, clearTimeout, setInterval, clearInterval,
   indexedDB: gidb,
+  IDBKeyRange: globalThis.IDBKeyRange,   // used by the streamed save's chunk cursor
   document: documentMock,
   window: windowMock,
   navigator: { mediaDevices: { addEventListener() {}, getUserMedia: async () => makeStream([]), getDisplayMedia: async () => makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]), enumerateDevices: async () => [] } },
   localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
-  URL: { createObjectURL: () => 'blob:mock', revokeObjectURL: () => {} },
+  URL: { createObjectURL: (b) => { objectUrlBlobs.push(b); return 'blob:mock'; }, revokeObjectURL: () => {} },
   requestAnimationFrame: (cb) => { rafId++; rafQueue.push({ id: rafId, cb }); return rafId; },
   cancelAnimationFrame: (id) => { rafQueue = rafQueue.filter(x => x.id !== id); },
   MediaRecorder: MediaRecorderMock,
@@ -126,6 +133,9 @@ const api = sandbox.__api;
 const state = api.state;
 const ORIG = { addChunk: sandbox.addChunk, concatenateWebM: sandbox.concatenateWebM };
 sandbox.showError = (m) => { recordedErrors.push(m || ''); };
+const ORIG_updateStatus = sandbox.updateStatus;
+sandbox.updateStatus = (mode, text) => { statusHistory.push(text); return ORIG_updateStatus(mode, text); };
+const ORIG_CARRY_CAP = sandbox.STREAM_CARRY_CAP;
 
 // ---------- helpers ----------
 function flushRaf() { const q = rafQueue; rafQueue = []; for (const { cb } of q) cb(16); }
@@ -149,12 +159,28 @@ async function seed(nChunks, mime) {
   for (let i = 0; i < nChunks; i++) await api.addChunk(id, i, new Blob(['x']));
   return id;
 }
+// The FSA mock models FILES, not write() calls: each writable collects its
+// parts and pushes ONE combined Blob to lastWritten when close() resolves — so
+// "lastWritten.length" means "files written" whether a save streamed in many
+// writes (v1.11) or arrived as a single blob. Individual payloads land in
+// writeCalls; abort() is counted; failWriteAfter injects a mid-write failure.
 function pickerSequence(outcomes) {
   let i = 0;
   return async () => {
     const o = outcomes[Math.min(i, outcomes.length - 1)]; i++;
     if (o === 'abort') { const e = new Error('abort'); e.name = 'AbortError'; throw e; }
-    return { createWritable: async () => ({ write(b) { lastWritten.push(b); }, close() {} }) };
+    return { createWritable: async () => {
+      const parts = [];
+      return {
+        write(b) {
+          if (failWriteAfter >= 0 && writeCalls.length >= failWriteAfter) throw new Error('disk error');
+          writeCalls.push(b);
+          parts.push(b);
+        },
+        close() { lastWritten.push(new Blob(parts)); closedFiles++; },
+        abort() { abortCalls++; },
+      };
+    } };
   };
 }
 async function resetState() {
@@ -168,6 +194,9 @@ async function resetState() {
   documentMock.getElementById('recoveryBanner').classList.remove('visible');
   documentMock.hidden = false;
   lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0; downloadClicks = [];
+  writeCalls = []; abortCalls = 0; closedFiles = 0; failWriteAfter = -1;
+  statusHistory = []; objectUrlBlobs = [];
+  sandbox.STREAM_CARRY_CAP = ORIG_CARRY_CAP;
 }
 
 // ---------- assertions ----------
@@ -674,6 +703,219 @@ async function scenario(name, fn) {
     const orig = new Blob([poison]);
     const out = await S.makeSeekable(orig);
     assert(out === orig, 'original blob returned when coverage is incomplete');
+  });
+
+  // ============================================================
+  // Streamed save (v1.11, REVIEW #5) — differential + sink scenarios
+  // ============================================================
+  // The invariant: for ANY chunked file, the streamed save's output bytes must
+  // equal makeSeekable() run on the concatenated blob — indexed files and bail
+  // cases alike (an un-indexed streaming save emits the raw bytes verbatim,
+  // which is exactly the original blob the buffered path falls back to).
+
+  function syntheticFirefoxWebm() {   // 8-byte unknown-size cluster markers (scenario O shape)
+    const header = Buffer.from([0x1A, 0x45, 0xDF, 0xA3, 0x80]);
+    const segHdr = Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    const infoEl = el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], uintBytes(1000000, 3)));
+    const tracks = el([0x16, 0x54, 0xAE, 0x6B],
+      el([0xAE], el([0xD7], [0x01]), el([0x83], [0x01])),
+      el([0xAE], el([0xD7], [0x02]), el([0x83], [0x02])));
+    const c0 = clusterUnknown(0,    [simpleBlock(1, 0, 0x80, 40), simpleBlock(2, 5, 0x80, 10)], true);
+    const c1 = clusterUnknown(7504, [simpleBlock(1, 0, 0x80, 40)], true);
+    const c2 = clusterUnknown(15000,[simpleBlock(1, 0, 0x80, 40), simpleBlock(1, 480, 0x00, 20)], true);
+    return Buffer.concat([header, segHdr, infoEl, tracks, c0, c1, c2]);
+  }
+  function syntheticAudioOnlyWebm() { // no video track → Duration-only indexing
+    const header = Buffer.from([0x1A, 0x45, 0xDF, 0xA3, 0x80]);
+    const segHdr = Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    const infoEl = el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], uintBytes(1000000, 3)));
+    const tracks = el([0x16, 0x54, 0xAE, 0x6B],
+      el([0xAE], el([0xD7], [0x01]), el([0x83], [0x02])));   // audio only
+    const c0 = clusterUnknown(0,   [simpleBlock(1, 0, 0x80, 20)]);
+    const c1 = clusterUnknown(900, [simpleBlock(1, 40, 0x80, 20)]);
+    return Buffer.concat([header, segHdr, infoEl, tracks, c0, c1]);
+  }
+  function syntheticPoisonWebm() {    // unknown-size non-cluster + 8KB tail → both paths bail
+    function clusterKnown(ts, blocks) {
+      const data = Buffer.concat([el([0xE7], uintBytes(ts, 2)), ...blocks]);
+      return Buffer.concat([Buffer.from([0x1F, 0x43, 0xB6, 0x75]), sizeVint(data.length), data]);
+    }
+    const header = Buffer.from([0x1A, 0x45, 0xDF, 0xA3, 0x80]);
+    const segHdr = Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    const infoEl = el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], uintBytes(1000000, 3)));
+    const tracks = el([0x16, 0x54, 0xAE, 0x6B], el([0xAE], el([0xD7], [0x01]), el([0x83], [0x01])));
+    const c0 = clusterKnown(0, [simpleBlock(1, 0, 0x80, 40)]);
+    const c1 = clusterKnown(1000, [simpleBlock(1, 0, 0x80, 40)]);
+    return Buffer.concat([header, segHdr, infoEl, tracks, c0, c1,
+      Buffer.from([0xEC, 0xFF]), Buffer.alloc(8192, 0x42)]);
+  }
+
+  async function seedBuffers(parts, indexes) {
+    const id = await api.createSession('video/webm;codecs=vp9,opus');
+    for (let i = 0; i < parts.length; i++) await api.addChunk(id, indexes ? indexes[i] : i, new Blob([parts[i]]));
+    return id;
+  }
+  function splitEveryByte(buf) { const out = []; for (let i = 0; i < buf.length; i++) out.push(buf.slice(i, i + 1)); return out; }
+  function splitAt(buf, offsets) {
+    const out = []; let prev = 0;
+    for (const o of offsets) { if (o > prev && o < buf.length) { out.push(buf.slice(prev, o)); prev = o; } }
+    out.push(buf.slice(prev));
+    return out;
+  }
+  function clusterIdOffsets(buf) {
+    const out = [];
+    for (let i = 0; i + 3 < buf.length; i++) {
+      if (buf[i] === 0x1F && buf[i + 1] === 0x43 && buf[i + 2] === 0xB6 && buf[i + 3] === 0x75) out.push(i);
+    }
+    return out;
+  }
+  async function expectedBytes(buf) {
+    return Buffer.from(await (await S.makeSeekable(new Blob([buf]))).arrayBuffer());
+  }
+  async function runStreamedFSA(sessionId) {
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    const r = await S.saveFile({ kind: 'session', sessionId, mimeType: 'video/webm' });
+    return { r, bytes: Buffer.from(await lastWritten.pop().arrayBuffer()) };
+  }
+  async function runStreamedDownload(sessionId) {
+    delete windowMock.showSaveFilePicker;
+    const r = await S.saveFile({ kind: 'session', sessionId, mimeType: 'video/webm' });
+    return { r, bytes: Buffer.from(await objectUrlBlobs[objectUrlBlobs.length - 1].arrayBuffer()) };
+  }
+
+  // U — the differential star: streamed === buffered, per fixture × split
+  await scenario('U streamed output byte-identical to makeSeekable (differential)', async () => {
+    const fixtures = [
+      { name: 'chrome',    buf: syntheticWebm(),               indexes: true },
+      { name: 'firefox',   buf: syntheticFirefoxWebm(),        indexes: true },
+      { name: 'truncated', buf: syntheticWebm().slice(0, -20), indexes: true },
+      { name: 'audioOnly', buf: syntheticAudioOnlyWebm(),      indexes: true },
+      { name: 'poison',    buf: syntheticPoisonWebm(),         indexes: false },  // both paths bail → raw
+    ];
+    for (const f of fixtures) {
+      const want = await expectedBytes(f.buf);
+      assert(f.indexes ? want.length > f.buf.length : want.length === f.buf.length,
+        f.name + ': buffered baseline ' + (f.indexes ? 'indexes' : 'bails to the original'));
+      const cids = clusterIdOffsets(f.buf);
+      const splits = [
+        ['whole',        [f.buf]],
+        ['midClusterId', splitAt(f.buf, cids.map(o => o + 2))],
+        ['midSizeVint',  splitAt(f.buf, cids.map(o => o + 5))],
+        ['midTimestamp', splitAt(f.buf, cids.map(o => o + 6))],
+        ['thirds',       splitAt(f.buf, [Math.floor(f.buf.length / 3), Math.floor(2 * f.buf.length / 3)])],
+      ];
+      // The brutal split — every byte its own chunk — for the real fixtures
+      // (poison is ~8.5 KB of filler tail; per-byte chunking it adds runtime,
+      // not coverage).
+      if (f.buf.length < 1000) splits.push(['everyByte', splitEveryByte(f.buf)]);
+      for (const [sname, parts] of splits) {
+        const id = await seedBuffers(parts);
+        const fsa = await runStreamedFSA(id);
+        assert(fsa.r === 'saved' && Buffer.compare(fsa.bytes, want) === 0,
+          f.name + '/' + sname + ': FSA streamed === buffered (' + fsa.bytes.length + ' vs ' + want.length + ' bytes)');
+        const dl = await runStreamedDownload(id);
+        assert(dl.r === 'downloaded' && Buffer.compare(dl.bytes, want) === 0,
+          f.name + '/' + sname + ': download streamed === buffered');
+      }
+    }
+  });
+
+  // U2 — chunk-index gaps: stream what's there, exactly like the buffered path would
+  await scenario('U2 streamed save tolerates chunk-index gaps', async () => {
+    const buf = syntheticWebm();
+    const q = Math.floor(buf.length / 4);
+    const parts = [buf.slice(0, q), buf.slice(q, 2 * q), buf.slice(2 * q, 3 * q), buf.slice(3 * q)];
+    const id = await seedBuffers(parts, [0, 1, 3, 4]);   // gap at index 2
+    const want = await expectedBytes(buf);
+    const fsa = await runStreamedFSA(id);
+    assert(fsa.r === 'saved' && Buffer.compare(fsa.bytes, want) === 0, 'gapped indexes stream the full byte sequence');
+  });
+
+  // V — picker-first: cancel costs nothing (no pass 1, no cursor work)
+  await scenario('V streamed FSA cancel-before-work', async () => {
+    const id = await seedBuffers([syntheticWebm()]);
+    windowMock.showSaveFilePicker = pickerSequence(['abort']);
+    const r = await S.saveFile({ kind: 'session', sessionId: id, mimeType: 'video/webm' });
+    assert(r === 'cancelled', 'picker cancel → cancelled');
+    assert(writeCalls.length === 0 && lastWritten.length === 0, 'nothing written');
+    assert(!statusHistory.some(t => /Preparing/.test(t)), 'pass 1 never started');
+    const chunks = await readStore('chunks');
+    assert(chunks.length === 1, 'chunks untouched');
+  });
+
+  // V2 — mid-write failure: abort() the swap file, keep the session
+  await scenario('V2 streamed FSA mid-write failure aborts and keeps the session', async () => {
+    const src = syntheticWebm();
+    const mid = Math.floor(src.length / 2);
+    const id = await seedBuffers([src.slice(0, mid), src.slice(mid)]);
+    state.sessionId = id; state.chunkIndex = 2;
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    failWriteAfter = 2;   // third write() throws
+    await api.finalizeRecording();
+    await drain();
+    assert(abortCalls === 1, 'writable.abort() called (got ' + abortCalls + ')');
+    assert(closedFiles === 0 && lastWritten.length === 0, 'no file finalized');
+    const sessions = await readStore('sessions');
+    assert(sessions.length === 1, 'session kept after failed save (got ' + sessions.length + ')');
+    assert(recordedErrors.some(m => /Save failed/.test(m) && /safe/i.test(m)), 'failure message points at recovery');
+  });
+
+  // V3 — progress + close ordering through the real finalize path
+  await scenario('V3 streamed FSA shows progress to 100% and deletes only after close', async () => {
+    const parts = splitEveryByte(syntheticWebm());
+    const id = await seedBuffers(parts);
+    state.sessionId = id; state.chunkIndex = parts.length;
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.finalizeRecording();
+    await drain();
+    assert(statusHistory.some(t => /Preparing your video/.test(t)), 'pass-1 status shown');
+    assert(statusHistory.some(t => t === 'Saving… 100%'), 'progress reached 100%');
+    assert(closedFiles === 1 && lastWritten.length === 1, 'exactly one file closed');
+    const sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'session deleted only after the confirmed (closed) save');
+  });
+
+  // W — Firefox: composed download blob identical; v1.9 confirm flow intact
+  await scenario('W firefox streamed download blob identical + confirm flow', async () => {
+    const src = syntheticWebm();
+    const mid = Math.floor(src.length / 2);
+    const id = await seedBuffers([src.slice(0, mid), src.slice(mid)]);
+    state.sessionId = id; state.chunkIndex = 2;
+    await api.finalizeRecording();   // Firefox mode (resetState removed the picker)
+    await drain();
+    assert(downloadClicks.length === 1, 'one download fired');
+    const got = Buffer.from(await objectUrlBlobs[objectUrlBlobs.length - 1].arrayBuffer());
+    const want = await expectedBytes(src);
+    assert(Buffer.compare(got, want) === 0, 'downloaded blob === buffered makeSeekable output');
+    let sessions = await readStore('sessions');
+    assert(sessions.length === 1, 'session kept until the user confirms arrival');
+    await sandbox.confirmDownloadArrived();
+    await drain();
+    sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'confirm deletes the session');
+  });
+
+  // X — rider: recovery banner numbers via cursor-sum (no chunk getAll at load)
+  await scenario('X recovery banner numbers via cursor-sum', async () => {
+    const a = await api.createSession('video/webm');
+    for (let i = 0; i < 3; i++) await api.addChunk(a, i, new Blob(['0123456789']));   // 3 × 10 B
+    const b = await api.createSession('video/webm');
+    for (let i = 0; i < 2; i++) await api.addChunk(b, i, new Blob(['12345']));        // 2 × 5 B
+    await sandbox.checkForRecovery();
+    await drain();
+    assert(documentMock.getElementById('recoveryBanner').classList.contains('visible'), 'banner shown');
+    const txt = documentMock.getElementById('recoveryInfo').textContent;
+    assert(/^Found 5 chunks \(~0m 5s, 0\.0 MB\) across 2 segments/.test(txt), 'banner text correct (got: ' + txt + ')');
+  });
+
+  // Z — carry cap exceeded → un-indexed streaming save (raw bytes, still saves)
+  await scenario('Z carry cap exceeded falls back to raw streaming save', async () => {
+    const src = syntheticWebm();
+    const id = await seedBuffers([src]);
+    sandbox.STREAM_CARRY_CAP = 32;   // absurdly small — force the bail
+    const fsa = await runStreamedFSA(id);
+    assert(fsa.r === 'saved', 'still saves');
+    assert(Buffer.compare(fsa.bytes, src) === 0, 'raw un-indexed output, byte-for-byte the recording');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

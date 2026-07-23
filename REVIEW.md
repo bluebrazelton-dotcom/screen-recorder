@@ -67,7 +67,7 @@ inspect the file.
 visibility-throttled): worker `setInterval(33ms)` → `postMessage` → draw. Keep rAF when
 visible if desired; switch clocks on `visibilitychange`.
 
-### 5. Every save materializes the whole recording in RAM
+### 5. Every save materializes the whole recording in RAM — ✓ FIXED v1.11 for single-segment saves (streamed two-pass save: per-chunk cursor pulls → bounded-carry index scan with byte-identical output to the buffered `makeSeekable` → streamed FSA writes on Chrome / reference-composed download Blob on Firefox; any indexing doubt still saves un-indexed; the page-load recovery banner cursor-sums instead of chunk-`getAll`; save progress shown. Multi-segment stitching stays buffered with a documented ceiling — BUILD_LOG Known Limitation #1 — and streaming stitch is the queued follow-on.)
 `getSessionChunks()` ~line 552 uses `getAll()` — every chunk ArrayBuffer loads at once.
 At 2.5 Mbps, a 3-hour recording ≈ 3.4 GB in memory AT SAVE TIME — the tab can crash at
 the finish line, undoing the crash-resilience story. This affects the normal save path,
@@ -158,7 +158,7 @@ top. The hardest Tier 2 feature is half-built by accident.
 
 **Suggested build order:**
 1. P0 fixes (#1–3) + background-tab test/fix (#4) — one session  ✓ DONE v1.6
-2. Streaming save (#5)
+2. Streaming save (#5)  ✓ DONE v1.11 (single-segment; streaming stitch queued)
 3. Chapter hotkeys + sidecar export (small, completes recording-side Tier 1)
 4. Caption editor with VTT/SRT import (borrow from laubonghaudoi/subtitle-editor, MIT —
    see prior-art recon in project memory `project_screen_recorder.md`)

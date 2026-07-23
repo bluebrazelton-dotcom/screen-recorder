@@ -449,9 +449,98 @@ v1.4/v1.5 PiP features); harness re-run green (22 scenarios / 99 assertions).
 
 ---
 
+### v1.11 — Streaming save: bounded-memory single-segment saves (2026-07-23)
+
+**Commit:** `stream single-segment saves: bounded memory, byte-identical output`
+
+Closes REVIEW.md P1 #5 for single-segment saves (the normal save path and
+single-crash recovery). Previously every save materialized the whole recording
+roughly three times over — chunk `getAll` → full-recording Blob →
+`makeSeekable`'s contiguous `arrayBuffer` — so a 3-hour Best-quality lecture
+(~3.5 GB) could OOM the tab at the finish line. Worse, because sessions delete
+only on `'saved'`, an OOM at save didn't lose data — it LOOPED: recovery
+re-attempted the same buffered path and died the same way, leaving the
+recording unsaveable.
+
+1. **`saveFile` grew a source type.** `saveFile(source, suggestedName)` takes
+   either a Blob (buffered path — code unchanged) or
+   `{ kind: 'session', sessionId, mimeType }` (streamed). Session sources:
+   single-segment finalize, single-segment recovery, and the stitch shortcut
+   when only the current segment has data. Blob sources (stitched files,
+   separate-part fallbacks) keep the existing `makeSeekable` path. The
+   tri-state return and every v1.9 caller-gating line are unchanged.
+
+2. **Pass 1 — streaming index scan.** `createWebmStreamScanner()` re-implements
+   `webmScan`'s decisions over the chunk stream with a hard-capped carry buffer
+   (`STREAM_CARRY_CAP`, 64 MB): EBML preamble, cluster boundaries (including
+   Firefox's 8-byte unknown-size markers, with candidate boundaries that
+   straddle chunk edges held until the up-to-13 bytes needed to validate them
+   arrive), per-cluster keyframe check and max block time while the bytes are
+   still in carry. Retains only `[0, segmentDataStart)`, the Info and Tracks
+   elements, and ~40 bytes of metadata per cluster — Duration is known before
+   anything is written, so there is no backfill patch and no v1.8.1-style
+   wrong-Duration hazard. Any doubt (cap hit, sanity guard, truncated
+   Timestamp, > 4 KB unparsed tail) → the save streams the raw chunk bytes
+   verbatim instead: un-indexed but intact. Never a partial index; never a
+   guessed Duration.
+
+3. **Pass 2 — sinks.** Chrome/Edge (FSA): the picker opens FIRST (cancel →
+   `'cancelled'`, zero work done), then pass 1, then a second chunk walk
+   writes SeekHead → Info(+Duration) → Tracks → the recorded cluster ranges
+   sliced from each chunk → Cues. `'saved'` only after `close()` resolves; a
+   mid-write failure calls `abort()` (FSA's swap file never lands) and the
+   session is kept — same recovery story as today. Firefox (download): each
+   chunk is wrapped in a small Blob during pass 1 and the final download Blob
+   is composed from `slice()` REFERENCES to those chunk Blobs — peak memory
+   drops from ~3× the recording (one copy contiguous) to ~1×, browser-managed,
+   with no contiguous full-file buffer. The v1.9 confirmation-bar flow is
+   unchanged.
+
+4. **Shared builders.** The SeekHead / Info+Duration / Cues writers were
+   extracted from `makeSeekable` (`webmBuildInfo`, `webmBuildSeekHead`,
+   `webmBuildCues`, `webmSeekHeadLen`) and are called by BOTH paths, so the
+   buffered and streamed head layouts cannot drift.
+
+5. **Riders.** `checkForRecovery` now cursor-sums chunk counts and bytes
+   (`sessionChunkStats`) — the recovery banner no longer loads every chunk of
+   every session at page load. Streamed saves show faculty-plain progress:
+   "Preparing your video…" during the scan, then "Saving… N%" in whole numbers
+   every ~5% during the write.
+
+**Chunk iteration note:** `forEachSessionChunk` opens one connection and pulls
+ONE chunk per short-lived transaction (keyed after the last index, gap-
+tolerant). A long-lived cursor can't span the write loop — IndexedDB
+transactions auto-commit whenever the event loop turns on external work (an
+FSA `write()`), which is why the pulls are per-chunk by design.
+
+**Verification:** harness now 30 scenarios / 183 assertions. The star is the
+differential suite: five fixture shapes (Chrome-style 1-byte cluster markers,
+Firefox 8-byte markers, truncated crash tail, audio-only → Duration-only,
+coverage-guard poison) × adversarial chunk splits (every byte its own chunk,
+mid-cluster-ID, mid-size-VINT, mid-Timestamp, thirds) — streamed output must
+be BYTE-IDENTICAL to `makeSeekable` run on the concatenated blob, for indexed
+files and bail cases alike (an un-indexed streaming save emits the raw bytes,
+which is exactly the buffered fallback's original blob). Also: picker cancel
+does zero work (no pass 1, no writes); an injected mid-write failure calls
+`abort()` and keeps the session recoverable; progress reaches 100% and the
+session deletes only after `close()`; chunk-index gaps stream what's there;
+the Firefox composed download is byte-identical through the real finalize
+path; banner numbers are correct via cursor-sum; a forced carry-cap bail still
+saves the raw recording. All 22 prior scenarios pass unchanged — the FSA mock
+now aggregates `write()` calls per file handle and pushes one combined Blob on
+`close()`, so existing "files written" assertions keep their original meaning.
+
+**Real acceptance (owner, both browsers):** a genuinely long recording
+(≥ 30–60 min, Best quality) with Task Manager open — memory roughly flat
+during save; output seeks correctly; kill-tab crash on a long recording →
+recover → save succeeds; then a short (~15 s) sanity clip. See the manual
+test below.
+
+---
+
 ## Known limitations
 
-1. **Memory usage during stitching:** All segment blobs are loaded into memory for concatenation. For very long recordings (multiple hours), this could hit browser memory limits. Future improvement: stream-based stitching.
+1. **Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.
 
 2. ~~**No seeking in output:** MediaRecorder-produced WebM files lack a Cues element (seek index), so players can't seek precisely. This affects both single and stitched recordings. Fix would require writing Cues at save time.~~ — ✓ Fixed in v1.8: `makeSeekable()` writes Duration + Cues at save time (zero-dependency remux in `saveFile`). Files that fail indexing still save, just un-seekable.
 
@@ -487,12 +576,12 @@ v1.4/v1.5 PiP features); harness re-run green (22 scenarios / 99 assertions).
 
 ```
 screen-recorder/
-├── index.html      # The entire app (HTML + CSS + JS, ~2700 lines)
+├── index.html      # The entire app (HTML + CSS + JS, ~3300 lines)
 ├── README.md       # Project description and usage
 ├── LICENSE         # MIT License
 ├── BUILD_LOG.md    # This file
 ├── REVIEW.md       # Fable 5 code review — tracked items + build queue
-└── test.cjs        # Node harness (22 scenarios / 99 assertions; npm i fake-indexeddb)
+└── test.cjs        # Node harness (30 scenarios / 183 assertions; npm i fake-indexeddb)
 ```
 
 ---
@@ -561,6 +650,16 @@ screen-recorder/
 2. Fully cover or minimize the tab for ~60s while the on-screen content keeps moving
 3. Stop and save, then scrub the portion recorded while the tab was hidden
 4. The video should keep updating through that window (not a frozen frame)
+
+**Manual acceptance test (streaming save memory, v1.11 — both browsers):**
+1. Record a genuinely long session (≥ 30–60 min at Best quality)
+2. Stop & save with Task Manager / about:memory open — the tab's memory should
+   stay roughly flat during "Preparing your video…" and "Saving… N%" (no spike
+   near the recording's full size)
+3. The saved file must play and seek correctly (same checks as the v1.8 list)
+4. Kill the tab mid-recording on a long session, reload, Recover & save — the
+   recovery save must also complete without a memory spike
+5. Finish with a short (~15 s) sanity clip in each browser
 
 **Manual acceptance test (Firefox cancel/failed download, v1.9):**
 1. In Firefox, set "Always ask you where to save files" (Settings → General → Downloads)

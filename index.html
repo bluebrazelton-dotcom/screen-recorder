@@ -645,6 +645,63 @@ async function getSessionChunks(sessionId) {
   });
 }
 
+// Count a session's chunks and sum their bytes WITHOUT loading them all
+// (REVIEW #5): a summing cursor holds one record at a time, so the page-load
+// recovery banner and the save-path gating never materialize a recording.
+async function sessionChunkStats(sessionId) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('chunks', 'readonly');
+    const index = tx.objectStore('chunks').index('bySession');
+    const req = index.openCursor(sessionId);
+    let count = 0, bytes = 0;
+    req.onsuccess = (e) => {
+      const cursor = e.target.result;
+      if (cursor) {
+        count++;
+        const d = cursor.value && cursor.value.data;
+        bytes += d ? d.byteLength : 0;
+        cursor.continue();
+      }
+    };
+    tx.oncomplete = () => { db.close(); resolve({ count, bytes }); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+// Iterate a session's chunks in index order, ONE at a time, through
+// `fn(data, index)`. One connection for the whole walk; one short-lived
+// transaction per chunk. Why not a single cursor: IndexedDB transactions
+// auto-commit whenever the event loop turns on external work (like an FSA
+// write), so a cursor can't survive pass 2 — per-chunk pulls keyed after the
+// last index can. Tolerates index gaps (streams what's there).
+async function forEachSessionChunk(sessionId, fn) {
+  const db = await openDB();
+  try {
+    let lastIndex = -1;
+    for (;;) {
+      const rec = await new Promise((resolve, reject) => {
+        const tx = db.transaction('chunks', 'readonly');
+        const range = IDBKeyRange.bound([sessionId, lastIndex], [sessionId, Infinity], true, false);
+        const req = tx.objectStore('chunks').openCursor(range);
+        let out = null;
+        req.onsuccess = (e) => {
+          const cursor = e.target.result;
+          if (cursor) out = { index: cursor.value.index, data: cursor.value.data };
+          // no cursor.continue() — exactly one record per transaction
+        };
+        tx.oncomplete = () => resolve(out);
+        tx.onerror = () => reject(tx.error);
+      });
+      if (!rec) return;
+      lastIndex = rec.index;
+      await fn(rec.data, rec.index);
+    }
+  } finally {
+    db.close();
+  }
+}
+
 async function deleteSession(sessionId) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -1806,6 +1863,60 @@ function webmMaxBlockTime(view, cluster) {
   return max;
 }
 
+// --- Shared finalize builders ---------------------------------------------
+// Used by BOTH the buffered makeSeekable() pass and the streamed save path
+// (REVIEW #5). Extracted so the two paths can never drift: the differential
+// tests in test.cjs assert byte-identical output between them.
+
+// Rebuild the Info element: original children minus any existing Duration,
+// plus a fresh Duration (IEEE float, timestampScale ticks). `view` must cover
+// the bytes the offsets refer to.
+function webmBuildInfo(view, infoDataStart, infoDataEnd, durationTicks) {
+  const infoParts = [];
+  let ip = infoDataStart;
+  while (ip < infoDataEnd) {
+    const id = ebmlReadId(view, ip);
+    if (!id) break;
+    const size = ebmlReadSize(view, ip + id.length);
+    if (!size || size.isUnknown) break;
+    const end = Math.min(ip + id.length + size.length + size.value, infoDataEnd);
+    if (id.value !== EBML_IDS.DURATION) {
+      infoParts.push(new Uint8Array(view.buffer, view.byteOffset + ip, end - ip));
+    }
+    ip = end;
+  }
+  infoParts.push(ebmlElement(EBML_IDS.DURATION, ebmlWriteFloat64(durationTicks)));
+  return ebmlElement.apply(null, [EBML_IDS.INFO].concat(infoParts));
+}
+
+// SeekHead size is deterministic because SeekPosition values are fixed-width
+// 8-byte uints: Seek entry = 21 bytes; SeekHead = 4(ID) + 1(size) + 21×entries.
+function webmSeekHeadLen(includeCues) { return 5 + 21 * (includeCues ? 3 : 2); }
+
+// SeekHead pointing at Info, Tracks (and Cues when cuesPos is not null).
+function webmBuildSeekHead(infoPos, tracksPos, cuesPos) {
+  const seekEntry = (targetId, position) => ebmlElement(EBML_IDS.SEEK,
+    ebmlElement(EBML_IDS.SEEKID, ebmlIdBytes(targetId)),
+    ebmlElement(EBML_IDS.SEEKPOS, ebmlWriteUInt(position, 8)));
+  const seekEntries = [seekEntry(EBML_IDS.INFO, infoPos), seekEntry(EBML_IDS.TRACKS, tracksPos)];
+  if (cuesPos !== null) seekEntries.push(seekEntry(EBML_IDS.CUES, cuesPos));
+  return ebmlElement.apply(null, [EBML_IDS.SEEKHEAD].concat(seekEntries));
+}
+
+// Cues from a keyframe-cluster list of { timestamp, position } — positions are
+// relative to the Segment data start in the FINAL layout, fixed-width 8-byte.
+function webmBuildCues(keyClusters, videoTrack) {
+  const cuePoints = [];
+  for (const c of keyClusters) {
+    cuePoints.push(ebmlElement(EBML_IDS.CUEPOINT,
+      ebmlElement(EBML_IDS.CUETIME, ebmlWriteUInt(c.timestamp, ebmlUIntWidth(c.timestamp))),
+      ebmlElement(EBML_IDS.CUETRACKPOS,
+        ebmlElement(EBML_IDS.CUETRACK, ebmlWriteUInt(videoTrack, ebmlUIntWidth(videoTrack))),
+        ebmlElement(EBML_IDS.CUECLUSTERPOS, ebmlWriteUInt(c.position, 8)))));
+  }
+  return ebmlElement.apply(null, [EBML_IDS.CUES].concat(cuePoints));
+}
+
 // The save-time finalize pass. Returns a new indexed Blob, or the ORIGINAL blob
 // unchanged if anything about the file resists parsing. Never throws.
 async function makeSeekable(blob) {
@@ -1836,19 +1947,7 @@ async function makeSeekable(blob) {
     const durationTicks = Math.max(webmMaxBlockTime(view, lastCluster), scan.lastTimestamp) + 33;
 
     // --- Rebuild Info: original children minus any existing Duration, plus ours.
-    const infoParts = [];
-    let ip = scan.infoDataStart;
-    while (ip < scan.infoDataEnd) {
-      const id = ebmlReadId(view, ip);
-      if (!id) break;
-      const size = ebmlReadSize(view, ip + id.length);
-      if (!size || size.isUnknown) break;
-      const end = Math.min(ip + id.length + size.length + size.value, scan.infoDataEnd);
-      if (id.value !== EBML_IDS.DURATION) infoParts.push(new Uint8Array(buffer, ip, end - ip));
-      ip = end;
-    }
-    infoParts.push(ebmlElement(EBML_IDS.DURATION, ebmlWriteFloat64(durationTicks)));
-    const newInfo = ebmlElement.apply(null, [EBML_IDS.INFO].concat(infoParts));
+    const newInfo = webmBuildInfo(view, scan.infoDataStart, scan.infoDataEnd, durationTicks);
 
     const tracksBytes = new Uint8Array(buffer, scan.tracksStart, scan.tracksDataEnd - scan.tracksStart);
 
@@ -1865,7 +1964,7 @@ async function makeSeekable(blob) {
     // after the Segment size VINT) in the FINAL file. SeekHead size is
     // deterministic because SeekPosition values are fixed-width 8-byte uints:
     // Seek entry = 21 bytes; SeekHead = 4(ID) + 1(size) + 21×entries.
-    const seekHeadLen = 5 + 21 * (includeCues ? 3 : 2);
+    const seekHeadLen = webmSeekHeadLen(includeCues);
     const infoPos = seekHeadLen;
     const tracksPos = infoPos + newInfo.length;
     const clustersPos = tracksPos + tracksBytes.length;
@@ -1881,26 +1980,12 @@ async function makeSeekable(blob) {
     const cuesPos = runningPos;
 
     // --- Cues: one CuePoint per keyframe cluster.
-    let cues = null;
-    if (includeCues) {
-      const cuePoints = [];
-      for (const c of keyClusters) {
-        cuePoints.push(ebmlElement(EBML_IDS.CUEPOINT,
-          ebmlElement(EBML_IDS.CUETIME, ebmlWriteUInt(c.timestamp, ebmlUIntWidth(c.timestamp))),
-          ebmlElement(EBML_IDS.CUETRACKPOS,
-            ebmlElement(EBML_IDS.CUETRACK, ebmlWriteUInt(videoTrack, ebmlUIntWidth(videoTrack))),
-            ebmlElement(EBML_IDS.CUECLUSTERPOS, ebmlWriteUInt(clusterFinalPos.get(c), 8)))));
-      }
-      cues = ebmlElement.apply(null, [EBML_IDS.CUES].concat(cuePoints));
-    }
+    const cues = includeCues
+      ? webmBuildCues(keyClusters.map(c => ({ timestamp: c.timestamp, position: clusterFinalPos.get(c) })), videoTrack)
+      : null;
 
     // --- SeekHead pointing at Info, Tracks (and Cues when present).
-    const seekEntry = (targetId, position) => ebmlElement(EBML_IDS.SEEK,
-      ebmlElement(EBML_IDS.SEEKID, ebmlIdBytes(targetId)),
-      ebmlElement(EBML_IDS.SEEKPOS, ebmlWriteUInt(position, 8)));
-    const seekEntries = [seekEntry(EBML_IDS.INFO, infoPos), seekEntry(EBML_IDS.TRACKS, tracksPos)];
-    if (includeCues) seekEntries.push(seekEntry(EBML_IDS.CUES, cuesPos));
-    const seekHead = ebmlElement.apply(null, [EBML_IDS.SEEKHEAD].concat(seekEntries));
+    const seekHead = webmBuildSeekHead(infoPos, tracksPos, includeCues ? cuesPos : null);
     if (seekHead.length !== seekHeadLen) return blob; // layout math broke — don't emit a bad index
 
     // --- Assemble. Cluster bytes are copied verbatim; SimpleBlock timestamps are
@@ -1923,6 +2008,471 @@ async function makeSeekable(blob) {
     console.warn('makeSeekable: indexing failed, saving the un-indexed file', e);
     return blob;
   }
+}
+
+// ============================================================
+// Streamed save (REVIEW #5) — two passes over the session's chunks;
+// never the whole recording in memory.
+// ============================================================
+// Pass 1 (createWebmStreamScanner) re-implements webmScan's DECISIONS over a
+// chunk stream: a small capped carry buffer, only the tiny preamble regions and
+// ~40 bytes of metadata per cluster are retained. It mirrors webmScan +
+// makeSeekable so closely that the differential tests in test.cjs assert the
+// streamed output is BYTE-IDENTICAL to makeSeekable() run on the concatenated
+// blob — for indexed files and bail cases alike. Any doubt anywhere → the save
+// falls back to streaming the raw chunk bytes verbatim (un-indexed but intact,
+// same outcome as makeSeekable's original-blob fallback). Never a partial
+// index; never a guessed Duration.
+
+// Hard cap on the carry buffer. Firefox writes ~7.5s clusters (a few MB at Best
+// quality); anything bigger than this means the scan is lost → un-indexed save.
+// (var, not const, so the test harness can lower it to exercise the bail.)
+var STREAM_CARRY_CAP = 64 * 1024 * 1024;
+
+function createWebmStreamScanner() {
+  let carry = new Uint8Array(0);   // unconsumed bytes
+  let carryAbs = 0;                // absolute file offset of carry[0]
+  let total = 0;                   // bytes pushed so far
+  let eos = false;                 // finish() called
+  let bailed = false;              // hard bail → un-indexed save
+  let stopped = false;             // top-level scan stopped (mirrors webmScan's `break`)
+  let stage = 'header';            // 'header' | 'segment' | 'preamble' | 'clusters'
+  let pos = 0;                     // absolute parse position (mirrors webmScan's pos/scanEnd)
+  let safeEndAbs = Infinity;       // Segment end when its size is known (EOF applied at finish)
+
+  // Retained preamble regions (small — guarded like makeSeekable):
+  let segmentDataStart = 0;
+  let preambleBytes = null;        // [0, segmentDataStart): EBML Header + Segment ID + size VINT
+  let infoBytes = null, infoDataOff = 0;      // the Info element (ID+size+data)
+  let tracksBytes = null, tracksDataOff = 0;  // the Tracks element
+  let videoTrack = null;
+
+  // Per-cluster metadata (absolute file offsets; bytes are NOT retained):
+  const clusters = [];             // { start, end, timestamp, keyframe }
+  let maxClusterTs = 0;            // mirrors webmScan's info.lastTimestamp
+  let lastClusterMaxBlockTime = 0; // running; the final cluster's value survives
+
+  // A cluster whose end we haven't located yet:
+  let pending = null;              // { startAbs, dataStartAbs, sizeUnknown, sizeValue, scanAbs }
+
+  function bail() { bailed = true; carry = new Uint8Array(0); }
+  function stopScan(atAbs) { stopped = true; pos = atAbs; carry = new Uint8Array(0); }
+  const carryEnd = () => carryAbs + carry.length;
+  function carryView() { return new DataView(carry.buffer, carry.byteOffset, carry.length); }
+  function drop(toAbs) {
+    const n = toAbs - carryAbs;
+    if (n <= 0) return;
+    carry = carry.slice(n);        // slice() copies — never pin a big backing buffer
+    carryAbs = toAbs;
+  }
+
+  // Read an ID (isSize=false) or size VINT (isSize=true) at an absolute offset.
+  // Returns the parsed field, 'more' (need more bytes — only while streaming),
+  // or null (unparseable on all the evidence we will ever have — the reader
+  // only returns null for truncation, which at end-of-stream mirrors
+  // webmScan's `break`/throw cases).
+  function readField(abs, isSize) {
+    if (abs >= carryEnd()) return eos ? null : 'more';
+    const f = isSize ? ebmlReadSize(carryView(), abs - carryAbs) : ebmlReadId(carryView(), abs - carryAbs);
+    if (f) return f;
+    return eos ? null : 'more';
+  }
+
+  const covered = (toAbs) => toAbs <= carryEnd();
+
+  // A cluster's bytes are complete in carry: read its Timestamp (same tolerance
+  // as webmScan), decide keyframe, track maxBlockTime, record the range, drop.
+  function completeCluster(startAbs, dataStartAbs, endAbs) {
+    const v = new DataView(carry.buffer, carry.byteOffset + (startAbs - carryAbs));
+    const len = endAbs - startAbs;
+    const dRel = dataStartAbs - startAbs;
+    let ts = 0;
+    const tsId = ebmlReadId(v, dRel);
+    if (tsId && tsId.value === EBML_IDS.TIMESTAMP) {
+      const tsSize = ebmlReadSize(v, dRel + tsId.length);
+      if (!tsSize) { bail(); return; }   // webmScan throws here (truncated Timestamp) → un-indexed
+      ts = ebmlReadUInt(v, dRel + tsId.length + tsSize.length, tsSize.value);
+    }
+    const desc = { offset: 0, totalSize: len, timestamp: ts };
+    const keyframe = videoTrack ? webmClusterHasVideoKeyframe(v, desc, videoTrack) : false;
+    lastClusterMaxBlockTime = webmMaxBlockTime(v, desc);
+    clusters.push({ start: startAbs, end: endAbs, timestamp: ts, keyframe });
+    if (ts > maxClusterTs) maxClusterTs = ts;
+    pos = endAbs;
+    drop(endAbs);
+  }
+
+  // --- Stage parsers. Each returns true on progress, false to stop pumping
+  // (need more bytes, or a terminal flag was set). ---
+
+  function parseHeader() {
+    const id = readField(0, false);
+    if (id === 'more') return false;
+    if (!id || id.value !== EBML_IDS.HEADER) { bail(); return false; }   // webmScan throws
+    const size = readField(id.length, true);
+    if (size === 'more') return false;
+    if (!size || size.isUnknown) { bail(); return false; }
+    const headerEnd = id.length + size.length + size.value;
+    if (!covered(headerEnd)) { if (eos) bail(); return false; }
+    stage = 'segment'; pos = headerEnd;
+    return true;
+  }
+
+  function parseSegment() {
+    const id = readField(pos, false);
+    if (id === 'more') return false;
+    if (!id || id.value !== EBML_IDS.SEGMENT) { bail(); return false; }  // webmScan throws
+    const size = readField(pos + id.length, true);
+    if (size === 'more') return false;
+    if (!size) { bail(); return false; }
+    segmentDataStart = pos + id.length + size.length;
+    if (!size.isUnknown) safeEndAbs = segmentDataStart + size.value;
+    preambleBytes = carry.slice(0, segmentDataStart - carryAbs);   // carryAbs is still 0 here
+    stage = 'preamble'; pos = segmentDataStart;
+    drop(segmentDataStart);
+    return true;
+  }
+
+  function parsePreambleChild() {
+    if (pos >= safeEndAbs) { stopScan(pos); return false; }        // segment ended, no clusters
+    const id = readField(pos, false);
+    if (id === 'more') return false;
+    if (!id) { stopScan(pos); return false; }                      // webmScan: break
+    const size = readField(pos + id.length, true);
+    if (size === 'more') return false;
+    if (!size) { stopScan(pos); return false; }                    // webmScan: break
+    const dataStart = pos + id.length + size.length;
+
+    if (id.value === EBML_IDS.CLUSTER) {
+      // Preamble complete. Guards mirror makeSeekable's bail conditions
+      // (missing/unknown-size Info or Tracks, or clusters arriving first).
+      if (!infoBytes || !tracksBytes) { bail(); return false; }
+      videoTrack = webmFindVideoTrack(
+        new DataView(tracksBytes.buffer, tracksBytes.byteOffset, tracksBytes.length),
+        { tracksDataStart: tracksDataOff, tracksDataEnd: tracksBytes.length });
+      stage = 'clusters';
+      return true;                 // the cluster stage re-reads at pos
+    }
+
+    if (id.value === EBML_IDS.INFO) {
+      if (size.isUnknown) { bail(); return false; }
+      const end = dataStart + size.value;
+      if (end > safeEndAbs) { bail(); return false; }
+      if (end - pos > 10000) { bail(); return false; }             // makeSeekable: implausible Info
+      if (!covered(end)) { if (eos) bail(); return false; }
+      infoBytes = carry.slice(pos - carryAbs, end - carryAbs);
+      infoDataOff = dataStart - pos;
+      pos = end; drop(end);
+      return true;
+    }
+
+    if (size.isUnknown) { stopScan(pos); return false; }           // webmScan: break
+
+    if (id.value === EBML_IDS.TRACKS) {
+      const end = dataStart + size.value;
+      if (end > safeEndAbs) { bail(); return false; }
+      if (end - pos > 100000) { bail(); return false; }            // makeSeekable: implausible Tracks
+      if (!covered(end)) { if (eos) bail(); return false; }
+      tracksBytes = carry.slice(pos - carryAbs, end - carryAbs);
+      tracksDataOff = dataStart - pos;
+      pos = end; drop(end);
+      return true;
+    }
+
+    // Any other element is skipped and NOT retained — the buffered rebuild
+    // drops these bytes from its output too.
+    const end = Math.min(dataStart + size.value, safeEndAbs);
+    if (!covered(end)) { if (eos) bail(); return false; }          // truncated preamble → no clusters → un-indexed
+    pos = end; drop(end);
+    return true;
+  }
+
+  function parseClusterStep() {
+    if (!pending) {
+      if (pos >= safeEndAbs) return false;                         // scan complete (webmScan loop end)
+      const id = readField(pos, false);
+      if (id === 'more') return false;
+      if (!id) { stopScan(pos); return false; }
+      const size = readField(pos + id.length, true);
+      if (size === 'more') return false;
+      if (!size) { stopScan(pos); return false; }
+      const dataStart = pos + id.length + size.length;
+
+      if (id.value !== EBML_IDS.CLUSTER) {
+        // A late Info/Tracks would make the buffered path re-record it and then
+        // fail makeSeekable's ordering guard → un-indexed. Same outcome here.
+        if (id.value === EBML_IDS.INFO || id.value === EBML_IDS.TRACKS) { bail(); return false; }
+        if (size.isUnknown) { stopScan(pos); return false; }       // webmScan: break
+        const end = Math.min(dataStart + size.value, safeEndAbs);
+        if (!covered(end)) {
+          if (eos) pos = Math.min(end, total);                     // webmScan clamps to EOF; ≤4KB tail still indexes
+          return false;
+        }
+        pos = end; drop(end);                                      // skipped, not emitted (matches buffered)
+        return true;
+      }
+
+      pending = { startAbs: pos, dataStartAbs: dataStart, sizeUnknown: size.isUnknown, sizeValue: size.value, scanAbs: dataStart + 1 };
+    }
+
+    if (!pending.sizeUnknown) {
+      let end = Math.min(pending.dataStartAbs + pending.sizeValue, safeEndAbs);
+      if (!covered(end)) {
+        if (!eos) return false;
+        end = Math.min(end, total);                                // truncated known-size cluster (crash tail)
+      }
+      const p = pending; pending = null;
+      completeCluster(p.startAbs, p.dataStartAbs, end);
+      return true;
+    }
+
+    // Unknown-size cluster: byte-scan for the next validated Cluster ID.
+    // Same boundary logic as webmScan — candidates near the carry tail are held
+    // until the up-to-13 bytes needed to validate them (ID 4 + size VINT up to
+    // 8 + the 0xE7 first-child byte) have arrived, or until end-of-stream where
+    // webmScan's truncation tolerance applies.
+    const effSafeEnd = eos ? Math.min(safeEndAbs, total) : safeEndAbs;
+    const limit = Math.min(carryEnd(), effSafeEnd);
+    let sp = pending.scanAbs;
+    let boundary = -1;
+    while (sp < limit - 3) {
+      const rel = sp - carryAbs;
+      if (carry[rel] === 0x1F && carry[rel + 1] === 0x43 && carry[rel + 2] === 0xB6 && carry[rel + 3] === 0x75) {
+        if (sp + 4 < effSafeEnd) {                                 // webmScan: scanPos + 4 < safeEnd
+          const cand = readField(sp + 4, true);
+          if (cand === 'more') { pending.scanAbs = sp; return false; }
+          if (cand) {
+            const tsBytePos = sp + 4 + cand.length;
+            if (tsBytePos >= carryEnd() && !eos) { pending.scanAbs = sp; return false; }
+            if (tsBytePos >= effSafeEnd || carry[tsBytePos - carryAbs] === EBML_IDS.TIMESTAMP) {
+              boundary = sp;
+              break;
+            }
+          }
+          // cand null (truncated at EOF) or no 0xE7 → false positive, keep scanning
+        }
+        // else: too close to the segment end to validate — webmScan treats it
+        // as a false positive (the current cluster runs to safeEnd)
+      }
+      sp++;
+    }
+    pending.scanAbs = sp;
+    if (boundary >= 0) {
+      const p = pending; pending = null;
+      completeCluster(p.startAbs, p.dataStartAbs, boundary);
+      return true;
+    }
+    if (eos) {                                                     // no boundary → cluster runs to the end
+      const p = pending; pending = null;
+      completeCluster(p.startAbs, p.dataStartAbs, effSafeEnd);
+      return true;
+    }
+    return false;                                                  // wait for more bytes; resume at scanAbs
+  }
+
+  function pump() {
+    try {
+      for (;;) {
+        if (bailed || stopped) return;
+        let progressed;
+        if (stage === 'header') progressed = parseHeader();
+        else if (stage === 'segment') progressed = parseSegment();
+        else if (stage === 'preamble') progressed = parsePreambleChild();
+        else progressed = parseClusterStep();
+        if (!progressed) return;
+      }
+    } catch (e) {
+      // Anything unexpected → un-indexed streaming save. Never a partial index.
+      console.warn('stream scan failed, saving un-indexed', e);
+      bail();
+    }
+  }
+
+  return {
+    push(bytes) {
+      total += bytes.length;
+      if (bailed || stopped) return;   // still count total (coverage guard needs it)
+      const merged = new Uint8Array(carry.length + bytes.length);
+      merged.set(carry, 0);
+      merged.set(bytes, carry.length);
+      carry = merged;
+      if (carry.length > STREAM_CARRY_CAP) { bail(); return; }     // scan lost → un-indexed
+      pump();
+    },
+    // True when the scan covered the file and an index can be built.
+    finish() {
+      eos = true;
+      if (!bailed && !stopped) pump();
+      if (bailed) return false;
+      if (clusters.length === 0) return false;                     // makeSeekable: no clusters → original
+      if (total - pos > 4096) return false;                        // coverage guard (same 4KB slack)
+      return true;
+    },
+    result() {
+      return { preambleBytes, infoBytes, infoDataOff, tracksBytes, videoTrack,
+               clusters, maxClusterTs, lastClusterMaxBlockTime };
+    },
+  };
+}
+
+// Build the indexed head + Cues for a completed stream scan. Returns
+// { head: [Uint8Array…], ranges: [{start,end}], cues: Uint8Array|null } or
+// null if the layout math doesn't hold (→ caller saves un-indexed).
+// Positions come from a running sum over the EMITTED cluster ranges — exactly
+// like makeSeekable — because bytes dropped between clusters shift every
+// position in the final file.
+function buildStreamIndexParts(scan) {
+  const durationTicks = Math.max(scan.lastClusterMaxBlockTime, scan.maxClusterTs) + 33;
+  const infoView = new DataView(scan.infoBytes.buffer, scan.infoBytes.byteOffset, scan.infoBytes.length);
+  const newInfo = webmBuildInfo(infoView, scan.infoDataOff, scan.infoBytes.length, durationTicks);
+  const keyClusters = scan.videoTrack ? scan.clusters.filter(c => c.keyframe) : [];
+  const includeCues = keyClusters.length > 0;
+  const seekHeadLen = webmSeekHeadLen(includeCues);
+  const infoPos = seekHeadLen;
+  const tracksPos = infoPos + newInfo.length;
+  let runningPos = tracksPos + scan.tracksBytes.length;
+  const positions = new Map();
+  for (const c of scan.clusters) { positions.set(c, runningPos); runningPos += (c.end - c.start); }
+  const cuesPos = runningPos;
+  const cues = includeCues
+    ? webmBuildCues(keyClusters.map(c => ({ timestamp: c.timestamp, position: positions.get(c) })), scan.videoTrack)
+    : null;
+  const seekHead = webmBuildSeekHead(infoPos, tracksPos, includeCues ? cuesPos : null);
+  if (seekHead.length !== seekHeadLen) return null;   // layout math broke — don't emit a bad index
+  return {
+    head: [scan.preambleBytes, seekHead, newInfo, scan.tracksBytes],
+    ranges: scan.clusters.map(c => ({ start: c.start, end: c.end })),
+    cues,
+  };
+}
+
+// Fire-and-forget download (Firefox — no File System Access API). Arrival
+// cannot be confirmed, so this NEVER counts as a confirmed save: callers keep
+// the session until the user confirms the file landed.
+function startDownload(blob, suggestedName) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = suggestedName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+  updateStatus('idle', 'Downloaded — check your Downloads folder');
+  return 'downloaded';
+}
+
+// Streamed save of one session — Chrome/Edge (File System Access API).
+// Picker FIRST (cancel costs nothing, no cursor touched), then pass 1 (index
+// scan, bounded carry), then pass 2 (re-cursor and write). 'saved' only after
+// close() resolves. On a mid-write failure the swap file is aborted (FSA isn't
+// durable until close, so nothing lands) and the error goes to the caller's
+// existing catch — the session is kept, same recovery story as today.
+async function saveSessionStreamedFSA(source, suggestedName) {
+  let handle;
+  try {
+    handle = await window.showSaveFilePicker({
+      suggestedName,
+      types: [{
+        description: 'WebM Video',
+        accept: { 'video/webm': ['.webm'] },
+      }],
+    });
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      updateStatus('idle', 'Save cancelled — recording preserved, reload to recover it');
+      return 'cancelled';
+    }
+    throw err;
+  }
+
+  updateStatus('idle', 'Preparing your video…');
+  const scanner = createWebmStreamScanner();
+  let chunkCount = 0;
+  await forEachSessionChunk(source.sessionId, (data) => {
+    chunkCount++;
+    scanner.push(new Uint8Array(data));
+  });
+  const plan = scanner.finish() ? buildStreamIndexParts(scanner.result()) : null;
+
+  const writable = await handle.createWritable();
+  try {
+    let written = 0, lastPct = -1;
+    const progress = () => {
+      written++;
+      const pct = chunkCount ? Math.min(100, Math.floor((written / chunkCount) * 100)) : 100;
+      if (pct >= lastPct + 5 || pct === 100) { lastPct = pct; updateStatus('idle', 'Saving… ' + pct + '%'); }
+    };
+    if (plan) {
+      for (const part of plan.head) await writable.write(part);
+      let ri = 0, fileOff = 0;
+      await forEachSessionChunk(source.sessionId, async (data) => {
+        const chunkStart = fileOff, chunkEnd = fileOff + data.byteLength;
+        while (ri < plan.ranges.length && plan.ranges[ri].start < chunkEnd) {
+          const r = plan.ranges[ri];
+          const s = Math.max(r.start, chunkStart), e = Math.min(r.end, chunkEnd);
+          if (e > s) await writable.write(new Uint8Array(data, s - chunkStart, e - s));
+          if (r.end <= chunkEnd) ri++; else break;
+        }
+        fileOff = chunkEnd;
+        progress();
+      });
+      if (plan.cues) await writable.write(plan.cues);
+    } else {
+      // Un-indexed streaming save: the raw recording, byte for byte.
+      await forEachSessionChunk(source.sessionId, async (data) => {
+        await writable.write(new Uint8Array(data));
+        progress();
+      });
+    }
+    await writable.close();
+  } catch (err) {
+    try { await writable.abort(); } catch (abortErr) { /* swap file is discarded either way */ }
+    throw err;
+  }
+  updateStatus('idle', 'Saved successfully');
+  return 'saved';
+}
+
+// Streamed save of one session — Firefox (download path). No FSA, so a final
+// Blob must exist — but as REFERENCES: one small Blob per chunk, sliced to the
+// recorded cluster ranges (Blob.slice is a reference operation) and composed
+// into a multipart Blob. Peak memory drops from ~3× the recording (one copy
+// contiguous) to ~1×, browser-managed, with no contiguous full-file buffer.
+async function saveSessionStreamedDownload(source, suggestedName) {
+  updateStatus('idle', 'Preparing your video…');
+  const scanner = createWebmStreamScanner();
+  const chunkBlobs = [];
+  const offsets = [];
+  let fileOff = 0;
+  await forEachSessionChunk(source.sessionId, (data) => {
+    offsets.push(fileOff);
+    fileOff += data.byteLength;
+    chunkBlobs.push(new Blob([data]));
+    scanner.push(new Uint8Array(data));
+  });
+  const plan = scanner.finish() ? buildStreamIndexParts(scanner.result()) : null;
+
+  let parts;
+  if (plan) {
+    parts = plan.head.slice();
+    let k = 0;   // ranges ascend, so the chunk pointer only ever moves forward
+    for (const r of plan.ranges) {
+      while (k < chunkBlobs.length && offsets[k] + chunkBlobs[k].size <= r.start) k++;
+      let p = r.start, j = k;
+      while (p < r.end && j < chunkBlobs.length) {
+        const cStart = offsets[j], cEnd = cStart + chunkBlobs[j].size;
+        const s = Math.max(p, cStart), e = Math.min(r.end, cEnd);
+        if (e > s) parts.push(chunkBlobs[j].slice(s - cStart, e - cStart));
+        p = e;
+        j++;
+      }
+    }
+    if (plan.cues) parts.push(plan.cues);
+  } else {
+    parts = chunkBlobs;   // un-indexed: the raw recording, byte for byte
+  }
+  return startDownload(new Blob(parts, { type: source.mimeType || 'video/webm' }), suggestedName);
 }
 
 // ============================================================
@@ -2230,23 +2780,22 @@ async function finalizeRecording() {
     // save leaves it in the recovery banner instead of being dropped. deleteSession (on a
     // confirmed save) is now the only thing that retires a session. completeSession() is unused.
 
-    // Get all chunks for the current session
-    const chunks = await getSessionChunks(state.sessionId);
-    if (chunks.length === 0 && state.priorSegments.length === 0) {
+    // Count chunks WITHOUT loading them (REVIEW #5): the single-segment save
+    // streams straight from IndexedDB, so nothing here builds a whole-recording blob.
+    const stats = await sessionChunkStats(state.sessionId);
+    if (stats.count === 0 && state.priorSegments.length === 0) {
       showError('No recording data found.');
       resetUI();
       return;
     }
 
-    // Build blob for the current session
-    const currentBlob = new Blob(chunks.map(c => new Blob([c.data])), { type: sessionMimeType });
-
     if (state.priorSegments.length > 0) {
       // Multi-segment: stitch prior segments + current into one file
-      await stitchAndSave(currentBlob, sessionMimeType);
+      // (buffered — see BUILD_LOG Known Limitation #1).
+      await stitchAndSave(sessionMimeType);
     } else {
-      // Single segment: save directly. Only delete the session on a CONFIRMED save.
-      const result = await saveFile(currentBlob);
+      // Single segment: streamed save. Only delete the session on a CONFIRMED save.
+      const result = await saveFile({ kind: 'session', sessionId: state.sessionId, mimeType: sessionMimeType });
       if (result === 'saved') {
         await deleteSession(state.sessionId);
       } else if (result === 'downloaded') {
@@ -2267,28 +2816,30 @@ async function finalizeRecording() {
 
 // Stitch multiple recording segments into one file and save.
 // Falls back to saving segments separately if stitching fails.
-async function stitchAndSave(currentBlob, currentMimeType) {
+async function stitchAndSave(currentMimeType) {
   updateStatus('idle', 'Stitching segments together...');
 
   try {
-    // Build blobs for all prior segments
-    const segmentBlobs = [];
+    // Which prior segments actually have data (counted via cursor — REVIEW #5;
+    // no chunks are loaded unless we really are stitching).
+    const priorsWithData = [];
     for (const seg of state.priorSegments) {
-      const chunks = await getSessionChunks(seg.sessionId);
-      if (chunks.length > 0) {
-        segmentBlobs.push(new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType }));
-      }
+      if ((await sessionChunkStats(seg.sessionId)).count > 0) priorsWithData.push(seg);
     }
 
-    // Add the current recording as the final segment
-    segmentBlobs.push(currentBlob);
-
     let result;
-    if (segmentBlobs.length < 2) {
-      // Only one segment has data — save directly
-      result = await saveFile(segmentBlobs[0] || currentBlob);
+    if (priorsWithData.length === 0) {
+      // Only the current recording has data — stream it directly.
+      result = await saveFile({ kind: 'session', sessionId: state.sessionId, mimeType: currentMimeType });
     } else {
-      // Concatenate using the EBML parser
+      // Concatenate using the EBML parser (buffered — Known Limitation #1)
+      const segmentBlobs = [];
+      for (const seg of priorsWithData) {
+        const chunks = await getSessionChunks(seg.sessionId);
+        segmentBlobs.push(new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType }));
+      }
+      const currentChunks = await getSessionChunks(state.sessionId);
+      segmentBlobs.push(new Blob(currentChunks.map(c => new Blob([c.data])), { type: currentMimeType }));
       const stitched = await concatenateWebM(segmentBlobs);
       result = await saveFile(stitched);
     }
@@ -2328,6 +2879,8 @@ async function stitchAndSave(currentBlob, currentMimeType) {
         else { cancelled = true; break; }
       }
       if (!cancelled) {
+        const currentChunks = await getSessionChunks(state.sessionId);
+        const currentBlob = new Blob(currentChunks.map(c => new Blob([c.data])), { type: currentMimeType });
         const r = await saveFile(currentBlob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
         if (r === 'saved') { await deleteSession(state.sessionId); }
         else if (r === 'downloaded') { downloadedIds.push(state.sessionId); }
@@ -2346,16 +2899,26 @@ async function stitchAndSave(currentBlob, currentMimeType) {
   }
 }
 
-// Save a blob to disk. Returns one of:
+// Save a recording to disk. `source` is either a Blob (buffered path — stitched
+// files and separate-part fallbacks) or `{ kind: 'session', sessionId, mimeType }`
+// (streamed path, REVIEW #5 — the recording goes from IndexedDB to disk one
+// chunk at a time and is never materialized in memory). Returns one of:
 //   'saved'      — File System Access API confirmed the write (Chrome/Edge)
 //   'cancelled'  — the user cancelled the save picker
 //   'downloaded' — download fallback fired (Firefox); arrival CANNOT be confirmed,
 //                  so callers must NOT treat this as a confirmed save.
-async function saveFile(blob, suggestedName) {
+async function saveFile(source, suggestedName) {
   suggestedName = suggestedName || `recording-${formatDateForFilename()}.webm`;
-  // Inject Duration + Cues so the saved file is seekable. Every save path (single,
-  // stitched, recovered, separate-part fallback) funnels through here, so hooking
-  // once covers them all. Falls back to the original blob internally on any failure.
+
+  if (source && !(source instanceof Blob) && source.kind === 'session') {
+    if ('showSaveFilePicker' in window) return saveSessionStreamedFSA(source, suggestedName);
+    return saveSessionStreamedDownload(source, suggestedName);
+  }
+
+  let blob = source;
+  // Inject Duration + Cues so the saved file is seekable. Every buffered save
+  // path (stitched, separate-part fallback) funnels through here. Falls back to
+  // the original blob internally on any failure.
   blob = await makeSeekable(blob);
   // Try File System Access API first
   if ('showSaveFilePicker' in window) {
@@ -2382,19 +2945,8 @@ async function saveFile(blob, suggestedName) {
     }
   }
 
-  // Fallback: download link (Firefox — no File System Access API). A fire-and-forget
-  // click can't report success or cancellation, so this never counts as a confirmed
-  // save: the session stays in IndexedDB until the user confirms the file arrived.
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = suggestedName;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 60000);
-  updateStatus('idle', 'Downloaded — check your Downloads folder');
-  return 'downloaded';
+  // Fallback: download link (Firefox — no File System Access API).
+  return startDownload(blob, suggestedName);
 }
 
 function formatDateForFilename() {
@@ -2458,11 +3010,13 @@ async function checkForRecovery() {
     const sessionInfos = [];
 
     for (const session of allSessions) {
-      const chunks = await getSessionChunks(session.id);
-      if (chunks.length > 0) {
-        totalChunks += chunks.length;
-        totalBytes += chunks.reduce((sum, c) => sum + c.data.byteLength, 0);
-        sessionInfos.push({ id: session.id, mimeType: session.mimeType, startTime: session.startTime, chunkCount: chunks.length });
+      // Cursor-sum (REVIEW #5 rider): the banner no longer loads every chunk of
+      // every session at page load just to display a size/duration line.
+      const stats = await sessionChunkStats(session.id);
+      if (stats.count > 0) {
+        totalChunks += stats.count;
+        totalBytes += stats.bytes;
+        sessionInfos.push({ id: session.id, mimeType: session.mimeType, startTime: session.startTime, chunkCount: stats.count });
       }
     }
 
@@ -2495,13 +3049,14 @@ async function recoverRecording() {
   try {
     const sessions = window._recoverySessions || [{ id: window._recoverySessionId, mimeType: window._recoveryMimeType }];
 
-    // Build a blob for each session that actually has chunks, remembering which session
-    // each blob came from so we only delete what we successfully save.
+    // Find the sessions that actually have chunks (counted via cursor — REVIEW #5;
+    // nothing is loaded yet), remembering which is which so we only delete what
+    // we successfully save.
     const segments = [];
     for (const sess of sessions) {
-      const chunks = await getSessionChunks(sess.id);
-      if (chunks.length > 0) {
-        segments.push({ id: sess.id, blob: new Blob(chunks.map(c => new Blob([c.data])), { type: sess.mimeType || 'video/webm' }) });
+      const stats = await sessionChunkStats(sess.id);
+      if (stats.count > 0) {
+        segments.push({ id: sess.id, mimeType: sess.mimeType || 'video/webm' });
       } else {
         await deleteSession(sess.id);   // empty session — safe to drop
       }
@@ -2514,8 +3069,9 @@ async function recoverRecording() {
     }
 
     if (segments.length === 1) {
-      // Single segment: save directly, delete only on a CONFIRMED save.
-      const result = await saveFile(segments[0].blob);
+      // Single segment: streamed save straight from IndexedDB, delete only on a
+      // CONFIRMED save.
+      const result = await saveFile({ kind: 'session', sessionId: segments[0].id, mimeType: segments[0].mimeType });
       if (result === 'saved') {
         await deleteSession(segments[0].id);
         document.getElementById('recoveryBanner').classList.remove('visible');
@@ -2528,7 +3084,13 @@ async function recoverRecording() {
     }
 
     // Multiple segments from repeated crashes: try to stitch them into one file.
+    // Stitching needs the segment bytes, so this path stays buffered (Known
+    // Limitation #1); single-crash recovery above is fully streamed.
     updateStatus('idle', 'Stitching recovered segments...');
+    for (const s of segments) {
+      const chunks = await getSessionChunks(s.id);
+      s.blob = new Blob(chunks.map(c => new Blob([c.data])), { type: s.mimeType });
+    }
     let stitched = null;
     try {
       stitched = await concatenateWebM(segments.map(s => s.blob));
