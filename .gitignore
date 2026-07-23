@@ -1,0 +1,10 @@
+# Dependencies / scratch
+node_modules/
+_to_delete/
+
+# Test recordings — binaries, keep them out of the repo
+*.webm
+
+# Session working docs (kept local, not part of the app)
+*_HANDOFF.md
+*_completion_report.md
