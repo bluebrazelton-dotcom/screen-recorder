@@ -10,6 +10,7 @@ let recordedErrors = [];
 let rafQueue = [];
 let rafId = 0;
 let addChunkCalls = 0;
+let downloadClicks = [];
 
 // ---------- DOM / platform mocks ----------
 const ctxStub = new Proxy({}, {
@@ -58,7 +59,7 @@ const _docHandlers = {};
 const documentMock = {
   hidden: false,
   getElementById: (id) => (_elCache[id] || (_elCache[id] = makeEl(id))),
-  createElement: (tag) => makeEl(tag),
+  createElement: (tag) => { const el = makeEl(tag); if (tag === 'a') { el.click = () => { downloadClicks.push(el.download); }; } return el; },
   addEventListener: (type, fn) => { (_docHandlers[type] = _docHandlers[type] || []).push(fn); },
   removeEventListener() {},
   body: { appendChild() {}, removeChild() {} },
@@ -160,10 +161,13 @@ async function resetState() {
   await resetDB();
   Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, cameraStream: null, micStream: null, audioContext: null, compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [] });
   windowMock._recoverySessions = null; windowMock._recoverySessionId = null; windowMock._recoveryMimeType = null;
-  windowMock.showSaveFilePicker = undefined;
+  delete windowMock.showSaveFilePicker;   // absent = Firefox mode; FSA scenarios set their own picker
   sandbox.addChunk = ORIG.addChunk; sandbox.concatenateWebM = ORIG.concatenateWebM;
+  sandbox.downloadPendingIds = [];
+  documentMock.getElementById('downloadConfirm').classList.remove('visible');
+  documentMock.getElementById('recoveryBanner').classList.remove('visible');
   documentMock.hidden = false;
-  lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0;
+  lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0; downloadClicks = [];
 }
 
 // ---------- assertions ----------
@@ -348,6 +352,79 @@ async function scenario(name, fn) {
       api.stopCompositing();
     }
     if (state.timerInterval) clearInterval(state.timerInterval);
+  });
+
+  // ============================================================
+  // Firefox mode (v1.9) — no showSaveFilePicker -> download fallback.
+  // The download path must NEVER count as a confirmed save.
+  // ============================================================
+
+  // Q — download keeps the session; user confirming arrival deletes it
+  await scenario('Q firefox download keeps session; confirm deletes it', async () => {
+    const id = await seed(2);
+    state.sessionId = id; state.chunkIndex = 2;
+    await api.finalizeRecording();
+    await drain();
+    assert(downloadClicks.length === 1, 'download fired once (got ' + downloadClicks.length + ')');
+    let sessions = await readStore('sessions');
+    assert(sessions.length === 1, 'session KEPT after unconfirmed download (got ' + sessions.length + ')');
+    const bar = documentMock.getElementById('downloadConfirm');
+    assert(bar.classList.contains('visible'), 'confirm bar shown');
+    await sandbox.confirmDownloadArrived();
+    await drain();
+    sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'session deleted after user confirms arrival (got ' + sessions.length + ')');
+    assert(!bar.classList.contains('visible'), 'confirm bar hidden after confirm');
+  });
+
+  // R — download + "didn't arrive" keeps the recording recoverable
+  await scenario('R firefox download decline keeps recording recoverable', async () => {
+    const id = await seed(2);
+    state.sessionId = id; state.chunkIndex = 2;
+    await api.finalizeRecording();
+    await drain();
+    sandbox.keepDownloadSession();
+    const sessions = await readStore('sessions');
+    const chunks = await readStore('chunks');
+    assert(sessions.length === 1, 'session still kept after decline (got ' + sessions.length + ')');
+    assert(chunks.length === 2, 'chunks still kept after decline (got ' + chunks.length + ')');
+    assert(recordedErrors.some(m => /kept safe|recover/i.test(m)), 'user told how to get it back');
+    assert(!documentMock.getElementById('downloadConfirm').classList.contains('visible'), 'confirm bar dismissed');
+  });
+
+  // S — stitched download keeps ALL segments until confirmed
+  await scenario('S firefox stitched download keeps all segments until confirmed', async () => {
+    const p1 = await seed(2), p2 = await seed(2), cur = await seed(2);
+    state.priorSegments = [{ sessionId: p1, mimeType: 'video/webm' }, { sessionId: p2, mimeType: 'video/webm' }];
+    state.sessionId = cur; state.chunkIndex = 2;
+    await api.finalizeRecording();
+    await drain();
+    assert(downloadClicks.length === 1, 'one stitched download fired (got ' + downloadClicks.length + ')');
+    let sessions = await readStore('sessions');
+    assert(sessions.length === 3, 'all 3 sessions kept after unconfirmed download (got ' + sessions.length + ')');
+    await sandbox.confirmDownloadArrived();
+    await drain();
+    sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'all sessions deleted after confirm (got ' + sessions.length + ')');
+    assert(state.priorSegments.length === 0, 'priorSegments cleared after confirm');
+  });
+
+  // T — recovery stitch-fail: every part downloads, all kept until confirmed
+  await scenario('T firefox recovery stitch-fail keeps all parts until confirmed', async () => {
+    const s1 = await seed(2), s2 = await seed(2);
+    sandbox.concatenateWebM = async () => { throw new Error('forced stitch fail'); };
+    windowMock._recoverySessions = [{ id: s1, mimeType: 'video/webm' }, { id: s2, mimeType: 'video/webm' }];
+    await api.recoverRecording();
+    await drain();
+    assert(downloadClicks.length === 2, 'both parts downloaded (got ' + downloadClicks.length + ')');
+    let sessions = await readStore('sessions');
+    assert(sessions.length === 2, 'both sessions kept after unconfirmed downloads (got ' + sessions.length + ')');
+    assert(documentMock.getElementById('downloadConfirm').classList.contains('visible'), 'one confirm bar for all parts');
+    await sandbox.confirmDownloadArrived();
+    await drain();
+    sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'all parts deleted after confirm (got ' + sessions.length + ')');
+    assert(!documentMock.getElementById('recoveryBanner').classList.contains('visible'), 'recovery banner cleared');
   });
 
   // ============================================================

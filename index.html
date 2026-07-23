@@ -226,6 +226,27 @@
     cursor: not-allowed;
   }
 
+  .mirror-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.15rem 0.5rem;
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .mirror-toggle input {
+    accent-color: var(--green);
+    cursor: pointer;
+  }
+
+  .mirror-toggle input:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   .screen-hint {
     font-size: 0.65rem;
     color: var(--text-dim);
@@ -329,6 +350,34 @@
     gap: 0.5rem;
   }
 
+  /* Download confirmation bar (Firefox download-fallback saves) */
+  .download-confirm {
+    padding: 1rem 1.25rem;
+    background: rgba(78, 204, 163, 0.08);
+    border: 1px solid rgba(78, 204, 163, 0.3);
+    border-radius: var(--radius);
+    display: none;
+  }
+
+  .download-confirm.visible { display: block; }
+
+  .download-confirm h3 {
+    font-size: 0.9rem;
+    color: var(--green);
+    margin-bottom: 0.4rem;
+  }
+
+  .download-confirm p {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    margin-bottom: 0.75rem;
+  }
+
+  .download-confirm .recovery-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+
   /* Error display */
   .error-banner {
     padding: 0.75rem 1rem;
@@ -371,6 +420,16 @@
       <button class="primary btn-record" onclick="continueRecording()">Continue recording</button>
       <button class="primary btn-save" onclick="recoverRecording()">Recover &amp; save</button>
       <button class="primary btn-stop" onclick="discardRecovery()">Discard</button>
+    </div>
+  </div>
+
+  <!-- Download confirmation (Firefox saves via download; arrival can't be detected) -->
+  <div class="download-confirm" id="downloadConfirm">
+    <h3>Downloaded &mdash; did it arrive?</h3>
+    <p id="downloadConfirmMsg">Your recording was downloaded (usually to your Downloads folder).</p>
+    <div class="recovery-actions">
+      <button class="primary btn-save" onclick="confirmDownloadArrived()">It's there &mdash; all set</button>
+      <button class="primary btn-record" onclick="keepDownloadSession()">It didn't arrive &mdash; keep my recording</button>
     </div>
   </div>
 
@@ -424,6 +483,9 @@
           <option value="square">Square</option>
           <option value="circle">Circle</option>
         </select>
+        <label class="mirror-toggle">
+          <input type="checkbox" id="mirrorToggle" onchange="onMirrorChanged()"> Mirror webcam
+        </label>
       </div>
       <div class="source-group">
         <button class="toggle-btn active" id="toggleMic" onclick="toggleSource('mic')">
@@ -723,6 +785,7 @@ function updateToggleUI() {
   document.getElementById('toggleMic').disabled = disabled;
   document.getElementById('cameraSelect').disabled = disabled || !state.sources.camera;
   document.getElementById('pipShapeSelect').disabled = disabled || !state.sources.camera;
+  document.getElementById('mirrorToggle').disabled = disabled || !state.sources.camera;
   document.getElementById('micSelect').disabled = disabled || !state.sources.mic;
   document.getElementById('qualitySelect').disabled = disabled;
 }
@@ -785,6 +848,11 @@ function onDeviceSelected(type) {
 
 function onPipShapeChanged() {
   pipState.shape = document.getElementById('pipShapeSelect').value;
+  savePipLayout();
+}
+
+function onMirrorChanged() {
+  pipState.mirror = document.getElementById('mirrorToggle').checked;
   savePipLayout();
 }
 
@@ -862,6 +930,7 @@ const pipState = {
   yFrac: 0.72,
   widthFrac: 0.2, // fraction of canvas width
   shape: 'rectangle', // 'rectangle', 'square', or 'circle'
+  mirror: false,  // flip horizontally (applies to preview AND recording — same canvas)
   dragging: false,
   resizing: false,
   dragOffsetX: 0,
@@ -877,6 +946,7 @@ try {
     if (typeof parsed.yFrac === 'number') pipState.yFrac = parsed.yFrac;
     if (typeof parsed.widthFrac === 'number') pipState.widthFrac = Math.max(0.08, Math.min(0.5, parsed.widthFrac));
     if (['rectangle', 'square', 'circle'].includes(parsed.shape)) pipState.shape = parsed.shape;
+    if (typeof parsed.mirror === 'boolean') pipState.mirror = parsed.mirror;
   }
 } catch (e) { /* ignore */ }
 
@@ -887,6 +957,7 @@ function savePipLayout() {
       yFrac: pipState.yFrac,
       widthFrac: pipState.widthFrac,
       shape: pipState.shape,
+      mirror: pipState.mirror,
     }));
   } catch (e) { /* ignore */ }
 }
@@ -1045,7 +1116,15 @@ function startCompositing() {
     if (state.cameraStream && cameraVideo.readyState >= 2) {
       if (!state.sources.screen) {
         // Camera-only mode: draw full canvas, no clip
-        ctx.drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
+        if (pipState.mirror) {
+          ctx.save();
+          ctx.translate(canvas.width, 0);
+          ctx.scale(-1, 1);
+          ctx.drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
+          ctx.restore();
+        } else {
+          ctx.drawImage(cameraVideo, 0, 0, canvas.width, canvas.height);
+        }
       } else {
         // PiP overlay — position and size from pipState (draggable/resizable)
         const pip = getPipRect();
@@ -1079,7 +1158,17 @@ function startCompositing() {
         ctx.closePath();
         ctx.clip();
 
-        // For square and circle, center-crop the camera feed to fill 1:1
+        // For square and circle, center-crop the camera feed to fill 1:1.
+        // Mirroring flips around the PiP's own vertical axis via a nested
+        // save/translate/scale — the clip stays active (it's context state), and
+        // the border stroke below is unaffected (paths aren't context state).
+        if (pipState.mirror) {
+          ctx.save();
+          ctx.translate(pip.x + pip.w, pip.y);
+          ctx.scale(-1, 1);
+        }
+        const mx = pipState.mirror ? 0 : pip.x;
+        const my = pipState.mirror ? 0 : pip.y;
         if (pipState.shape === 'square' || pipState.shape === 'circle') {
           const vw = cameraVideo.videoWidth || 1;
           const vh = cameraVideo.videoHeight || 1;
@@ -1087,10 +1176,11 @@ function startCompositing() {
           const cropSize = Math.min(vw, vh);
           const sx = (vw - cropSize) / 2;
           const sy = (vh - cropSize) / 2;
-          ctx.drawImage(cameraVideo, sx, sy, cropSize, cropSize, pip.x, pip.y, pip.w, pip.h);
+          ctx.drawImage(cameraVideo, sx, sy, cropSize, cropSize, mx, my, pip.w, pip.h);
         } else {
-          ctx.drawImage(cameraVideo, pip.x, pip.y, pip.w, pip.h);
+          ctx.drawImage(cameraVideo, mx, my, pip.w, pip.h);
         }
+        if (pipState.mirror) ctx.restore();
 
         // Border
         ctx.strokeStyle = 'rgba(255,255,255,0.3)';
@@ -2155,10 +2245,12 @@ async function finalizeRecording() {
       // Multi-segment: stitch prior segments + current into one file
       await stitchAndSave(currentBlob, sessionMimeType);
     } else {
-      // Single segment: save directly. Only delete the session once it's on disk.
-      const saved = await saveFile(currentBlob);
-      if (saved) {
+      // Single segment: save directly. Only delete the session on a CONFIRMED save.
+      const result = await saveFile(currentBlob);
+      if (result === 'saved') {
         await deleteSession(state.sessionId);
+      } else if (result === 'downloaded') {
+        offerDownloadConfirm([state.sessionId], 1);
       } else {
         showError('Save cancelled — your recording is still here. Reload the page to recover it.');
       }
@@ -2191,23 +2283,26 @@ async function stitchAndSave(currentBlob, currentMimeType) {
     // Add the current recording as the final segment
     segmentBlobs.push(currentBlob);
 
-    let saved;
+    let result;
     if (segmentBlobs.length < 2) {
       // Only one segment has data — save directly
-      saved = await saveFile(segmentBlobs[0] || currentBlob);
+      result = await saveFile(segmentBlobs[0] || currentBlob);
     } else {
       // Concatenate using the EBML parser
       const stitched = await concatenateWebM(segmentBlobs);
-      saved = await saveFile(stitched);
+      result = await saveFile(stitched);
     }
 
-    if (saved) {
-      // Only delete once the stitched file is actually on disk.
+    if (result === 'saved') {
+      // Only delete once the stitched file is confirmed on disk.
       for (const seg of state.priorSegments) {
         await deleteSession(seg.sessionId);
       }
       await deleteSession(state.sessionId);
       state.priorSegments = [];
+    } else if (result === 'downloaded') {
+      // Keep every session until the user confirms the download arrived.
+      offerDownloadConfirm([...state.priorSegments.map(s => s.sessionId), state.sessionId], 1);
     } else {
       showError('Save cancelled — all segments preserved. Reload the page to recover them.');
     }
@@ -2221,24 +2316,29 @@ async function stitchAndSave(currentBlob, currentMimeType) {
     );
     if (fallback) {
       let fileNum = 1;
-      let allSaved = true;
+      let cancelled = false;
+      const downloadedIds = [];
       for (const seg of state.priorSegments) {
         const chunks = await getSessionChunks(seg.sessionId);
         if (chunks.length === 0) { await deleteSession(seg.sessionId); continue; }
         const blob = new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType });
-        const ok = await saveFile(blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
-        if (ok) { await deleteSession(seg.sessionId); fileNum++; }
-        else { allSaved = false; break; }
+        const r = await saveFile(blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+        if (r === 'saved') { await deleteSession(seg.sessionId); fileNum++; }
+        else if (r === 'downloaded') { downloadedIds.push(seg.sessionId); fileNum++; }
+        else { cancelled = true; break; }
       }
-      if (allSaved) {
-        const ok = await saveFile(currentBlob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
-        if (ok) await deleteSession(state.sessionId);
-        else allSaved = false;
+      if (!cancelled) {
+        const r = await saveFile(currentBlob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+        if (r === 'saved') { await deleteSession(state.sessionId); }
+        else if (r === 'downloaded') { downloadedIds.push(state.sessionId); }
+        else { cancelled = true; }
       }
-      if (allSaved) {
-        state.priorSegments = [];
-      } else {
+      if (cancelled) {
         showError('Save cancelled — remaining segments are still here. Reload the page to recover them.');
+      } else if (downloadedIds.length > 0) {
+        offerDownloadConfirm(downloadedIds, downloadedIds.length);
+      } else {
+        state.priorSegments = [];
       }
     } else {
       showError('Stitching failed. Your recordings are safe in the browser — refresh and use Recovery.');
@@ -2246,6 +2346,11 @@ async function stitchAndSave(currentBlob, currentMimeType) {
   }
 }
 
+// Save a blob to disk. Returns one of:
+//   'saved'      — File System Access API confirmed the write (Chrome/Edge)
+//   'cancelled'  — the user cancelled the save picker
+//   'downloaded' — download fallback fired (Firefox); arrival CANNOT be confirmed,
+//                  so callers must NOT treat this as a confirmed save.
 async function saveFile(blob, suggestedName) {
   suggestedName = suggestedName || `recording-${formatDateForFilename()}.webm`;
   // Inject Duration + Cues so the saved file is seekable. Every save path (single,
@@ -2266,18 +2371,20 @@ async function saveFile(blob, suggestedName) {
       await writable.write(blob);
       await writable.close();
       updateStatus('idle', 'Saved successfully');
-      return true;                              // saved
+      return 'saved';
     } catch (err) {
       if (err.name === 'AbortError') {
         // User cancelled the picker — recording is still in IndexedDB, keep it.
         updateStatus('idle', 'Save cancelled — recording preserved, reload to recover it');
-        return false;                           // cancelled, NOT saved
+        return 'cancelled';
       }
       throw err;
     }
   }
 
-  // Fallback: download link (browsers without File System Access API)
+  // Fallback: download link (Firefox — no File System Access API). A fire-and-forget
+  // click can't report success or cancellation, so this never counts as a confirmed
+  // save: the session stays in IndexedDB until the user confirms the file arrived.
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -2286,13 +2393,47 @@ async function saveFile(blob, suggestedName) {
   a.click();
   document.body.removeChild(a);
   setTimeout(() => URL.revokeObjectURL(url), 60000);
-  updateStatus('idle', 'Downloaded');
-  return true;                                  // download triggered
+  updateStatus('idle', 'Downloaded — check your Downloads folder');
+  return 'downloaded';
 }
 
 function formatDateForFilename() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}_${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}`;
+}
+
+// ============================================================
+// Download confirmation (Firefox fallback saves)
+// ============================================================
+// Sessions whose bytes went out as an unconfirmed download. Deleted only when
+// the user confirms the file arrived; otherwise they stay recoverable (the
+// recovery banner on next load is the backstop if the bar is ignored).
+var downloadPendingIds = [];
+
+function offerDownloadConfirm(sessionIds, fileCount) {
+  downloadPendingIds = sessionIds;
+  document.getElementById('downloadConfirmMsg').textContent = fileCount > 1
+    ? `Your ${fileCount} recording files were downloaded (usually to your Downloads folder).`
+    : 'Your recording was downloaded (usually to your Downloads folder).';
+  document.getElementById('downloadConfirm').classList.add('visible');
+}
+
+async function confirmDownloadArrived() {
+  for (const id of downloadPendingIds) await deleteSession(id);
+  downloadPendingIds = [];
+  state.priorSegments = [];
+  document.getElementById('downloadConfirm').classList.remove('visible');
+  document.getElementById('recoveryBanner').classList.remove('visible');
+  updateStatus('idle', 'All set');
+}
+
+function keepDownloadSession() {
+  downloadPendingIds = [];
+  document.getElementById('downloadConfirm').classList.remove('visible');
+  const bannerUp = document.getElementById('recoveryBanner').classList.contains('visible');
+  showError(bannerUp
+    ? 'Your recording is kept safe in this browser — click "Recover & save" above to try again.'
+    : 'Your recording is kept safe in this browser. Reload the page and click "Recover & save" to try again.');
 }
 
 // ============================================================
@@ -2373,11 +2514,13 @@ async function recoverRecording() {
     }
 
     if (segments.length === 1) {
-      // Single segment: save directly, delete only if saved.
-      const saved = await saveFile(segments[0].blob);
-      if (saved) {
+      // Single segment: save directly, delete only on a CONFIRMED save.
+      const result = await saveFile(segments[0].blob);
+      if (result === 'saved') {
         await deleteSession(segments[0].id);
         document.getElementById('recoveryBanner').classList.remove('visible');
+      } else if (result === 'downloaded') {
+        offerDownloadConfirm([segments[0].id], 1);
       } else {
         showError('Save cancelled — your recording stays in the list until you save it.');
       }
@@ -2394,10 +2537,12 @@ async function recoverRecording() {
     }
 
     if (stitched) {
-      const saved = await saveFile(stitched);
-      if (saved) {
+      const result = await saveFile(stitched);
+      if (result === 'saved') {
         for (const s of segments) await deleteSession(s.id);
         document.getElementById('recoveryBanner').classList.remove('visible');
+      } else if (result === 'downloaded') {
+        offerDownloadConfirm(segments.map(s => s.id), 1);
       } else {
         showError('Save cancelled — all segments stay in the list until you save them.');
       }
@@ -2408,21 +2553,27 @@ async function recoverRecording() {
     // keeping only the newest. Delete only the segments we actually write.
     showError('Could not stitch the segments — saving each part as a separate file.');
     let fileNum = 1;
-    let allSaved = true;
+    let cancelled = false;
+    const downloadedIds = [];
     for (const s of segments) {
-      const saved = await saveFile(s.blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
-      if (saved) {
+      const r = await saveFile(s.blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+      if (r === 'saved') {
         await deleteSession(s.id);
         fileNum++;
+      } else if (r === 'downloaded') {
+        downloadedIds.push(s.id);
+        fileNum++;
       } else {
-        allSaved = false;
+        cancelled = true;
         break;   // stop at the first cancel; remaining segments stay recoverable
       }
     }
-    if (allSaved) {
-      document.getElementById('recoveryBanner').classList.remove('visible');
-    } else {
+    if (cancelled) {
       showError('Save cancelled — the remaining parts stay in the list until you save them.');
+    } else if (downloadedIds.length > 0) {
+      offerDownloadConfirm(downloadedIds, downloadedIds.length);
+    } else {
+      document.getElementById('recoveryBanner').classList.remove('visible');
     }
   } catch (err) {
     console.error('Recovery failed:', err);
@@ -2585,6 +2736,9 @@ window.addEventListener('load', () => {
 
   // Restore saved PiP shape in the dropdown
   document.getElementById('pipShapeSelect').value = pipState.shape;
+
+  // Restore saved mirror preference
+  document.getElementById('mirrorToggle').checked = pipState.mirror;
 
   // Restore saved recording quality (video bitrate)
   try {

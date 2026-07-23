@@ -93,6 +93,8 @@ at save time only. Do NOT switch recording to non-fragmented MP4 — see build l
    `getUserMedia({audio:true,video:true})` on load). Privacy-minded faculty see a
    camera+mic prompt before touching anything. Enumerate without labels initially;
    request permission lazily on first toggle/use, then re-enumerate for labels.
+   (Elevated by the v1.9 Firefox-first pass: Firefox doesn't persist mic/camera grants
+   by default, so this prompt shows on every load in the now-primary browser.)
 8. — ✓ FIXED v1.8 (byte-scan now requires a Timestamp element `0xE7` as the first child of a candidate Cluster; done alongside the Cues writer, which builds the seek index from these boundaries) **EBML byte-scan validation is weaker than its comment claims** (~lines 1263–1287).
    The comment says a Timestamp element should follow "at a plausible position" but the
    code only checks that a size VINT parses (almost any byte ≥ 0x01 passes). Add the
@@ -118,6 +120,26 @@ at save time only. Do NOT switch recording to non-fragmented MP4 — see build l
 13. **Accessibility of the app itself:** PiP is mouse-only (add arrow-key nudging when
     focused), verify text-dim contrast (#8892a4 on #1a1a2e) against WCAG AA, add
     visible focus styles. An education tool should model the standard it serves.
+
+---
+
+## Firefox-first pass (2026-07-23)
+
+### 14. Firefox cancel/failed-save deletes the recording (download fallback) — P0 — ✓ FIXED v1.9
+Firefox lacks `showSaveFilePicker`, so `saveFile()` uses the `a.click()` download
+fallback and returns `true` unconditionally; callers then `deleteSession`. A cancelled
+"Save As" or a failed download loses the recording — the v1.6 P0 #1 guarantee doesn't
+hold in Firefox, now the primary browser. Fix: the download path must not count as a
+confirmed save; keep the session recoverable and surface a "downloaded — recover if it
+didn't land" affordance; decide the lingering-session sweep policy. *(v1.9: tri-state
+`saveFile` + download-confirmation bar; sweep policy = immediate affordance with
+recovery-banner backstop, chosen by the owner.)*
+
+**Sweep findings (v1.9 pass — all verified clean in code; real-Firefox acceptance on
+the owner's manual list):** codec → vp8,opus via existing fallback (clean); system
+audio absent in Firefox screen capture → guarded, mic-only (documented, BUILD_LOG
+limitation #7); worker draw clock browser-agnostic (clean); IndexedDB ephemeral in
+private windows (documented, limitation #8); picker cancel already handled (clean).
 
 ---
 

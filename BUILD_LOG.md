@@ -10,7 +10,7 @@
 
 **Repo:** github.com/bluebrazelton-dotcom/screen-recorder
 **License:** MIT
-**Target browsers:** Chrome 86+, Edge 86+ (File System Access API + getDisplayMedia); Firefox supported since v1.8.1 (saves via download fallback; writes 8-byte unknown-size cluster VINTs — see v1.8.1)
+**Target browsers:** Chrome 86+, Edge 86+ (File System Access API + getDisplayMedia); Firefox first-class since v1.9 (saves via download fallback with in-app arrival confirmation; writes 8-byte unknown-size cluster VINTs — see v1.8.1)
 **Architecture:** Single `index.html` file, inline CSS + JS, no build step, no server
 
 ---
@@ -377,6 +377,78 @@ recording, crash recovery, stitching, and seeking all apply.
 
 ---
 
+### v1.9 — Firefox-first: unconfirmed downloads no longer count as saves (2026-07-23)
+
+**Commit:** `fix Firefox cancel/failed-save data loss: tri-state saveFile + download confirmation`
+
+**Bug (REVIEW.md #14, P0):** Firefox has no `showSaveFilePicker`, so `saveFile()` fell to
+the `a.click()` download fallback and returned `true` unconditionally; every caller then
+treated the save as confirmed and called `deleteSession`. A cancelled "Save As" dialog
+(Firefox set to "Always ask you where to save files") or a failed download (disk full,
+permissions) deleted the recording with no recovery path — the v1.6 cancel-preservation
+guarantee did not hold in Firefox, now the primary browser.
+
+**The constraint:** a fire-and-forget download can't report success or cancellation —
+there is no API for it. So the fix is not "detect the cancel"; it is "stop treating an
+unconfirmed download as a confirmed save."
+
+**Fixes:**
+
+1. **Tri-state `saveFile`:** returns `'saved'` (FSA wrote + closed), `'cancelled'` (FSA
+   AbortError), or `'downloaded'` (fallback fired; arrival unconfirmed). All six caller
+   sites updated: `'saved'` deletes the session (unchanged), `'cancelled'` keeps it
+   (unchanged), `'downloaded'` keeps it until the user confirms.
+2. **Download confirmation bar:** after a fallback download, an in-app bar asks
+   "Downloaded — did it arrive?" — "It's there — all set" deletes the session(s);
+   "It didn't arrive — keep my recording" keeps them recoverable. If the bar is ignored,
+   the recovery banner on next load is the backstop. (Sweep policy chosen by Blue:
+   immediate affordance with banner backstop.)
+3. **Multi-part loops** (stitch-fail fallback, recovery separate parts): a downloaded
+   part no longer breaks the loop or deletes its session; all parts download and one
+   confirmation bar resolves them together.
+
+Chrome/Edge FSA path is behavior-identical (only the return values renamed).
+
+**Firefox sweep (this pass, all verified clean in code):** codec falls to `vp8,opus`
+(Firefox has no VP9 encoder; existing fallback chain handles it); system audio absent
+from Firefox screen capture — guarded, mic-only mixes without error (limitation #7);
+worker draw clock browser-agnostic (worker timers unthrottled in Firefox); IndexedDB
+ephemeral in Firefox private windows (limitation #8); picker cancel (`NotAllowedError`)
+already handled. REVIEW P2 #7 (permission prompt on load) noted as elevated in Firefox —
+its own session.
+
+**Verification:** harness now 22 scenarios / 99 assertions — new Firefox-mode scenarios
+(no `showSaveFilePicker` in the mock): single download keeps the session and confirm
+deletes it; decline keeps the recording recoverable; stitched download keeps all 3
+sessions until confirmed; recovery stitch-fail downloads both parts and keeps both until
+confirmed. All 18 prior scenarios pass unchanged (FSA path regression-checked by
+scenarios A–F). Real-Firefox acceptance (cancel the "Always ask" dialog → recording
+survives) is the manual test below.
+
+---
+
+### v1.10 — Mirror webcam option (2026-07-23)
+
+**Commit:** `add mirror-webcam toggle (flips preview AND recording)`
+
+A "Mirror webcam" checkbox under the webcam controls flips the camera horizontally.
+Because the preview canvas IS the recording (`captureStream` records the same pixels),
+the flip applies to both — mirror-preview-only would require a second draw pipeline.
+Caveat: written text held up to a mirrored camera reads backwards in the saved file.
+
+- Works in all modes: PiP (all shapes — the flip is around the PiP's own vertical
+  axis, so position/drag/resize are unaffected) and camera-only.
+- Off by default; persisted in the `pipLayout` localStorage entry alongside position,
+  size, and shape; disabled during recording (same convention as the shape selector).
+- Implementation: nested `save()/translate/scale(-1,1)/restore()` around the camera
+  `drawImage` — the clip path stays active, and the border stroke is unaffected
+  (paths aren't part of the context state stack).
+
+Verification: visual (no Node-harness coverage for canvas transforms, consistent with
+v1.4/v1.5 PiP features); harness re-run green (22 scenarios / 99 assertions).
+
+---
+
 ## Known limitations
 
 1. **Memory usage during stitching:** All segment blobs are loaded into memory for concatenation. For very long recordings (multiple hours), this could hit browser memory limits. Future improvement: stream-based stitching.
@@ -390,6 +462,12 @@ recording, crash recovery, stitching, and seeking all apply.
 5. **No black frame detection:** Screen switching mid-recording produces a few black frames. Detecting and removing these would require frame-by-frame analysis (decode → inspect → re-encode), which is a significant complexity increase. Noted for future exploration.
 
 6. **Single-file architecture:** The entire app is one HTML file with inline CSS and JS. This is intentional (zero build step, easy to deploy), but limits code organization as features grow. Consider splitting if the file exceeds ~2000 lines.
+
+7. **No system audio in Firefox:** Firefox's screen capture does not provide system/tab
+   audio; Firefox recordings capture microphone audio only.
+
+8. **Firefox private windows:** IndexedDB is in-memory in private browsing, so crash
+   recovery does not survive a private-window crash. Record in a normal window.
 
 ---
 
@@ -409,10 +487,12 @@ recording, crash recovery, stitching, and seeking all apply.
 
 ```
 screen-recorder/
-├── index.html      # The entire app (HTML + CSS + JS, ~2100 lines)
+├── index.html      # The entire app (HTML + CSS + JS, ~2700 lines)
 ├── README.md       # Project description and usage
 ├── LICENSE         # MIT License
-└── BUILD_LOG.md    # This file
+├── BUILD_LOG.md    # This file
+├── REVIEW.md       # Fable 5 code review — tracked items + build queue
+└── test.cjs        # Node harness (22 scenarios / 99 assertions; npm i fake-indexeddb)
 ```
 
 ---
@@ -481,6 +561,15 @@ screen-recorder/
 2. Fully cover or minimize the tab for ~60s while the on-screen content keeps moving
 3. Stop and save, then scrub the portion recorded while the tab was hidden
 4. The video should keep updating through that window (not a frozen frame)
+
+**Manual acceptance test (Firefox cancel/failed download, v1.9):**
+1. In Firefox, set "Always ask you where to save files" (Settings → General → Downloads)
+2. Record 10+ seconds, click "Stop & save", and CANCEL the save dialog
+3. The confirmation bar appears; click "It didn't arrive — keep my recording"
+4. Reload the page — the recovery banner must reappear, and "Recover & save" must
+   produce a playable file
+5. Repeat with a normal save; click "It's there — all set" — the session resolves
+   (no banner on reload)
 
 ---
 
