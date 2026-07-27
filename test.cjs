@@ -781,6 +781,17 @@ async function scenario(name, fn) {
     for (let i = 0; i < parts.length; i++) await api.addChunk(id, indexes ? indexes[i] : i, new Blob([parts[i]]));
     return id;
   }
+  // One session per buffer (a multi-segment chain), each split into thirds — for
+  // the Phase 0 oracle scenarios (STREAMING_STITCH_HANDOFF §5). Returns session
+  // ids in order.
+  async function seedSegments(buffers) {
+    const ids = [];
+    for (const buf of buffers) {
+      const thirds = splitAt(buf, [Math.floor(buf.length / 3), Math.floor(2 * buf.length / 3)]);
+      ids.push(await seedBuffers(thirds));
+    }
+    return ids;
+  }
   function splitEveryByte(buf) { const out = []; for (let i = 0; i < buf.length; i++) out.push(buf.slice(i, i + 1)); return out; }
   function splitAt(buf, offsets) {
     const out = []; let prev = 0;
@@ -797,6 +808,13 @@ async function scenario(name, fn) {
   }
   async function expectedBytes(buf) {
     return Buffer.from(await (await S.makeSeekable(new Blob([buf]))).arrayBuffer());
+  }
+  // Phase 0 oracle (STREAMING_STITCH_HANDOFF §5): the REAL concatenateWebM +
+  // makeSeekable, run over N segment buffers. Uses ORIG.concatenateWebM so this
+  // stays the buffered reference even in scenarios that override sandbox.concatenateWebM.
+  async function stitchOracle(buffers) {
+    const stitched = await ORIG.concatenateWebM(buffers.map(b => new Blob([b])));
+    return Buffer.from(await (await S.makeSeekable(stitched)).arrayBuffer());
   }
   async function runStreamedFSA(sessionId) {
     windowMock.showSaveFilePicker = pickerSequence(['ok']);
@@ -1052,6 +1070,111 @@ async function scenario(name, fn) {
     const sessions = await readStore('sessions');
     assert(sessions.length === 0, 'confirm deletes BOTH sessions (got ' + sessions.length + ')');
     assert(sandbox.downloadPendingFiles === 0, 'file count reset after confirm');
+  });
+
+  // ============================================================
+  // Phase 0 — the buffered-stitch oracle (STREAMING_STITCH_HANDOFF §5)
+  // ============================================================
+  // Pins today's makeSeekable(concatenateWebM(segments)) behavior byte-level,
+  // before the streamed multi-segment rewrite begins.
+
+  // AL — 2-segment Chrome+Chrome oracle structure
+  await scenario('AL 2-segment Chrome+Chrome oracle structure', async () => {
+    const out = await stitchOracle([syntheticWebm(), syntheticWebm()]);
+    let headerCount = 0;
+    for (let i = 0; i + 3 < out.length; i++) {
+      if (out[i] === 0x1A && out[i+1] === 0x45 && out[i+2] === 0xDF && out[i+3] === 0xA3) headerCount++;
+    }
+    assert(headerCount === 1, 'exactly one EBML header in stitched output (got ' + headerCount + ')');
+    const view = new DataView(out.buffer, out.byteOffset, out.length);
+    const rescan = S.webmScan(out.buffer.slice(out.byteOffset, out.byteOffset + out.length));
+    // segment 1 verbatim 0,1000,2000 (lastTimestamp 2000); segment 2 rebased by 2000+1000=3000
+    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,1000,2000,3000,4000,5000',
+      'segment 2 clusters rebased by segment 1 lastTimestamp+1000 (got ' + rescan.clusters.map(c => c.timestamp) + ')');
+    const infoKids = childElems(view, rescan.infoDataStart, rescan.infoDataEnd);
+    const dur = infoKids.find(k => k.id === 0x4489);
+    const durVal = dur ? view.getFloat64(dur.dataStart, false) : -1;
+    assert(durVal > 5900 && durVal < 6000, 'Duration reflects the 2-segment total, 2933+3000 (got ' + durVal + ')');
+    const segData = rescan.segmentDataStart;
+    const shSize = S.ebmlReadSize(view, segData + 4);
+    const seeks = childElems(view, segData + 4 + shSize.length, segData + 4 + shSize.length + shSize.value);
+    let cuesPos = -1;
+    for (const s of seeks) {
+      const kids = childElems(view, s.dataStart, s.dataEnd);
+      const idEl = kids.find(k => k.id === 0x53AB), posEl = kids.find(k => k.id === 0x53AC);
+      if (S.ebmlReadUInt(view, idEl.dataStart, idEl.dataEnd - idEl.dataStart) === 0x1C53BB6B)
+        cuesPos = S.ebmlReadUInt(view, posEl.dataStart, posEl.dataEnd - posEl.dataStart);
+    }
+    const cuesAt = segData + cuesPos;
+    const cuesSize = S.ebmlReadSize(view, cuesAt + 4);
+    const cuePoints = childElems(view, cuesAt + 4 + cuesSize.length, cuesAt + 4 + cuesSize.length + cuesSize.value);
+    const cueTimes = cuePoints.map(cp => {
+      const t = childElems(view, cp.dataStart, cp.dataEnd).find(k => k.id === 0xB3);
+      return S.ebmlReadUInt(view, t.dataStart, t.dataEnd - t.dataStart);
+    });
+    assert(cueTimes.join(',') === '0,2000,3000,5000', 'cues cover both segments, rebased (got ' + cueTimes + ')');
+  });
+
+  // AM — 3-segment mixed chain: Chrome + Firefox (8-byte marker) + Chrome
+  await scenario('AM 3-segment mixed chain (Chrome+Firefox+Chrome)', async () => {
+    const out = await stitchOracle([syntheticWebm(), syntheticFirefoxWebm(), syntheticWebm()]);
+    const view = new DataView(out.buffer, out.byteOffset, out.length);
+    const rescan = S.webmScan(out.buffer.slice(out.byteOffset, out.byteOffset + out.length));
+    assert(rescan.clusters.length === 9, '9 clusters total, 3+3+3 (got ' + rescan.clusters.length + ')');
+    // seg1 verbatim 0,1000,2000; seg2 offset = 2000+1000=3000 -> 3000,10504,18000 (firefox ts 0,7504,15000);
+    // seg3 offset = 3000 + (15000+1000) = 19000 -> 19000,20000,21000 (cumulative across BOTH gaps)
+    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,1000,2000,3000,10504,18000,19000,20000,21000',
+      'cumulative rebasing across both segment gaps (got ' + rescan.clusters.map(c => c.timestamp) + ')');
+    // The Firefox segment's clusters are rewritten (not verbatim — only segment 1 is).
+    // webmRewriteCluster preserves unknown-size via the constant EBML_UNKNOWN_SIZE
+    // (8-byte 0x01 FFx7) for ANY sizeIsUnknown cluster it rewrites — byte-check that
+    // pattern survives here, where the source segment already used an 8-byte marker.
+    for (const c of rescan.clusters.slice(3, 6)) {
+      const b0 = view.getUint8(c.offset + 4);
+      const rest = [1,2,3,4,5,6,7].map(i => view.getUint8(c.offset + 4 + i));
+      assert(b0 === 0x01 && rest.every(x => x === 0xFF),
+        'rewritten firefox cluster keeps an 8-byte unknown-size marker (got 0x' + b0.toString(16) + ' ' + rest.map(x => x.toString(16)) + ')');
+    }
+  });
+
+  // AN — audio-only chain (2 segments): Duration rebased, no video Cues at all
+  await scenario('AN audio-only chain, Duration-only indexing', async () => {
+    const out = await stitchOracle([syntheticAudioOnlyWebm(), syntheticAudioOnlyWebm()]);
+    const view = new DataView(out.buffer, out.byteOffset, out.length);
+    const rescan = S.webmScan(out.buffer.slice(out.byteOffset, out.byteOffset + out.length));
+    // seg1 verbatim 0,900 (lastTimestamp 900); seg2 offset = 900+1000=1900 -> 1900,2800
+    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,900,1900,2800',
+      'audio-only clusters rebased (got ' + rescan.clusters.map(c => c.timestamp) + ')');
+    const infoKids = childElems(view, rescan.infoDataStart, rescan.infoDataEnd);
+    const dur = infoKids.find(k => k.id === 0x4489);
+    const durVal = dur ? view.getFloat64(dur.dataStart, false) : -1;
+    assert(durVal > 2830 && durVal < 2900, 'Duration reflects rebased last audio block, 2800+40+33 (got ' + durVal + ')');
+    const segData = rescan.segmentDataStart;
+    const shSize = S.ebmlReadSize(view, segData + 4);
+    const seeks = childElems(view, segData + 4 + shSize.length, segData + 4 + shSize.length + shSize.value);
+    assert(seeks.length === 2, 'SeekHead has only Info+Tracks entries, no Cues (got ' + seeks.length + ')');
+    let hasCuesId = false;
+    for (let i = 0; i + 3 < out.length; i++) {
+      if (out[i] === 0x1C && out[i+1] === 0x53 && out[i+2] === 0xBB && out[i+3] === 0x6B) { hasCuesId = true; break; }
+    }
+    assert(!hasCuesId, 'no video track -> no Cues element anywhere in the output');
+  });
+
+  // AO — end-to-end buffered stitch through the real save path === the oracle
+  await scenario('AO real finalizeRecording stitch matches the oracle', async () => {
+    const b1 = syntheticWebm(), b2 = syntheticWebm();
+    const [p1, cur] = await seedSegments([b1, b2]);
+    state.priorSegments = [{ sessionId: p1, mimeType: 'video/webm' }];
+    state.sessionId = cur; state.chunkIndex = 3;
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.finalizeRecording();
+    await drain();
+    assert(lastWritten.length === 1, 'one stitched file written');
+    const got = Buffer.from(await lastWritten[0].arrayBuffer());
+    const want = await stitchOracle([b1, b2]);
+    assert(Buffer.compare(got, want) === 0, 'app buffered stitch === oracle (' + got.length + ' vs ' + want.length + ' bytes)');
+    const sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'both segments deleted after confirmed stitched save');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');
