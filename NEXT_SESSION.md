@@ -7,14 +7,15 @@ Close-out snapshot, 2026-07-27 (post-v1.12.2). An Aegis session also has the ful
 
 - v1.12.1 is committed and pushed (`9a65827`) — the 07-23 close-out's step zero is
   done.
-- v1.12.2 = `downloadPendingIds` polish (old queue item 1): a 2nd unresolved Firefox
-  download now APPENDS to the confirm bar (ID dedupe + `downloadPendingFiles`
-  counter in the message) instead of overwriting the 1st's IDs. Harness green
-  (31 scenarios / 208 assertions, new scenario AK). **Blue's real-Firefox
-  acceptance — two unconfirmed downloads back-to-back — may still be pending;
-  confirm before building on top.** Check `git log -1` for a v1.12.2 message; if
-  absent, the working tree holds it — commit+push from a normal shell (suggested
-  message in BUILD_LOG's v1.12.2 entry).
+- v1.12.2 is committed and pushed (`05222cd`), Blue's real-Firefox acceptance
+  passed: a 2nd unresolved Firefox download now APPENDS to the confirm bar (ID
+  dedupe + `downloadPendingFiles` counter in the message) instead of overwriting
+  the 1st's IDs, and filenames gained seconds (same-minute saves no longer
+  collide). Harness green (31 scenarios / 208 assertions, new scenario AK).
+- Standing preference (in Aegis memory too): Blue wants future DidaRec work run
+  as orchestrator + Sonnet 5 subagents (`Agent` tool, `model: "sonnet"`) to save
+  tokens — Fable plans/reviews/presents, Sonnet drafts/explores/runs tests. The
+  File Edit Rule still applies at the orchestrator level.
 - v1.12 = REVIEW P2 #7 closed: zero permission prompts at load; grants happen lazily
   at first webcam/mic use; labels upgrade on grant and a blank re-enumeration never
   overwrites a good name; `state.sources.camera` defaults off (the root cause of
