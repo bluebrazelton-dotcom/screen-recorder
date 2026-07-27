@@ -2969,7 +2969,7 @@ async function saveFile(source, suggestedName) {
 
 function formatDateForFilename() {
   const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}_${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}`;
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}_${String(d.getHours()).padStart(2,'0')}${String(d.getMinutes()).padStart(2,'0')}${String(d.getSeconds()).padStart(2,'0')}`;
 }
 
 // ============================================================
@@ -2979,11 +2979,18 @@ function formatDateForFilename() {
 // the user confirms the file arrived; otherwise they stay recoverable (the
 // recovery banner on next load is the backstop if the bar is ignored).
 var downloadPendingIds = [];
+var downloadPendingFiles = 0;
 
 function offerDownloadConfirm(sessionIds, fileCount) {
-  downloadPendingIds = sessionIds;
-  document.getElementById('downloadConfirmMsg').textContent = fileCount > 1
-    ? `Your ${fileCount} recording files were downloaded (usually to your Downloads folder).`
+  // Append, don't overwrite: a 2nd unresolved download while the bar is up
+  // must keep covering the 1st's sessions — otherwise confirming deletes only
+  // the newest and quietly leaves the rest for the recovery banner.
+  for (const id of sessionIds) {
+    if (!downloadPendingIds.includes(id)) downloadPendingIds.push(id);
+  }
+  downloadPendingFiles += fileCount;
+  document.getElementById('downloadConfirmMsg').textContent = downloadPendingFiles > 1
+    ? `Your ${downloadPendingFiles} recording files were downloaded (usually to your Downloads folder).`
     : 'Your recording was downloaded (usually to your Downloads folder).';
   document.getElementById('downloadConfirm').classList.add('visible');
 }
@@ -2991,6 +2998,7 @@ function offerDownloadConfirm(sessionIds, fileCount) {
 async function confirmDownloadArrived() {
   for (const id of downloadPendingIds) await deleteSession(id);
   downloadPendingIds = [];
+  downloadPendingFiles = 0;
   state.priorSegments = [];
   document.getElementById('downloadConfirm').classList.remove('visible');
   document.getElementById('recoveryBanner').classList.remove('visible');
@@ -2999,6 +3007,7 @@ async function confirmDownloadArrived() {
 
 function keepDownloadSession() {
   downloadPendingIds = [];
+  downloadPendingFiles = 0;
   document.getElementById('downloadConfirm').classList.remove('visible');
   const bannerUp = document.getElementById('recoveryBanner').classList.contains('visible');
   showError(bannerUp

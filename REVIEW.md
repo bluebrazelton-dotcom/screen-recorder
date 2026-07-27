@@ -148,6 +148,10 @@ audio absent in Firefox screen capture → guarded, mic-only (documented, BUILD_
 limitation #7); worker draw clock browser-agnostic (clean); IndexedDB ephemeral in
 private windows (documented, limitation #8); picker cancel already handled (clean).
 
+*(Follow-up polish — ✓ FIXED v1.12.2: a 2nd unresolved download used to overwrite
+the 1st's confirm bar; now it appends with ID dedupe and the bar counts all covered
+files. Was safe — recovery-banner backstop — just dishonest about coverage.)*
+
 ---
 
 ## Feature map vs. the research-derived plan

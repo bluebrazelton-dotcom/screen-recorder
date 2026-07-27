@@ -645,6 +645,43 @@ only a browser proves pixels.
 
 ---
 
+### v1.12.2 — Download confirm bar appends across saves (2026-07-27)
+
+**Commit:** `append 2nd unresolved download to confirm bar instead of overwriting`
+
+**Bug (queued since the v1.11 close-out; origin: v1.9's download-confirmation
+bar):** `offerDownloadConfirm` assigned `downloadPendingIds = sessionIds`, so a
+2nd unresolved Firefox download while the 1st confirm bar was still up
+overwrote the 1st's session IDs. Confirming then deleted only the newest
+sessions; the older ones silently fell back to the recovery banner while the
+bar's wording implied it covered everything. Safe (nothing lost) but dishonest.
+
+**Fix:** append with per-ID dedupe instead of overwrite, plus a
+`downloadPendingFiles` counter so the bar's message counts every file it now
+covers ("Your N recording files were downloaded…"). Confirming deletes every
+covered session; Keep is unchanged; both paths reset the counter. Re-offering
+an already-covered session still bumps the file count on purpose — the browser
+really does write a second file (`recording(1).webm`); the ID dedupe only
+prevents double-deletion.
+
+**Also in this version:** `formatDateForFilename()` gains seconds
+(`recording-2026-07-27_143258.webm`) — the acceptance test surfaced that two
+saves in the same minute produced identical suggested filenames. All save
+paths name files through this one function.
+
+**Verification:** harness 31 scenarios / 208 assertions — new scenario AK
+drives two unresolved downloads back-to-back and asserts both sessions stay
+covered, the message says "2 recording files", a re-offer doesn't duplicate the
+ID, and confirm deletes BOTH sessions. Real-Firefox acceptance passed
+(2026-07-27): bar reads "Your 2 recording files were downloaded…", confirm
+clears both, no recovery banner on reload. During acceptance the owner also
+re-verified that Record re-enables after reselecting a screen post-save (a
+harness repro of the full record→stop→download→reselect flow passes; an
+earlier greyed-button sighting did not reproduce — stale copy or a missed
+error banner).
+
+---
+
 ## Known limitations
 
 1. **Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.

@@ -214,6 +214,7 @@ async function resetState() {
   delete windowMock.showSaveFilePicker;   // absent = Firefox mode; FSA scenarios set their own picker
   sandbox.addChunk = ORIG.addChunk; sandbox.concatenateWebM = ORIG.concatenateWebM;
   sandbox.downloadPendingIds = [];
+  sandbox.downloadPendingFiles = 0;
   documentMock.getElementById('downloadConfirm').classList.remove('visible');
   documentMock.getElementById('recoveryBanner').classList.remove('visible');
   documentMock.hidden = false;
@@ -1034,6 +1035,23 @@ async function scenario(name, fn) {
 
   await scenario('AJ camera defaults off (no stream at load, so the toggle is truthful)', async () => {
     assert(state.sources.camera === false, 'state.sources.camera defaults to false (got ' + state.sources.camera + ')');
+  });
+
+  // AK — a 2nd unresolved download appends to the confirm bar (no overwrite)
+  await scenario('AK second unresolved download appends to confirm bar', async () => {
+    const id1 = await seed(1);
+    const id2 = await seed(1);
+    sandbox.offerDownloadConfirm([id1], 1);
+    sandbox.offerDownloadConfirm([id2], 1);
+    assert(sandbox.downloadPendingIds.length === 2, 'both sessions covered (got ' + sandbox.downloadPendingIds.length + ')');
+    const msg = documentMock.getElementById('downloadConfirmMsg').textContent;
+    assert(/2 recording files/.test(msg), 'bar message counts both files (got "' + msg + '")');
+    sandbox.offerDownloadConfirm([id2], 1);
+    assert(sandbox.downloadPendingIds.length === 2, 're-offering a covered session does not duplicate its id');
+    await sandbox.confirmDownloadArrived();
+    const sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'confirm deletes BOTH sessions (got ' + sessions.length + ')');
+    assert(sandbox.downloadPendingFiles === 0, 'file count reset after confirm');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');
