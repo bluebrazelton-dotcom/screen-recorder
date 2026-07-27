@@ -46,9 +46,14 @@ page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when done.
 
 ## Open queue (priority order)
 
-1. Streaming stitch — multi-segment saves still buffer everything (BUILD_LOG Known
-   Limitation #1, ~2–3h ceiling). Hard plumbing: wants its own handoff brief like
-   STREAMING_SAVE_HANDOFF.md, and Fable-grade routing (window closes Aug 19).
+1. Streaming stitch — IN PROGRESS. Read `STREAMING_STITCH_HANDOFF.md` (design ratified
+   by Blue 2026-07-27, incl. Rider 2 = REVIEW #10 confirm() replacement). Phase 0 (the
+   buffered-stitch oracle, scenarios AL–AO) is DONE and pushed (`57dd209`, harness now
+   35 scenarios / 224 assertions) — it also caught that `webmRewriteCluster`
+   canonicalizes unknown-size markers to 8-byte for rewritten clusters (HANDOFF gotcha
+   #2 updated; the Phase 1 header helper must replicate this). Next: Phase 1 (scanner
+   clusters-only mode + `webmRewriteClusterHeader` extraction + merged plan builder,
+   differential vs the oracle). Window closes Aug 19.
 2. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
    Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT), chapter-
    marker hotkeys, sidecar export convention. The caption editor deserves its own
