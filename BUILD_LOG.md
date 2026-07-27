@@ -615,6 +615,36 @@ spot-checking.
 
 ---
 
+### v1.12.1 — Camera-only preview actually renders (2026-07-23)
+
+**Commit:** `fix blank camera-only preview: composite on screen-off, restore placeholder on exit`
+
+**Bug (found by the owner's post-push re-test of v1.12, both browsers):** in the
+exact order "Webcam on → Screen off," the viewer stayed blank — `toggleSource`
+only started compositing when a screen *stream* existed, so with no screen ever
+selected the camera ran into a hidden element while the placeholder sat on the
+canvas. The reverse exit had the sibling bug: toggling Webcam off from
+camera-only leaves a dead canvas, because the at-least-one guard flips Screen
+back ON before `stopCameraPreview`'s `!state.sources.screen` placeholder check
+runs.
+
+**Fixes (both directions):**
+
+1. `toggleSource` screen-off path: when the camera source is on and its stream
+   is live, restart compositing and hide the placeholder — the camera-only
+   preview renders immediately.
+2. `stopCameraPreview` no-stream branch: always restore the placeholder (the
+   old `sources.screen` check could never be true there after the guard ran).
+
+**Verification:** harness 30 scenarios / 203 assertions — AH/AI extended to
+assert what the viewer SHOWS (placeholder visibility + compositing started),
+not just toggle state; state-level assertions are exactly how this slipped
+through v1.12's otherwise-green run. Real-browser re-test of both directions is
+the owner's step. Lesson logged twice in one day: the harness proves logic;
+only a browser proves pixels.
+
+---
+
 ## Known limitations
 
 1. **Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.

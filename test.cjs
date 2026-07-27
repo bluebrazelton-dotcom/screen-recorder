@@ -1016,9 +1016,12 @@ async function scenario(name, fn) {
 
   await scenario('AH camera-only is reachable: screen-off with camera already on', async () => {
     state.sources = { screen: true, camera: true, mic: true };
+    state.cameraStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 320, height: 240 }), addEventListener() {}, stop() {} }]);
     sandbox.toggleSource('screen');
     assert(state.sources.screen === false && state.sources.camera === true, 'camera-only state reached');
     assert(recordedErrors[recordedErrors.length - 1] === '', 'no stale hint shown for a real toggle');
+    assert(documentMock.getElementById('placeholder').classList.contains('hidden'), 'placeholder hidden — the viewer shows the camera, not a blank canvas');
+    assert(typeof state.drawFrame === 'function', 'compositing started for the camera-only preview');
   });
 
   await scenario('AI toggling camera off in camera-only mode reverts with an explanation', async () => {
@@ -1026,6 +1029,7 @@ async function scenario(name, fn) {
     sandbox.toggleSource('camera');
     assert(state.sources.screen === true && state.sources.camera === false, 'reverted to screen mode');
     assert(recordedErrors.length > 0 && /screen/i.test(recordedErrors[recordedErrors.length - 1]), 'the snap-back is explained, not silent');
+    assert(!documentMock.getElementById('placeholder').classList.contains('hidden'), 'placeholder restored — no dead canvas after leaving camera-only');
   });
 
   await scenario('AJ camera defaults off (no stream at load, so the toggle is truthful)', async () => {

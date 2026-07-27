@@ -781,6 +781,14 @@ function toggleSource(source) {
       btnSelect.classList.remove('selected');
       btnSelect.textContent = 'Select Screen';
     }
+    // Camera-only with a live camera: composite the camera feed now.
+    // (Without this, "Webcam on → Screen off" leaves the placeholder up and
+    // the camera running into a hidden element — the viewer looks dead.)
+    if (state.sources.camera && state.cameraStream) {
+      stopCompositing();
+      startCompositing();
+      document.getElementById('placeholder').classList.add('hidden');
+    }
   }
 
   // Start or stop camera preview immediately
@@ -828,9 +836,10 @@ function stopCameraPreview() {
     startCompositing();
   } else {
     stopCompositing();
-    if (!state.sources.screen) {
-      document.getElementById('placeholder').classList.remove('hidden');
-    }
+    // No stream left to composite — show the placeholder. (Checking
+    // state.sources.screen here misses the camera-only exit: the at-least-one
+    // guard flips Screen back ON before this runs, leaving a dead canvas.)
+    document.getElementById('placeholder').classList.remove('hidden');
   }
 }
 
