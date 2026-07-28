@@ -775,6 +775,15 @@ async function scenario(name, fn) {
     return Buffer.concat([header, segHdr, infoEl, tracks, c0, c1,
       Buffer.from([0xEC, 0xFF]), Buffer.alloc(8192, 0x42)]);
   }
+  function preambleOnlyWebm() {       // valid preamble, zero clusters
+    const header = Buffer.from([0x1A, 0x45, 0xDF, 0xA3, 0x80]);
+    const segHdr = Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    const infoEl = el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], uintBytes(1000000, 3)));
+    const tracks = el([0x16, 0x54, 0xAE, 0x6B],
+      el([0xAE], el([0xD7], [0x01]), el([0x83], [0x01])),
+      el([0xAE], el([0xD7], [0x02]), el([0x83], [0x02])));
+    return Buffer.concat([header, segHdr, infoEl, tracks]);
+  }
 
   async function seedBuffers(parts, indexes) {
     const id = await api.createSession('video/webm;codecs=vp9,opus');
@@ -815,6 +824,44 @@ async function scenario(name, fn) {
   async function stitchOracle(buffers) {
     const stitched = await ORIG.concatenateWebM(buffers.map(b => new Blob([b])));
     return Buffer.from(await (await S.makeSeekable(stitched)).arrayBuffer());
+  }
+  // Phase 1: run the plan-level streamed stitch over segment buffers (each split
+  // by splitFn) and ASSEMBLE the plan's bytes — no sinks exist yet.
+  async function streamedPlanBytes(buffers, splitFn) {
+    const scanner0 = S.createWebmStreamScanner();
+    for (const part of splitFn(buffers[0])) scanner0.push(part);
+    const ok0 = scanner0.finish();
+    const scan0 = scanner0.result();
+    const videoTrack = scan0.videoTrack;
+    const segScans = [{ ok: ok0, scan: scan0 }];
+
+    let prevScan = scan0;
+    let offset = 0;
+    for (let i = 1; i < buffers.length; i++) {
+      offset += prevScan.maxClusterTs + 1000;
+      const scanner = S.createWebmStreamScanner({ clustersOnly: true, timeOffset: offset, videoTrack });
+      for (const part of splitFn(buffers[i])) scanner.push(part);
+      const ok = scanner.finish();
+      const scan = scanner.result();
+      segScans.push({ ok, scan });
+      prevScan = scan;
+    }
+
+    const plan = S.buildStitchPlanParts(segScans);
+    if (plan.bail) return { bail: plan.bail };
+
+    const parts = [];
+    for (const p of plan.head) parts.push(Buffer.from(p));
+    for (const e of plan.entries) {
+      if (e.verbatim) {
+        parts.push(Buffer.from(buffers[e.seg].slice(e.start, e.end)));
+      } else {
+        parts.push(Buffer.from(e.headerBytes));
+        parts.push(Buffer.from(buffers[e.seg].slice(e.remStart, e.remEnd)));
+      }
+    }
+    if (plan.cues) parts.push(Buffer.from(plan.cues));
+    return Buffer.concat(parts);
   }
   async function runStreamedFSA(sessionId) {
     windowMock.showSaveFilePicker = pickerSequence(['ok']);
@@ -1175,6 +1222,98 @@ async function scenario(name, fn) {
     assert(Buffer.compare(got, want) === 0, 'app buffered stitch === oracle (' + got.length + ' vs ' + want.length + ' bytes)');
     const sessions = await readStore('sessions');
     assert(sessions.length === 0, 'both segments deleted after confirmed stitched save');
+  });
+
+  // ============================================================
+  // Phase 1 — the streamed multi-segment stitch plan (STREAMING_STITCH_HANDOFF)
+  // ============================================================
+  // buildStitchPlanParts + the clusters-only scanner mode, assembled by hand
+  // via streamedPlanBytes (no sinks exist yet — that's Phase 2). The invariant:
+  // for ANY chunked multi-segment chain, the plan's assembled bytes must equal
+  // the buffered stitchOracle byte-for-byte.
+
+  // AP — plan-level differential (the star)
+  await scenario('AP plan-level differential (streamed stitch plan matches the oracle)', async () => {
+    const chains = [
+      ['chrome+chrome',          () => [syntheticWebm(), syntheticWebm()]],
+      ['chrome+firefox+chrome',  () => [syntheticWebm(), syntheticFirefoxWebm(), syntheticWebm()]],
+      ['audio+audio',            () => [syntheticAudioOnlyWebm(), syntheticAudioOnlyWebm()]],
+      // REQUIRED: a Chrome-shaped segment (1-byte 0xFF cluster markers) in
+      // position 2 is the canonicalization case — a "marker-preserving" helper
+      // diverges from the oracle exactly here (the oracle always canonicalizes
+      // a rewritten unknown-size cluster to the 8-byte EBML_UNKNOWN_SIZE form).
+      ['firefox+chrome',         () => [syntheticFirefoxWebm(), syntheticWebm()]],
+    ];
+    for (const [label, makeChain] of chains) {
+      const oracleBuffers = makeChain();
+      const want = await stitchOracle(oracleBuffers);
+      let headerCount = 0;
+      for (let i = 0; i + 3 < want.length; i++) {
+        if (want[i] === 0x1A && want[i+1] === 0x45 && want[i+2] === 0xDF && want[i+3] === 0xA3) headerCount++;
+      }
+      assert(headerCount === 1, label + ': precondition — the oracle actually indexed (one EBML header, got ' + headerCount + ')');
+
+      const splits = [
+        ['whole',        b => [b]],
+        ['thirds',       b => splitAt(b, [Math.floor(b.length / 3), Math.floor(2 * b.length / 3)])],
+        ['midClusterId', b => splitAt(b, clusterIdOffsets(b).map(o => o + 2))],
+        ['midSizeVint',  b => splitAt(b, clusterIdOffsets(b).map(o => o + 5))],
+        ['midTimestamp', b => splitAt(b, clusterIdOffsets(b).map(o => o + 6))],
+        ['atClusterIds', b => splitAt(b, clusterIdOffsets(b))],
+        ['lastByte',     b => splitAt(b, [b.length - 1])],
+        // All fixtures here are well under 1KB — every-byte chunking maximally
+        // exercises pending-boundary-candidate carry states (a segment ending
+        // while the carry still holds an unresolved cluster-ID candidate).
+        ['everyByte',    b => splitEveryByte(b)],
+      ];
+      for (const [sname, splitFn] of splits) {
+        const buffers = makeChain();   // fresh fixture buffers each time
+        const got = await streamedPlanBytes(buffers, splitFn);
+        assert(!got.bail && Buffer.compare(got, want) === 0,
+          label + '/' + sname + ': streamed plan === oracle (' + (got.bail || got.length) + ' vs ' + want.length + ' bytes)');
+      }
+    }
+  });
+
+  // AQ — bail propagation
+  await scenario('AQ bail propagation (plan-level)', async () => {
+    // (a) zero-cluster segment 2 → bail with a reason, no byte-identity attempted
+    {
+      const result = await streamedPlanBytes([syntheticWebm(), preambleOnlyWebm()], b => [b]);
+      assert(!!result.bail, 'zero-cluster segment 2 bails with a reason (got ' + JSON.stringify(result) + ')');
+    }
+
+    // (b) carry-cap bail
+    try {
+      sandbox.STREAM_CARRY_CAP = 32;   // absurdly small — force the bail (scenario Z's pattern)
+      const result = await streamedPlanBytes([syntheticWebm(), syntheticWebm()], b => [b]);
+      assert(!!result.bail, 'carry-cap exceeded bails (got ' + JSON.stringify(result) + ')');
+    } finally {
+      sandbox.STREAM_CARRY_CAP = ORIG_CARRY_CAP;
+    }
+
+    // Canonicalization probe: a clusters-only scan of a chrome segment (1-byte
+    // 0xFF unknown-size markers) yields headerBytes whose size VINT is the
+    // 8-byte EBML_UNKNOWN_SIZE pattern — independent of the oracle differential.
+    {
+      const chrome = syntheticWebm();
+      const scanner0 = S.createWebmStreamScanner();
+      scanner0.push(chrome);
+      const ok0 = scanner0.finish();
+      assert(ok0, 'precondition: segment 1 scan ok');
+      const scan0 = scanner0.result();
+      const scanner = S.createWebmStreamScanner({ clustersOnly: true, timeOffset: 3000, videoTrack: scan0.videoTrack });
+      scanner.push(chrome);
+      const ok = scanner.finish();
+      assert(ok, 'precondition: clusters-only scan ok');
+      const scan = scanner.result();
+      assert(scan.clusters.length > 0, 'precondition: clusters-only scan found clusters');
+      for (const c of scan.clusters) {
+        const sizeBytes = Array.from(c.headerBytes.slice(4, 12));
+        assert(sizeBytes.join(',') === [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF].join(','),
+          'canonicalized cluster header uses the 8-byte EBML_UNKNOWN_SIZE pattern (got ' + sizeBytes.map(x => x.toString(16)).join(',') + ')');
+      }
+    }
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

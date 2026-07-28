@@ -30,7 +30,7 @@ Close-out snapshot, 2026-07-27 (post-v1.12.2). An Aegis session also has the ful
 
 - `BUILD_LOG.md` — architecture + full version history (through v1.12.1).
 - `REVIEW.md` — the build queue and what's fixed.
-- `test.cjs` — Node harness (31 scenarios / 208 assertions). `npm i fake-indexeddb`
+- `test.cjs` — Node harness (37 scenarios / 268 assertions). `npm i fake-indexeddb`
   then `node test.cjs`. Extend it; don't bypass it.
 - `PERMISSION_UX_HANDOFF.md` / `STREAMING_SAVE_HANDOFF.md` — how the last two passes
   were run (untracked working docs).
@@ -47,13 +47,20 @@ page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when done.
 ## Open queue (priority order)
 
 1. Streaming stitch — IN PROGRESS. Read `STREAMING_STITCH_HANDOFF.md` (design ratified
-   by Blue 2026-07-27, incl. Rider 2 = REVIEW #10 confirm() replacement). Phase 0 (the
-   buffered-stitch oracle, scenarios AL–AO) is DONE and pushed (`57dd209`, harness now
-   35 scenarios / 224 assertions) — it also caught that `webmRewriteCluster`
-   canonicalizes unknown-size markers to 8-byte for rewritten clusters (HANDOFF gotcha
-   #2 updated; the Phase 1 header helper must replicate this). Next: Phase 1 —
-   operational brief in `STITCH_PHASE1_HANDOFF.md` (untracked; read it after the main
-   HANDOFF). Window closes Aug 19.
+   by Blue 2026-07-27, incl. Rider 2 = REVIEW #10 confirm() replacement). Phase 0
+   (oracle, AL–AO, `57dd209`) and Phase 1 (scanner + plan, AP–AQ; harness now 37
+   scenarios / 268 assertions) are DONE and pushed. Phase 1 landed
+   `webmRewriteClusterHeader` (one shared rewrite implementation, 8-byte marker
+   canonicalization preserved), the clusters-only scanner mode
+   (`createWebmStreamScanner({ clustersOnly, timeOffset, videoTrack })` — videoTrack
+   is SEGMENT 1's, oracle fidelity), and `buildStitchPlanParts` (→ `{head,entries,cues}`
+   or `{bail:reason}`). All unreachable from save flows; no version bump yet — v1.13's
+   BUILD_LOG entry comes with Phase 2. Next: Phase 2 — wire the sinks
+   (`saveSessionsStreamedStitch` FSA + download, `stitchAndSave`/`recoverRecording`
+   switch, bail → streamed parts, Riders 1+2), per HANDOFF §3.3–3.5/§5. Phase 2 notes:
+   plan entries carry `seg` index for the per-segment chunk walks; the
+   truncated-known-size-cluster bail branch in clusters-only mode has no dedicated
+   scenario yet — add one when the sinks make it drivable. Window closes Aug 19.
 2. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
    Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT), chapter-
    marker hotkeys, sidecar export convention. The caption editor deserves its own

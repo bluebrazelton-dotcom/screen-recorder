@@ -1631,6 +1631,72 @@ function webmScan(buffer) {
   return info;
 }
 
+// Parse a Cluster's header (ID + size VINT + Timestamp element) at offset 0 of
+// `view` and build the replacement header for a copy rebased by timeOffset.
+// totalSize is the cluster's full length (header + data). Returns
+// { headerBytes, remStart, newTs } — headerBytes is Cluster ID + new size VINT
+// + new Timestamp element; remStart is the offset (relative to cluster start)
+// of the first byte after the ORIGINAL Timestamp element (everything from
+// remStart to totalSize is emitted verbatim after headerBytes); newTs is the
+// rebased timestamp. Returns null when the header can't be parsed or the
+// remainder would be empty (caller falls back / bails).
+function webmRewriteClusterHeader(view, totalSize, timeOffset) {
+  // Parse Cluster header
+  const cId = ebmlReadId(view, 0);           // Cluster ID (0x1F43B675, 4 bytes)
+  if (!cId) return null;
+  const cSize = ebmlReadSize(view, cId.length); // Cluster data size
+  if (!cSize) return null;
+  const dataStart = cId.length + cSize.length;
+
+  // Parse Timestamp element (first child of Cluster per WebM spec)
+  const tsId = ebmlReadId(view, dataStart);     // should be 0xE7
+  if (!tsId || tsId.value !== EBML_IDS.TIMESTAMP) {
+    // No Timestamp element found — can't adjust
+    return null;
+  }
+  const tsSize = ebmlReadSize(view, dataStart + tsId.length);
+  if (!tsSize) return null;
+  const tsDataStart = dataStart + tsId.length + tsSize.length;
+  const tsDataEnd = tsDataStart + tsSize.value;
+  const origTs = ebmlReadUInt(view, tsDataStart, tsSize.value);
+
+  // Calculate new timestamp
+  const newTs = origTs + timeOffset;
+  const newTsWidth = ebmlUIntWidth(newTs);
+
+  // Build new Timestamp element: [0xE7] [size VINT] [value bytes]
+  const newTsSizeField = ebmlWriteSize(newTsWidth);
+  const newTsValue = ebmlWriteUInt(newTs, newTsWidth);
+
+  // Remainder of cluster data (everything after the original Timestamp element)
+  const restLen = totalSize - tsDataEnd;
+  if (restLen <= 0) return null;
+
+  // New cluster data size = new timestamp element + rest
+  const newTsElemLen = 1 + newTsSizeField.length + newTsWidth; // 0xE7 + size + value
+  const newClusterDataSize = newTsElemLen + restLen;
+
+  // If the original cluster had unknown size, preserve that — don't try to
+  // compute a known size (which can exceed the 4-byte VINT limit).
+  const newClusterSizeField = cSize.isUnknown
+    ? EBML_UNKNOWN_SIZE
+    : ebmlWriteSize(newClusterDataSize);
+
+  // Assemble: Cluster ID + new size + new Timestamp element
+  const clusterIdBytes = new Uint8Array([0x1F, 0x43, 0xB6, 0x75]);
+  const headerLen = 4 + newClusterSizeField.length + newTsElemLen;
+  const headerBytes = new Uint8Array(headerLen);
+  let w = 0;
+
+  headerBytes.set(clusterIdBytes, w);      w += 4;
+  headerBytes.set(newClusterSizeField, w); w += newClusterSizeField.length;
+  headerBytes[w++] = 0xE7;                                   // Timestamp ID
+  headerBytes.set(newTsSizeField, w);      w += newTsSizeField.length;
+  headerBytes.set(newTsValue, w);          w += newTsWidth;
+
+  return { headerBytes, remStart: tsDataEnd, newTs };
+}
+
 // Rebuild a Cluster with an adjusted timestamp.
 // Reads the original cluster, replaces only the Timestamp element value,
 // and reconstructs the Cluster header to account for any size change.
@@ -1638,35 +1704,11 @@ function webmRewriteCluster(buffer, cluster, timeOffset) {
   try {
     const view = new DataView(buffer, cluster.offset);
 
-    // Parse Cluster header
-    const cId = ebmlReadId(view, 0);           // Cluster ID (0x1F43B675, 4 bytes)
-    if (!cId) return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
-    const cSize = ebmlReadSize(view, cId.length); // Cluster data size
-    if (!cSize) return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
-    const dataStart = cId.length + cSize.length;
-
-    // Parse Timestamp element (first child of Cluster per WebM spec)
-    const tsId = ebmlReadId(view, dataStart);     // should be 0xE7
-    if (!tsId || tsId.value !== EBML_IDS.TIMESTAMP) {
-      // No Timestamp element found — return cluster bytes as-is (can't adjust)
-      return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
-    }
-    const tsSize = ebmlReadSize(view, dataStart + tsId.length);
-    if (!tsSize) return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
-    const tsDataStart = dataStart + tsId.length + tsSize.length;
-    const tsDataEnd = tsDataStart + tsSize.value;
-    const origTs = ebmlReadUInt(view, tsDataStart, tsSize.value);
-
-    // Calculate new timestamp
-    const newTs = origTs + timeOffset;
-    const newTsWidth = ebmlUIntWidth(newTs);
-
-    // Build new Timestamp element: [0xE7] [size VINT] [value bytes]
-    const newTsSizeField = ebmlWriteSize(newTsWidth);
-    const newTsValue = ebmlWriteUInt(newTs, newTsWidth);
+    const h = webmRewriteClusterHeader(view, cluster.totalSize, timeOffset);
+    if (!h) return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
 
     // Remainder of cluster data (everything after the original Timestamp element)
-    const restStart = cluster.offset + tsDataEnd;
+    const restStart = cluster.offset + h.remStart;
     const restEnd = cluster.offset + cluster.totalSize;
     const restLen = restEnd - restStart;
 
@@ -1675,29 +1717,11 @@ function webmRewriteCluster(buffer, cluster, timeOffset) {
       return new Uint8Array(buffer, cluster.offset, cluster.totalSize);
     }
 
-    // New cluster data size = new timestamp element + rest
-    const newTsElemLen = 1 + newTsSizeField.length + newTsWidth; // 0xE7 + size + value
-    const newClusterDataSize = newTsElemLen + restLen;
-
-    // If the original cluster had unknown size, preserve that — don't try to
-    // compute a known size (which can exceed the 4-byte VINT limit).
-    const newClusterSizeField = cluster.sizeIsUnknown
-      ? EBML_UNKNOWN_SIZE
-      : ebmlWriteSize(newClusterDataSize);
-
-    // Assemble: Cluster ID + new size + new Timestamp element + rest of data
-    const clusterIdBytes = new Uint8Array([0x1F, 0x43, 0xB6, 0x75]);
-    const totalLen = 4 + newClusterSizeField.length + newClusterDataSize;
-    const out = new Uint8Array(totalLen);
-    let w = 0;
-
-    out.set(clusterIdBytes, w);      w += 4;
-    out.set(newClusterSizeField, w); w += newClusterSizeField.length;
-    out[w++] = 0xE7;                                   // Timestamp ID
-    out.set(newTsSizeField, w);      w += newTsSizeField.length;
-    out.set(newTsValue, w);          w += newTsWidth;
+    // Assemble: header (Cluster ID + new size + new Timestamp element) + rest of data
+    const out = new Uint8Array(h.headerBytes.length + restLen);
+    out.set(h.headerBytes, 0);
     // Copy the rest of the cluster data from the original buffer
-    out.set(new Uint8Array(buffer, restStart, restLen), w);
+    out.set(new Uint8Array(buffer, restStart, restLen), h.headerBytes.length);
 
     return out;
   } catch (e) {
@@ -2047,7 +2071,14 @@ async function makeSeekable(blob) {
 // (var, not const, so the test harness can lower it to exercise the bail.)
 var STREAM_CARRY_CAP = 64 * 1024 * 1024;
 
-function createWebmStreamScanner() {
+function createWebmStreamScanner(opts) {
+  // clustersOnly mode is for stitch segments 2..N: the preamble is validated
+  // but not retained, and completed clusters are rewritten (timestamp rebased
+  // by timeOffset) via webmRewriteClusterHeader instead of recorded verbatim.
+  // With no opts, behavior is byte-identical to the original single-segment scanner.
+  const clustersOnly = !!(opts && opts.clustersOnly);
+  const optsTimeOffset = (opts && opts.timeOffset) || 0;
+
   let carry = new Uint8Array(0);   // unconsumed bytes
   let carryAbs = 0;                // absolute file offset of carry[0]
   let total = 0;                   // bytes pushed so far
@@ -2058,17 +2089,23 @@ function createWebmStreamScanner() {
   let pos = 0;                     // absolute parse position (mirrors webmScan's pos/scanEnd)
   let safeEndAbs = Infinity;       // Segment end when its size is known (EOF applied at finish)
 
-  // Retained preamble regions (small — guarded like makeSeekable):
+  // Retained preamble regions (small — guarded like makeSeekable). In
+  // clustersOnly mode nothing here is retained; sawInfo/sawTracks stand in
+  // for the infoBytes/tracksBytes truthiness checks used as the first-cluster guard.
   let segmentDataStart = 0;
   let preambleBytes = null;        // [0, segmentDataStart): EBML Header + Segment ID + size VINT
   let infoBytes = null, infoDataOff = 0;      // the Info element (ID+size+data)
   let tracksBytes = null, tracksDataOff = 0;  // the Tracks element
-  let videoTrack = null;
+  let sawInfo = false, sawTracks = false;
+  let videoTrack = clustersOnly ? ((opts && opts.videoTrack) || null) : null;
 
-  // Per-cluster metadata (absolute file offsets; bytes are NOT retained):
-  const clusters = [];             // { start, end, timestamp, keyframe }
-  let maxClusterTs = 0;            // mirrors webmScan's info.lastTimestamp
-  let lastClusterMaxBlockTime = 0; // running; the final cluster's value survives
+  // Per-cluster metadata (absolute file offsets; bytes are NOT retained in
+  // default mode either — only { start, end, timestamp, keyframe } survives.
+  // In clustersOnly mode each entry is instead
+  // { headerBytes, remStart, remEnd, rebasedTimestamp, keyframe }.
+  const clusters = [];
+  let maxClusterTs = 0;            // mirrors webmScan's info.lastTimestamp (segment-LOCAL, pre-rebase)
+  let lastClusterMaxBlockTime = 0; // running; the final cluster's value survives (segment-LOCAL, pre-rebase)
 
   // A cluster whose end we haven't located yet:
   let pending = null;              // { startAbs, dataStartAbs, sizeUnknown, sizeValue, scanAbs }
@@ -2114,8 +2151,14 @@ function createWebmStreamScanner() {
     const desc = { offset: 0, totalSize: len, timestamp: ts };
     const keyframe = videoTrack ? webmClusterHasVideoKeyframe(v, desc, videoTrack) : false;
     lastClusterMaxBlockTime = webmMaxBlockTime(v, desc);
-    clusters.push({ start: startAbs, end: endAbs, timestamp: ts, keyframe });
     if (ts > maxClusterTs) maxClusterTs = ts;
+    if (clustersOnly) {
+      const h = webmRewriteClusterHeader(v, len, optsTimeOffset);
+      if (!h) { bail(); return; }        // any doubt → bail (streamed stitch excludes the raw-copy fallback)
+      clusters.push({ headerBytes: h.headerBytes, remStart: startAbs + h.remStart, remEnd: endAbs, rebasedTimestamp: h.newTs, keyframe });
+    } else {
+      clusters.push({ start: startAbs, end: endAbs, timestamp: ts, keyframe });
+    }
     pos = endAbs;
     drop(endAbs);
   }
@@ -2145,7 +2188,7 @@ function createWebmStreamScanner() {
     if (!size) { bail(); return false; }
     segmentDataStart = pos + id.length + size.length;
     if (!size.isUnknown) safeEndAbs = segmentDataStart + size.value;
-    preambleBytes = carry.slice(0, segmentDataStart - carryAbs);   // carryAbs is still 0 here
+    if (!clustersOnly) preambleBytes = carry.slice(0, segmentDataStart - carryAbs);   // carryAbs is still 0 here
     stage = 'preamble'; pos = segmentDataStart;
     drop(segmentDataStart);
     return true;
@@ -2164,10 +2207,16 @@ function createWebmStreamScanner() {
     if (id.value === EBML_IDS.CLUSTER) {
       // Preamble complete. Guards mirror makeSeekable's bail conditions
       // (missing/unknown-size Info or Tracks, or clusters arriving first).
-      if (!infoBytes || !tracksBytes) { bail(); return false; }
-      videoTrack = webmFindVideoTrack(
-        new DataView(tracksBytes.buffer, tracksBytes.byteOffset, tracksBytes.length),
-        { tracksDataStart: tracksDataOff, tracksDataEnd: tracksBytes.length });
+      if (clustersOnly) {
+        if (!sawInfo || !sawTracks) { bail(); return false; }
+        // videoTrack is the constructor's opts.videoTrack (segment 1's) — this
+        // segment's own Tracks must not drive keyframe detection.
+      } else {
+        if (!infoBytes || !tracksBytes) { bail(); return false; }
+        videoTrack = webmFindVideoTrack(
+          new DataView(tracksBytes.buffer, tracksBytes.byteOffset, tracksBytes.length),
+          { tracksDataStart: tracksDataOff, tracksDataEnd: tracksBytes.length });
+      }
       stage = 'clusters';
       return true;                 // the cluster stage re-reads at pos
     }
@@ -2178,8 +2227,12 @@ function createWebmStreamScanner() {
       if (end > safeEndAbs) { bail(); return false; }
       if (end - pos > 10000) { bail(); return false; }             // makeSeekable: implausible Info
       if (!covered(end)) { if (eos) bail(); return false; }
-      infoBytes = carry.slice(pos - carryAbs, end - carryAbs);
-      infoDataOff = dataStart - pos;
+      if (clustersOnly) {
+        sawInfo = true;
+      } else {
+        infoBytes = carry.slice(pos - carryAbs, end - carryAbs);
+        infoDataOff = dataStart - pos;
+      }
       pos = end; drop(end);
       return true;
     }
@@ -2191,8 +2244,12 @@ function createWebmStreamScanner() {
       if (end > safeEndAbs) { bail(); return false; }
       if (end - pos > 100000) { bail(); return false; }            // makeSeekable: implausible Tracks
       if (!covered(end)) { if (eos) bail(); return false; }
-      tracksBytes = carry.slice(pos - carryAbs, end - carryAbs);
-      tracksDataOff = dataStart - pos;
+      if (clustersOnly) {
+        sawTracks = true;
+      } else {
+        tracksBytes = carry.slice(pos - carryAbs, end - carryAbs);
+        tracksDataOff = dataStart - pos;
+      }
       pos = end; drop(end);
       return true;
     }
@@ -2237,7 +2294,11 @@ function createWebmStreamScanner() {
       let end = Math.min(pending.dataStartAbs + pending.sizeValue, safeEndAbs);
       if (!covered(end)) {
         if (!eos) return false;
-        end = Math.min(end, total);                                // truncated known-size cluster (crash tail)
+        // Truncated known-size cluster (crash tail): the buffered path raw-copies
+        // it, but that fallback shape is deliberately excluded from streamed
+        // stitching — treat it as doubt.
+        if (clustersOnly) { bail(); return false; }
+        end = Math.min(end, total);
       }
       const p = pending; pending = null;
       completeCluster(p.startAbs, p.dataStartAbs, end);
@@ -2327,6 +2388,9 @@ function createWebmStreamScanner() {
       return true;
     },
     result() {
+      if (clustersOnly) {
+        return { clustersOnly: true, timeOffset: optsTimeOffset, clusters, maxClusterTs, lastClusterMaxBlockTime };
+      }
       return { preambleBytes, infoBytes, infoDataOff, tracksBytes, videoTrack,
                clusters, maxClusterTs, lastClusterMaxBlockTime };
     },
@@ -2360,6 +2424,67 @@ function buildStreamIndexParts(scan) {
   return {
     head: [scan.preambleBytes, seekHead, newInfo, scan.tracksBytes],
     ranges: scan.clusters.map(c => ({ start: c.start, end: c.end })),
+    cues,
+  };
+}
+
+// Merged multi-segment stitch plan. segScans[0] is a DEFAULT-mode scan result
+// (segment 1, verbatim); segScans[1..] are clusters-only results, already
+// rebased. Each element is { ok, scan } where ok is that scanner's finish()
+// value. Returns { head, entries, cues } or { bail: <reason string> } — the
+// caller maps bail to streamed separate-parts saves (never the buffered stitch).
+function buildStitchPlanParts(segScans) {
+  if (segScans.length === 0) return { bail: 'no segments' };
+  for (const s of segScans) {
+    if (!s.ok) return { bail: 'segment scan not ok' };
+    if (s.scan.clusters.length === 0) return { bail: 'segment has zero clusters' };
+  }
+  const seg1 = segScans[0].scan;
+  if (!seg1.infoBytes || !seg1.tracksBytes || !seg1.preambleBytes) return { bail: 'segment 1 missing preamble' };
+
+  const videoTrack = seg1.videoTrack;
+
+  // Entries: segment 1's clusters verbatim, segments 2..N's already-rewritten
+  // (rebased) cluster headers + verbatim remainders.
+  const entries = [];
+  for (const c of seg1.clusters) {
+    entries.push({ seg: 0, verbatim: true, start: c.start, end: c.end, timestamp: c.timestamp, keyframe: c.keyframe });
+  }
+  for (let i = 1; i < segScans.length; i++) {
+    for (const c of segScans[i].scan.clusters) {
+      entries.push({ seg: i, verbatim: false, headerBytes: c.headerBytes, remStart: c.remStart, remEnd: c.remEnd, timestamp: c.rebasedTimestamp, keyframe: c.keyframe });
+    }
+  }
+  const entryLen = (e) => e.verbatim ? (e.end - e.start) : (e.headerBytes.length + (e.remEnd - e.remStart));
+
+  // Duration: same formula as makeSeekable, applied to the would-be stitched file.
+  const lastSeg = segScans[segScans.length - 1].scan;
+  const lastSegOffset = segScans.length === 1 ? 0 : lastSeg.timeOffset;
+  let maxRebasedTs = 0;
+  for (const e of entries) { if (e.timestamp > maxRebasedTs) maxRebasedTs = e.timestamp; }
+  const durationTicks = Math.max(lastSeg.lastClusterMaxBlockTime + lastSegOffset, maxRebasedTs) + 33;
+
+  const infoView = new DataView(seg1.infoBytes.buffer, seg1.infoBytes.byteOffset, seg1.infoBytes.length);
+  const newInfo = webmBuildInfo(infoView, seg1.infoDataOff, seg1.infoBytes.length, durationTicks);
+
+  const keyClusters = videoTrack ? entries.filter(e => e.keyframe) : [];
+  const includeCues = keyClusters.length > 0;
+  const seekHeadLen = webmSeekHeadLen(includeCues);
+  const infoPos = seekHeadLen;
+  const tracksPos = infoPos + newInfo.length;
+  let runningPos = tracksPos + seg1.tracksBytes.length;
+  const positions = new Map();
+  for (const e of entries) { positions.set(e, runningPos); runningPos += entryLen(e); }
+  const cuesPos = runningPos;
+  const cues = includeCues
+    ? webmBuildCues(keyClusters.map(e => ({ timestamp: e.timestamp, position: positions.get(e) })), videoTrack)
+    : null;
+  const seekHead = webmBuildSeekHead(infoPos, tracksPos, includeCues ? cuesPos : null);
+  if (seekHead.length !== seekHeadLen) return { bail: 'layout' };   // layout math broke — don't emit a bad index
+
+  return {
+    head: [seg1.preambleBytes, seekHead, newInfo, seg1.tracksBytes],
+    entries,
     cues,
   };
 }
