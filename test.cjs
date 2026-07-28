@@ -149,7 +149,7 @@ const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!scriptMatch) { console.log('FATAL: no <script> block found in index.html'); process.exit(2); }
 let code = scriptMatch[1];
-code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, getSessionChunks, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock };';
+code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock };';
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app_new.js' });
 const api = sandbox.__api;
@@ -215,8 +215,10 @@ async function resetState() {
   sandbox.addChunk = ORIG.addChunk; sandbox.concatenateWebM = ORIG.concatenateWebM;
   sandbox.downloadPendingIds = [];
   sandbox.downloadPendingFiles = 0;
+  sandbox.stitchFallbackSegments = null;
   documentMock.getElementById('downloadConfirm').classList.remove('visible');
   documentMock.getElementById('recoveryBanner').classList.remove('visible');
+  documentMock.getElementById('stitchFallback').classList.remove('visible');
   documentMock.hidden = false;
   lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0; downloadClicks = [];
   writeCalls = []; abortCalls = 0; closedFiles = 0; failWriteAfter = -1;
@@ -281,10 +283,17 @@ async function scenario(name, fn) {
   });
 
   // D — stitchAndSave success deletes all segments
+  // BEHAVIOR CHANGE (STREAMING_STITCH_HANDOFF §3.4): the streamed stitch bails
+  // to the in-app fallback banner on unparseable segments instead of
+  // raw-concatenating them, so this scenario's original 1-byte seed('x')
+  // chunks no longer exercise the success path (pass 1 bails on them). Reseeded
+  // with real WebM fixtures (seedSegments) so the original bookkeeping
+  // assertion — one write, delete-all, priorSegments cleared — still tests the
+  // save-success intent, just through the streamed stitch.
   await scenario('D stitch success deletes all segments', async () => {
-    const p1 = await seed(2), p2 = await seed(2), cur = await seed(2);
+    const [p1, p2, cur] = await seedSegments([syntheticWebm(), syntheticWebm(), syntheticWebm()]);
     state.priorSegments = [{ sessionId: p1, mimeType: 'video/webm' }, { sessionId: p2, mimeType: 'video/webm' }];
-    state.sessionId = cur; state.chunkIndex = 2;
+    state.sessionId = cur; state.chunkIndex = 3;
     windowMock.showSaveFilePicker = pickerSequence(['ok']);
     await api.finalizeRecording();
     await drain();
@@ -294,12 +303,19 @@ async function scenario(name, fn) {
     assert(lastWritten.length === 1, 'one stitched file written');
   });
 
-  // E — recovery, stitch FAILS, cancel on 2nd part -> only written part deleted
-  await scenario('E recovery stitch-fail saves parts, deletes only written', async () => {
+  // E — recovery, stitch BAILS (unparseable segments), cancel on 2nd part ->
+  // only written part deleted.
+  // BEHAVIOR CHANGE: recoverRecording no longer calls concatenateWebM at all
+  // (it goes straight to the streamed stitch), so the forced-throw stub is
+  // inert — removed. These 1-byte seed('x') chunks aren't valid WebM, so pass
+  // 1 bails exactly like a real unparseable chain would, driving the same
+  // parts fallback the old thrown-stitch catch used to. The bail itself costs
+  // one picker call (the doomed stitch attempt's own picker, consumed before
+  // pass 1 ever runs) — pickerSequence gets a leading 'ok' to account for it.
+  await scenario('E recovery stitch-bail saves parts, deletes only written', async () => {
     const s1 = await seed(2), s2 = await seed(2), s3 = await seed(2);
     windowMock._recoverySessions = [{ id: s1, mimeType: 'video/webm' }, { id: s2, mimeType: 'video/webm' }, { id: s3, mimeType: 'video/webm' }];
-    sandbox.concatenateWebM = async () => { throw new Error('forced stitch fail'); };
-    windowMock.showSaveFilePicker = pickerSequence(['ok', 'abort']); // part1 saves, part2 cancels
+    windowMock.showSaveFilePicker = pickerSequence(['ok', 'ok', 'abort']); // stitch attempt bails, part1 saves, part2 cancels
     await api.recoverRecording();
     await drain();
     const sessions = await readStore('sessions');
@@ -310,12 +326,14 @@ async function scenario(name, fn) {
     assert(recordedErrors.some(m => /separate file/i.test(m)), 'told parts saved separately');
   });
 
-  // E2 — recovery, stitch FAILS, all parts save -> all deleted
-  await scenario('E2 recovery stitch-fail all-save deletes all', async () => {
+  // E2 — recovery, stitch BAILS, all parts save -> all deleted.
+  // Same bail-not-throw change as E; the stub is inert here too and removed.
+  // pickerSequence(['ok']) already covers the extra leading picker call (every
+  // outcome after the sequence is exhausted repeats the last one).
+  await scenario('E2 recovery stitch-bail all-save deletes all', async () => {
     await seed(2); await seed(2); // ids captured via recovery list below
     const all = await readStore('sessions');
     windowMock._recoverySessions = all.map(s => ({ id: s.id, mimeType: 'video/webm' }));
-    sandbox.concatenateWebM = async () => { throw new Error('forced stitch fail'); };
     windowMock.showSaveFilePicker = pickerSequence(['ok']);
     await api.recoverRecording();
     await drain();
@@ -448,10 +466,13 @@ async function scenario(name, fn) {
   });
 
   // S — stitched download keeps ALL segments until confirmed
+  // BEHAVIOR CHANGE (same as D): reseeded with real WebM fixtures so pass 1
+  // succeeds instead of bailing on 1-byte garbage, keeping this on the
+  // download-success path it was written to test.
   await scenario('S firefox stitched download keeps all segments until confirmed', async () => {
-    const p1 = await seed(2), p2 = await seed(2), cur = await seed(2);
+    const [p1, p2, cur] = await seedSegments([syntheticWebm(), syntheticWebm(), syntheticWebm()]);
     state.priorSegments = [{ sessionId: p1, mimeType: 'video/webm' }, { sessionId: p2, mimeType: 'video/webm' }];
-    state.sessionId = cur; state.chunkIndex = 2;
+    state.sessionId = cur; state.chunkIndex = 3;
     await api.finalizeRecording();
     await drain();
     assert(downloadClicks.length === 1, 'one stitched download fired (got ' + downloadClicks.length + ')');
@@ -464,10 +485,11 @@ async function scenario(name, fn) {
     assert(state.priorSegments.length === 0, 'priorSegments cleared after confirm');
   });
 
-  // T — recovery stitch-fail: every part downloads, all kept until confirmed
-  await scenario('T firefox recovery stitch-fail keeps all parts until confirmed', async () => {
+  // T — recovery stitch BAILS (Firefox): every part downloads, all kept until confirmed.
+  // Same bail-not-throw change as E/E2 — no picker exists in Firefox mode, so
+  // there's no picker-call bookkeeping to adjust; the stub is just removed.
+  await scenario('T firefox recovery stitch-bail keeps all parts until confirmed', async () => {
     const s1 = await seed(2), s2 = await seed(2);
-    sandbox.concatenateWebM = async () => { throw new Error('forced stitch fail'); };
     windowMock._recoverySessions = [{ id: s1, mimeType: 'video/webm' }, { id: s2, mimeType: 'video/webm' }];
     await api.recoverRecording();
     await drain();
@@ -1313,6 +1335,278 @@ async function scenario(name, fn) {
         assert(sizeBytes.join(',') === [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF].join(','),
           'canonicalized cluster header uses the 8-byte EBML_UNKNOWN_SIZE pattern (got ' + sizeBytes.map(x => x.toString(16)).join(',') + ')');
       }
+    }
+  });
+
+  // ============================================================
+  // Phase 2 — sinks + wiring (STREAMING_STITCH_HANDOFF §3.3-3.5)
+  // ============================================================
+  // saveSessionsStreamedStitch (both sinks), stitchAndSave/recoverRecording's
+  // rewired multi-segment paths, bail -> streamed parts (Rider 1), and the
+  // in-app stitch-fallback banner (Rider 2, REVIEW #10) replacing confirm().
+
+  // Seed one session per buffer, each split by splitFns[i] (defaults to the
+  // same thirds split seedSegments uses when no fn is given for that index) —
+  // seedSegments generalized to adversarial per-segment splits.
+  async function seedSegmentsSplit(buffers, splitFns) {
+    const ids = [];
+    for (let i = 0; i < buffers.length; i++) {
+      const fn = splitFns && splitFns[i];
+      const parts = fn ? fn(buffers[i]) : splitAt(buffers[i], [Math.floor(buffers[i].length / 3), Math.floor(2 * buffers[i].length / 3)]);
+      ids.push(await seedBuffers(parts));
+    }
+    return ids;
+  }
+
+  // AR — FSA streamed-stitch differential, end-to-end through stitchAndSave
+  await scenario('AR FSA streamed-stitch differential end-to-end', async () => {
+    const chains = [
+      ['chrome+chrome',          () => [syntheticWebm(), syntheticWebm()],                          null],
+      ['chrome+firefox+chrome',  () => [syntheticWebm(), syntheticFirefoxWebm(), syntheticWebm()],   null],
+      ['audio+audio',            () => [syntheticAudioOnlyWebm(), syntheticAudioOnlyWebm()],         null],
+      // Adversarial splits on the canonicalization chain: cluster-ID-boundary
+      // splits on segment 1, every-byte on segment 2.
+      ['firefox+chrome',         () => [syntheticFirefoxWebm(), syntheticWebm()],
+        (buffers) => [(b) => splitAt(b, clusterIdOffsets(b)), (b) => splitEveryByte(b)]],
+    ];
+    for (const [label, makeChain, splitFnsFactory] of chains) {
+      const buffers = makeChain();
+      const want = await stitchOracle(buffers);
+      const splitFns = splitFnsFactory ? splitFnsFactory(buffers) : null;
+      const ids = await seedSegmentsSplit(buffers, splitFns);
+      const last = ids[ids.length - 1];
+      const priors = ids.slice(0, -1);
+      state.priorSegments = priors.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+      state.sessionId = last; state.chunkIndex = 1;
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      await api.stitchAndSave('video/webm');
+      await drain();
+      assert(lastWritten.length === 1, label + ': one stitched file written');
+      const got = Buffer.from(await lastWritten.pop().arrayBuffer());
+      assert(Buffer.compare(got, want) === 0, label + ': streamed stitch === oracle (' + got.length + ' vs ' + want.length + ' bytes)');
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 0, label + ': all sessions deleted');
+      assert(state.priorSegments.length === 0, label + ': priorSegments cleared');
+    }
+  });
+
+  // AS — download streamed-stitch differential, end-to-end through stitchAndSave
+  await scenario('AS download streamed-stitch differential', async () => {
+    const chains = [
+      ['chrome+chrome',          () => [syntheticWebm(), syntheticWebm()]],
+      ['chrome+firefox+chrome',  () => [syntheticWebm(), syntheticFirefoxWebm(), syntheticWebm()]],
+      ['audio+audio',            () => [syntheticAudioOnlyWebm(), syntheticAudioOnlyWebm()]],
+      ['firefox+chrome',         () => [syntheticFirefoxWebm(), syntheticWebm()]],
+    ];
+    for (const [label, makeChain] of chains) {
+      const buffers = makeChain();
+      const want = await stitchOracle(buffers);
+      const ids = await seedSegments(buffers);   // AR already covers adversarial splits; thirds is enough here
+      const last = ids[ids.length - 1];
+      const priors = ids.slice(0, -1);
+      state.priorSegments = priors.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+      state.sessionId = last; state.chunkIndex = 3;
+      delete windowMock.showSaveFilePicker;   // Firefox mode
+      const clicksBefore = downloadClicks.length;
+      await api.stitchAndSave('video/webm');
+      await drain();
+      assert(downloadClicks.length === clicksBefore + 1, label + ': one stitched download fired');
+      const got = Buffer.from(await objectUrlBlobs[objectUrlBlobs.length - 1].arrayBuffer());
+      assert(Buffer.compare(got, want) === 0, label + ': composed download === oracle');
+      let sessions = await readStore('sessions');
+      const allIds = [...priors, last];
+      assert(allIds.every(id => sessions.some(s => s.id === id)), label + ': nothing deleted before confirm');
+      assert(documentMock.getElementById('downloadConfirm').classList.contains('visible'), label + ': confirm bar visible');
+      assert(allIds.every(id => sandbox.downloadPendingIds.includes(id)), label + ': downloadPendingIds covers all segments');
+      await sandbox.confirmDownloadArrived();
+      await drain();
+      sessions = await readStore('sessions');
+      assert(allIds.every(id => !sessions.some(s => s.id === id)), label + ': all sessions deleted after confirm');
+    }
+  });
+
+  // AT — FSA picker cancel = zero work
+  await scenario('AT FSA picker cancel is zero work', async () => {
+    const [p1, cur] = await seedSegments([syntheticWebm(), syntheticWebm()]);
+    state.priorSegments = [{ sessionId: p1, mimeType: 'video/webm' }];
+    state.sessionId = cur; state.chunkIndex = 3;
+    windowMock.showSaveFilePicker = pickerSequence(['abort']);
+    await api.stitchAndSave('video/webm');
+    await drain();
+    assert(writeCalls.length === 0, 'no writes attempted');
+    assert(closedFiles === 0, 'no file closed');
+    const sessions = await readStore('sessions');
+    assert(sessions.length === 2, 'both sessions intact (got ' + sessions.length + ')');
+    const chunks = await readStore('chunks');
+    assert(chunks.length === 6, 'chunks intact (got ' + chunks.length + ')');
+    assert(recordedErrors.some(m => /preserved|reload/i.test(m)), 'cancel messaging surfaced');
+  });
+
+  // AU — FSA mid-write failure -> abort, sessions kept, in-app fallback offered
+  await scenario('AU FSA mid-write failure aborts and offers the in-app fallback', async () => {
+    const [p1, cur] = await seedSegments([syntheticWebm(), syntheticWebm()]);
+    state.priorSegments = [{ sessionId: p1, mimeType: 'video/webm' }];
+    state.sessionId = cur; state.chunkIndex = 3;
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    failWriteAfter = 2;
+    await api.stitchAndSave('video/webm');
+    await drain();
+    assert(abortCalls === 1, 'writable.abort() called (got ' + abortCalls + ')');
+    assert(closedFiles === 0 && lastWritten.length === 0, 'no file finalized');
+    const sessions = await readStore('sessions');
+    assert(sessions.length === 2, 'both sessions kept after failed write (got ' + sessions.length + ')');
+    assert(documentMock.getElementById('stitchFallback').classList.contains('visible'), 'stitch fallback banner shown');
+    sandbox.stitchFallbackKeep();
+    assert(!documentMock.getElementById('stitchFallback').classList.contains('visible'), 'banner hidden after keep');
+    const sessions2 = await readStore('sessions');
+    assert(sessions2.length === 2, 'sessions still intact after keep');
+  });
+
+  // AV — bail routes through the in-app fallback buttons, not confirm() (REVIEW #10)
+  await scenario('AV bail routes through the in-app fallback, not confirm()', async () => {
+    const b1 = syntheticWebm();
+    const [p1, cur] = await seedSegments([b1, preambleOnlyWebm()]);
+    state.priorSegments = [{ sessionId: p1, mimeType: 'video/webm' }];
+    state.sessionId = cur; state.chunkIndex = 3;
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    // If this reached the old confirm(), it would throw — confirm is
+    // undefined in this sandbox. Green here proves the replacement is wired.
+    await api.stitchAndSave('video/webm');
+    await drain();
+    assert(documentMock.getElementById('stitchFallback').classList.contains('visible'), 'stitch fallback banner shown on bail');
+    let sessions = await readStore('sessions');
+    assert(sessions.length === 2, 'both sessions intact after bail (got ' + sessions.length + ')');
+
+    // Reference: what a lone v1.11 streamed single save produces for segment
+    // 1's own buffer (same deterministic thirds split as seedSegments used above).
+    const [refId] = await seedSegments([b1]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    const refResult = await S.saveFile({ kind: 'session', sessionId: refId, mimeType: 'video/webm' });
+    assert(refResult === 'saved', 'reference single save succeeded');
+    assert(lastWritten.length === 1, 'reference save wrote one file');
+    const refBytes = Buffer.from(await lastWritten.pop().arrayBuffer());
+    await api.deleteSession(refId);
+
+    windowMock.showSaveFilePicker = pickerSequence(['ok', 'ok']);
+    // stitchFallbackSaveParts() is void (it drives UI state, not a return
+    // value) — verify through the same side effects AT/AU use: writes, store
+    // contents, and the banner.
+    await sandbox.stitchFallbackSaveParts();
+    await drain();
+    assert(lastWritten.length === 2, 'two part files written (got ' + lastWritten.length + ')');
+    const part1Bytes = Buffer.from(await lastWritten[0].arrayBuffer());
+    assert(Buffer.compare(part1Bytes, refBytes) === 0, 'part 1 bytes identical to a lone v1.11 streamed save');
+    sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'both parts deleted after saving');
+    assert(!documentMock.getElementById('stitchFallback').classList.contains('visible'), 'banner stays hidden through the parts flow');
+
+    // Keep-variant: a fresh bail, choosing "keep" instead of "save as parts".
+    const [p1b, curb] = await seedSegments([syntheticWebm(), preambleOnlyWebm()]);
+    state.priorSegments = [{ sessionId: p1b, mimeType: 'video/webm' }];
+    state.sessionId = curb; state.chunkIndex = 3;
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.stitchAndSave('video/webm');
+    await drain();
+    assert(documentMock.getElementById('stitchFallback').classList.contains('visible'), 'banner shown on the fresh bail');
+    sandbox.stitchFallbackKeep();
+    assert(!documentMock.getElementById('stitchFallback').classList.contains('visible'), 'banner hidden after keep');
+    const sessions2 = await readStore('sessions');
+    assert(sessions2.length === 2, 'sessions kept after choosing keep (got ' + sessions2.length + ')');
+    assert(recordedErrors.some(m => /safe in the browser/i.test(m)), 'faculty message recorded');
+  });
+
+  // AW — recoverRecording streamed stitch
+  await scenario('AW recoverRecording streamed stitch', async () => {
+    // (a) clean chain -> streamed stitch === oracle, banner cleared
+    {
+      const b1 = syntheticWebm(), b2 = syntheticWebm(), b3 = syntheticAudioOnlyWebm();
+      const ids = await seedSegments([b1, b2, b3]);
+      windowMock._recoverySessions = ids.map(id => ({ id, mimeType: 'video/webm' }));
+      const want = await stitchOracle([b1, b2, b3]);
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      await api.recoverRecording();
+      await drain();
+      assert(lastWritten.length === 1, 'one stitched file written');
+      const got = Buffer.from(await lastWritten.pop().arrayBuffer());
+      assert(Buffer.compare(got, want) === 0, 'recovery streamed stitch === oracle');
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 0, 'all sessions deleted');
+      assert(!documentMock.getElementById('recoveryBanner').classList.contains('visible'), 'recovery banner hidden');
+    }
+
+    // (b) bail (zero-cluster middle segment) -> auto parts fallback, NOT the
+    // in-app stitchFallback banner — recovery auto-proceeds, same pattern as
+    // today, just streamed instead of buffered.
+    {
+      const ids = await seedSegments([syntheticWebm(), preambleOnlyWebm(), syntheticWebm()]);
+      windowMock._recoverySessions = ids.map(id => ({ id, mimeType: 'video/webm' }));
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      await api.recoverRecording();
+      await drain();
+      assert(recordedErrors.some(m => /Could not stitch/i.test(m)), '"Could not stitch" message recorded');
+      assert(!documentMock.getElementById('stitchFallback').classList.contains('visible'), 'no stitchFallback banner on recovery bail');
+      assert(lastWritten.length === 3, 'three parts saved (got ' + lastWritten.length + ')');
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 0, 'all parts deleted');
+      assert(!documentMock.getElementById('recoveryBanner').classList.contains('visible'), 'recovery banner hidden after parts save');
+    }
+  });
+
+  // Known-size (not unknown-size) clusters — for AX's truncated-final-cluster
+  // bail. Reuses the clusterKnown/el/simpleBlock builders scenario P and
+  // syntheticPoisonWebm establish.
+  function knownSizeClusterWebm() {
+    function clusterKnown(ts, blocks) {
+      const data = Buffer.concat([el([0xE7], uintBytes(ts, 2)), ...blocks]);
+      return Buffer.concat([Buffer.from([0x1F, 0x43, 0xB6, 0x75]), sizeVint(data.length), data]);
+    }
+    const header = Buffer.from([0x1A, 0x45, 0xDF, 0xA3, 0x80]);
+    const segHdr = Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    const infoEl = el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], uintBytes(1000000, 3)));
+    const tracks = el([0x16, 0x54, 0xAE, 0x6B],
+      el([0xAE], el([0xD7], [0x01]), el([0x83], [0x01])),
+      el([0xAE], el([0xD7], [0x02]), el([0x83], [0x02])));
+    const c0 = clusterKnown(0,    [simpleBlock(1, 0, 0x80, 40), simpleBlock(2, 5, 0x80, 10)]);
+    const c1 = clusterKnown(1000, [simpleBlock(1, 0, 0x80, 40), simpleBlock(1, 500, 0x00, 30)]);
+    return Buffer.concat([header, segHdr, infoEl, tracks, c0, c1]);
+  }
+
+  // AX — truncated-known-size final cluster: bail in a chain, tolerated alone
+  // (queued Phase 2 note; generalizes §6 gotcha #3 from unknown-size to
+  // known-size). The clusters-only scanner (segments 2..N) bails on a
+  // truncated known-size final cluster; the v1.11 single-segment scanner
+  // (segment 1, or any lone save) clamps and tolerates it — scenario M's
+  // shape. Same bytes, intentionally different outcome by position in the chain.
+  await scenario('AX truncated known-size final cluster: bail in a chain, tolerated alone', async () => {
+    const full = knownSizeClusterWebm();
+    const truncated = full.slice(0, -10);   // still well inside c1's payload
+
+    // Contrast case: the SAME truncated buffer, saved ALONE via the v1.11
+    // streamed path, still saves (clamped tolerance, no bail) — scenario-M-style.
+    {
+      const id = await seedBuffers([truncated]);
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      const r = await S.saveFile({ kind: 'session', sessionId: id, mimeType: 'video/webm' });
+      assert(r === 'saved', 'lone truncated segment still saves (v1.11 tolerance)');
+      assert(lastWritten.length === 1, 'one file written for the lone save');
+      lastWritten.pop();
+      await api.deleteSession(id);   // saveFile doesn't delete on its own — clean up before the chain case below
+    }
+
+    // As segment 2 of a chain, the same truncated bytes drive the
+    // clusters-only scanner's stricter guard -> bail, fallback banner offered.
+    {
+      const p1 = (await seedSegments([syntheticWebm()]))[0];
+      const cur = await seedBuffers([truncated]);
+      state.priorSegments = [{ sessionId: p1, mimeType: 'video/webm' }];
+      state.sessionId = cur; state.chunkIndex = 1;
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      await api.stitchAndSave('video/webm');
+      await drain();
+      assert(documentMock.getElementById('stitchFallback').classList.contains('visible'), 'bail -> stitch fallback banner visible');
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 2, 'both sessions intact after bail');
+      sandbox.stitchFallbackKeep();
     }
   });
 

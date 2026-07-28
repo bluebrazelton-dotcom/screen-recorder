@@ -682,9 +682,158 @@ error banner).
 
 ---
 
+### v1.13 — Streaming multi-segment stitch: bounded-memory Continue Recording + multi-crash recovery (2026-07-28)
+
+**Commit:** `stream multi-segment stitch: bounded memory, byte-identical output, in-app fallback banner`
+
+Closes REVIEW.md P1 #5 in full and P2 #10. v1.11 streamed single-segment saves;
+every multi-segment save (Continue Recording chains, multi-crash recovery)
+still ran `concatenateWebM` — every segment's whole blob in memory at once,
+then `makeSeekable`'s own contiguous rebuild on top — peak ≈2–3× total
+footage. Beyond roughly 2–3 hours of total footage at Balanced quality, the
+buffered stitch could OOM the tab at the finish line, and because sessions
+delete only on a confirmed save, an OOM there **looped**: recovery
+re-attempted the same buffered path and died the same way. This was
+BUILD_LOG Known Limitation #1 (closed — see the edit below).
+
+1. **Pass 1 — per-segment scan, one shared accumulation formula.**
+   `scanSegmentsForStitch(segments, onChunk)` walks each segment's chunks in
+   order through `createWebmStreamScanner`: segment 1 in the existing v1.11
+   default mode (verbatim preamble + cluster ranges); segments 2..N in a new
+   `clustersOnly` mode that validates but drops the preamble and, per
+   cluster, precomputes the rebased replacement header via
+   `webmRewriteClusterHeader` — a helper extracted from the buffered
+   `webmRewriteCluster` so both paths share one rewrite implementation
+   (including the marker-canonicalization behavior: any rewritten
+   unknown-size cluster comes out with the 8-byte `EBML_UNKNOWN_SIZE` form,
+   even from a Chrome-shaped 1-byte-marker source — "preserving" the
+   original marker would have silently diverged from the oracle). `timeOffset`
+   accumulates `prevScan.maxClusterTs + 1000` per prior segment — the exact
+   formula `concatenateWebM` uses and the one the harness's `streamedPlanBytes`
+   helper independently reimplements, so the two can't drift apart. Any
+   segment that fails to scan short-circuits the walk (remaining segments are
+   never read) and the whole stitch bails.
+
+2. **Plan build — unchanged, reused.** `buildStitchPlanParts` (already landed
+   in the Phase 1 session) merges segment 1's verbatim cluster ranges with
+   segments 2..N's (headerBytes + remainder-range) entries into one Duration,
+   SeekHead, and Cues, computed before a byte is written. Phase 2 only adds
+   the sinks and wiring on top.
+
+3. **Pass 2 — sinks.** `saveSessionsStreamedStitch(segments, suggestedName)`
+   mirrors the v1.11 single-segment sinks, generalized to a per-segment entry
+   list. Chrome/Edge (FSA): picker first (cancel → `'cancelled'`, zero work,
+   no pass 1 run); a pass-1 bail cleans up the swap file FSA already created
+   at picker time (`handle.remove()`, best effort) and returns `'bail'`;
+   otherwise pass 2 re-walks each segment's chunks, writing segment 1's
+   verbatim ranges and, for segments 2..N, each entry's `headerBytes` exactly
+   once (a per-entry guard flag) immediately before its remainder range —
+   including the edge case where the remainder is empty and lands exactly at
+   the segment's end, which the range-slicing loop's strict `<` never admits
+   into the main walk and so is flushed right after it. `'saved'` only after
+   `close()`; a mid-write failure `abort()`s and rethrows, keeping every
+   session. Firefox (download): pass 1 retains per-segment chunk Blob refs +
+   running offsets; pass 2 composes head + per-entry (headerBytes + `Blob.slice`
+   refs, forward-pointer reset at each segment boundary) + Cues into one
+   download Blob — peak ~1×, browser-managed, no contiguous full-chain buffer.
+
+4. **Bail semantics unchanged from the design:** any doubt anywhere in the
+   chain (parse failure, zero-cluster segment, carry-cap, a truncated
+   known-size final cluster in a non-first segment) bails the WHOLE stitch to
+   streamed separate parts — never to the buffered `concatenateWebM`, which
+   stays in the file solely as the differential-test oracle and the shape
+   the header-rewrite logic was extracted from. This is an intentional,
+   documented behavior difference from the old buffered path, which
+   tolerated some of these shapes by raw-copying: a zero-cluster or
+   truncated-final-cluster segment that used to silently raw-append now
+   drives the in-app fallback instead. The same bytes, saved ALONE via the
+   v1.11 single-segment path, still save with the existing clamped tolerance
+   (scenario M's shape) — the asymmetry is pinned by a differential test
+   (`AX`), not incidental.
+
+5. **Rider 1 — streamed parts everywhere.** `saveSegmentsAsParts(segments)`
+   replaces every buffered separate-parts loop (`stitchAndSave`'s fallback,
+   `recoverRecording`'s stitch-failure fallback) with `{kind:'session'}`
+   streamed saves, one v1.11 single-segment save per part — bounded memory
+   even in the fallback. `getSessionChunks()` (the chunk-store `getAll`) is
+   now unused by any save path and is deleted; the sessions-store `getAll`s
+   (`getIncompleteSession`, `checkForRecovery`, `cleanupCompleted`) are
+   metadata-only and are unaffected.
+
+6. **Rider 2 (REVIEW P2 #10) — the blocking `confirm()` is gone.**
+   `stitchAndSave`'s parse-failure fallback used to `confirm('Stitching
+   failed... Save each segment as a separate file instead?')` — a blocking
+   dialog, faculty-hostile and untestable. It's replaced by an in-app banner
+   (`#stitchFallback`, styled off the existing `.download-confirm` class —
+   same visual language as the recovery banner and download-confirm bar) with
+   two buttons: "Save as separate files" (`stitchFallbackSaveParts`, drives
+   `saveSegmentsAsParts`) and "Not now — keep them stored here"
+   (`stitchFallbackKeep`, leaves every session in place with a
+   safe-in-the-browser message). Both `stitchAndSave`'s pass-1 bail and its
+   catch block (genuine write-time exceptions) route to the same banner.
+   `recoverRecording`'s bail path does NOT show this banner — recovery has
+   always auto-proceeded straight to per-part saves without a prompt, and
+   that pattern is unchanged, just streamed instead of buffered.
+
+7. **Wiring.** `stitchAndSave` and `recoverRecording`'s multi-segment branches
+   now call `saveSessionsStreamedStitch` (falling back to a single
+   `saveFile({kind:'session'})` call when only one segment actually has data)
+   instead of building blobs via `getSessionChunks` + `concatenateWebM`.
+   Outcome handling — delete-all-on-`'saved'`, `offerDownloadConfirm` on
+   `'downloaded'`, the existing cancel messages — is unchanged; only the
+   `'bail'` branch and the write-failure catch are new.
+
+**Verification:** harness grew from 268 to 344 assertions (scenario count:
++7 new — AR through AX). AR is the FSA end-to-end differential (four chains —
+Chrome+Chrome, Chrome+Firefox+Chrome, audio+audio, and Firefox+Chrome with
+adversarial cluster-ID-boundary and every-byte chunk splits — through the real
+`stitchAndSave`, byte-identical to `stitchOracle`). AS is the same differential
+through the Firefox download sink. AT proves picker-cancel does zero work; AU
+proves a mid-write failure aborts, keeps every session, and offers the
+fallback banner; AV proves the bail path reaches the new banner and not the
+old `confirm()` (the sandbox has no `confirm` at all — reaching it would throw)
+and that a saved part is byte-identical to a lone v1.11 single-segment save;
+AW covers `recoverRecording`'s streamed stitch and its bail-to-parts
+auto-proceed; AX pins the truncated-known-size-cluster asymmetry (bail in a
+chain, tolerated alone). Two existing scenarios (D, S) that seeded
+1-byte garbage chunks were reseeded with real WebM fixtures, since the new
+bail behavior means unparseable chains no longer reach the save-success
+assertions they were written to test. Three more (E, E2, T) had their
+forced-throw `concatenateWebM` stubs removed — `recoverRecording` no longer
+calls `concatenateWebM` at all, so garbage segments now bail (rather than
+throw) into the same parts fallback; E's picker sequence gained one leading
+`'ok'` to account for the doomed stitch attempt's own (now-consumed) picker
+call before the parts loop starts. Scenario C (cancel) and F
+(stitch-success cancel) needed no changes — cancellation happens at the
+picker, before pass 1 ever touches segment data. Scenario AO (the buffered
+end-to-end differential from the Phase 0/1 sessions) passes unchanged and now
+exercises the real streamed path end-to-end, since `stitchAndSave` routes
+through it — the whole point of the rewrite is that its assertion (streamed
+output === oracle) still holds.
+
+**Grep audit:** no `getAll()` on the chunks object store is reachable from any
+save path (the three remaining `getAll()` calls are all on the sessions
+store — `getIncompleteSession`, `cleanupCompleted`, `checkForRecovery` —
+metadata only); no whole-file `arrayBuffer()` is reachable from a save path
+(the three remaining call sites are `addChunk`, a per-chunk conversion on the
+RECORDING path, unrelated to saving; `concatenateWebM`, the buffered oracle;
+and `makeSeekable`, now reachable only from `saveFile`'s Blob branch, which no
+app save flow passes into anymore).
+
+**Real acceptance (Phase 3, both browsers) — PENDING:** a long Continue
+Recording chain (≥ 2 crashes, ≥ 30 min total, Best quality, Task Manager
+open — memory should stay roughly flat through the stitch, not just the
+single-segment save); output must seek correctly across every stitch point
+and stay in sync past the seams; a deliberate zero-cluster or truncated
+final-segment chain should surface the in-app fallback banner, not a
+JavaScript error; then a short sanity clip. Not yet run against a real
+browser — this entry covers the harness-verified implementation only.
+
+---
+
 ## Known limitations
 
-1. **Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.
+1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.
 
 2. ~~**No seeking in output:** MediaRecorder-produced WebM files lack a Cues element (seek index), so players can't seek precisely. This affects both single and stitched recordings. Fix would require writing Cues at save time.~~ — ✓ Fixed in v1.8: `makeSeekable()` writes Duration + Cues at save time (zero-dependency remux in `saveFile`). Files that fail indexing still save, just un-seekable.
 

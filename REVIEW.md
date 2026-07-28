@@ -67,7 +67,7 @@ inspect the file.
 visibility-throttled): worker `setInterval(33ms)` → `postMessage` → draw. Keep rAF when
 visible if desired; switch clocks on `visibilitychange`.
 
-### 5. Every save materializes the whole recording in RAM — ✓ FIXED v1.11 for single-segment saves (streamed two-pass save: per-chunk cursor pulls → bounded-carry index scan with byte-identical output to the buffered `makeSeekable` → streamed FSA writes on Chrome / reference-composed download Blob on Firefox; any indexing doubt still saves un-indexed; the page-load recovery banner cursor-sums instead of chunk-`getAll`; save progress shown. Multi-segment stitching stays buffered with a documented ceiling — BUILD_LOG Known Limitation #1 — and streaming stitch is the queued follow-on.)
+### 5. Every save materializes the whole recording in RAM — ✓ FIXED v1.11 for single-segment saves, ✓ FIXED v1.13 for multi-segment stitching (streamed two-pass save: per-chunk cursor pulls → bounded-carry index scan with byte-identical output to the buffered `makeSeekable`/`concatenateWebM` → streamed FSA writes on Chrome / reference-composed download Blob on Firefox; any indexing doubt still saves un-indexed (single segment) or bails to streamed separate-parts saves with an in-app banner (multi-segment, replacing the old blocking `confirm()` — see #10); the page-load recovery banner cursor-sums instead of chunk-`getAll`; save progress shown. BUILD_LOG Known Limitation #1 is closed — `concatenateWebM` stays in the file only as the differential-test oracle, unreachable from any save flow.)
 `getSessionChunks()` ~line 552 uses `getAll()` — every chunk ArrayBuffer loads at once.
 At 2.5 Mbps, a 3-hour recording ≈ 3.4 GB in memory AT SAVE TIME — the tab can crash at
 the finish line, undoing the crash-resilience story. This affects the normal save path,
@@ -114,9 +114,19 @@ at save time only. Do NOT switch recording to non-fragmented MP4 — see build l
    and the Segment case is rescued by `safeEnd` clamping. Add a comment + explicit
    byte-pattern check (`width === 8 && all bytes after marker === 0xFF`) so a future
    refactor doesn't trip on it.
-10. **`confirm()` fallback in `stitchAndSave`** (~line 1809): replace with in-app
-    buttons (matches faculty-audience convention; blocking dialogs are hostile UX and
-    break automation/testing).
+10. — ✓ FIXED v1.13 (the blocking `confirm()` in `stitchAndSave`'s
+    stitch-failure fallback is replaced by an in-app banner — `#stitchFallback`,
+    styled off the existing `.download-confirm` class, same visual language as
+    the recovery banner and download-confirm bar — with "Save as separate
+    files" / "Not now — keep them stored here" buttons driving
+    `saveSegmentsAsParts` / `stitchFallbackKeep`. Both the pass-1 bail path and
+    genuine write-time exceptions route to the same banner; the harness asserts
+    the buttons drive the same code paths the `confirm()` branches used to,
+    and that the sandbox's absence of a global `confirm` — reaching it would
+    throw — is never exercised.) **`confirm()` fallback in `stitchAndSave`**
+    (~line 1809 in the reviewed v1.5 file; the function has moved since):
+    replace with in-app buttons (matches faculty-audience convention; blocking
+    dialogs are hostile UX and break automation/testing).
 11. **Dead code / housekeeping:** `getIncompleteSession()` (~line 538) is unused now.
     Zero-chunk incomplete sessions (created if `startRecording` fails after
     `createSession`) accumulate forever — sweep them in `cleanupCompleted()`.
@@ -169,7 +179,7 @@ top. The hardest Tier 2 feature is half-built by accident.
 
 **Suggested build order:**
 1. P0 fixes (#1–3) + background-tab test/fix (#4) — one session  ✓ DONE v1.6
-2. Streaming save (#5)  ✓ DONE v1.11 (single-segment; streaming stitch queued)
+2. Streaming save (#5)  ✓ DONE v1.11 (single-segment) + v1.13 (multi-segment stitch)
 3. Chapter hotkeys + sidecar export (small, completes recording-side Tier 1)
 4. Caption editor with VTT/SRT import (borrow from laubonghaudoi/subtitle-editor, MIT —
    see prior-art recon in project memory `project_screen_recorder.md`)

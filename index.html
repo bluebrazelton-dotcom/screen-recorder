@@ -433,6 +433,16 @@
     </div>
   </div>
 
+  <!-- Stitch fallback (combining segments failed; offer separate files instead) -->
+  <div class="download-confirm" id="stitchFallback">
+    <h3>Couldn't combine the segments</h3>
+    <p>The recording segments couldn't be combined into one file. Save each segment as its own numbered file instead?</p>
+    <div class="recovery-actions">
+      <button class="primary btn-save" onclick="stitchFallbackSaveParts()">Save as separate files</button>
+      <button class="primary btn-record" onclick="stitchFallbackKeep()">Not now &mdash; keep them stored here</button>
+    </div>
+  </div>
+
   <!-- Error display -->
   <div class="error-banner" id="errorBanner"></div>
 
@@ -625,21 +635,6 @@ async function getIncompleteSession() {
       db.close();
       const incomplete = req.result.filter(s => !s.completed);
       resolve(incomplete.length > 0 ? incomplete[incomplete.length - 1] : null);
-    };
-    req.onerror = () => { db.close(); reject(req.error); };
-  });
-}
-
-async function getSessionChunks(sessionId) {
-  const db = await openDB();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction('chunks', 'readonly');
-    const index = tx.objectStore('chunks').index('bySession');
-    const req = index.getAll(sessionId);
-    req.onsuccess = () => {
-      db.close();
-      const sorted = req.result.sort((a, b) => a.index - b.index);
-      resolve(sorted);
     };
     req.onerror = () => { db.close(); reject(req.error); };
   });
@@ -1700,6 +1695,11 @@ function webmRewriteClusterHeader(view, totalSize, timeOffset) {
 // Rebuild a Cluster with an adjusted timestamp.
 // Reads the original cluster, replaces only the Timestamp element value,
 // and reconstructs the Cluster header to account for any size change.
+// Buffered reference implementation (STREAMING_STITCH_HANDOFF §2/§4) — kept
+// as concatenateWebM's rewriter and, via the differential tests, the
+// byte-identity oracle for the streamed stitch. Not reachable from any save
+// flow; the streamed path shares its header logic through
+// webmRewriteClusterHeader instead of a second implementation.
 function webmRewriteCluster(buffer, cluster, timeOffset) {
   try {
     const view = new DataView(buffer, cluster.offset);
@@ -1734,6 +1734,13 @@ function webmRewriteCluster(buffer, cluster, timeOffset) {
 
 // Concatenate multiple WebM blobs into a single WebM blob.
 // Uses remuxing (no decode/re-encode) — fast and lossless.
+// Buffered reference implementation (STREAMING_STITCH_HANDOFF §2/§4) — stays
+// in the file as the differential-test oracle (makeSeekable(concatenateWebM(...))
+// is what the streamed stitch must match byte-for-byte) and as the shape the
+// scan/rewrite logic was extracted from. Not reachable from any save flow —
+// stitchAndSave and recoverRecording both go through the streamed stitch
+// (saveSessionsStreamedStitch), bailing to streamed separate parts on doubt,
+// never here.
 async function concatenateWebM(blobs) {
   if (blobs.length === 0) return null;
   if (blobs.length === 1) return blobs[0];
@@ -2489,6 +2496,50 @@ function buildStitchPlanParts(segScans) {
   };
 }
 
+// Pass 1 for the multi-segment stitch: scan `segments` (in play order) and
+// hand back a merged plan. Segment 1 runs the default-mode scanner
+// (verbatim); segments 2..N run clusters-only, chained by timeOffset —
+// each accumulation step is prevScan.maxClusterTs + 1000, prevScan being the
+// PREVIOUS segment's own scan result. This is the exact formula
+// concatenateWebM uses (1738–1739) and the one streamedPlanBytes's test
+// harness helper uses — one shared accumulation, so the two never drift apart.
+// `onChunk(i, data)`, if given, fires once per chunk of segment i, right
+// before that chunk reaches its scanner — sinks use it to retain their own
+// per-chunk state (FSA needs none; the download sink retains chunk Blobs).
+// Any segment that fails to scan short-circuits the whole walk (remaining
+// segments are never read) and returns { bail }; otherwise returns
+// { plan, chunkCount } where chunkCount is the total chunk count across every
+// segment (the sinks' progress denominator).
+async function scanSegmentsForStitch(segments, onChunk) {
+  const segScans = [];
+  let chunkCount = 0;
+  let timeOffset = 0;
+  let videoTrack = null;
+  let prevScan = null;
+
+  for (let i = 0; i < segments.length; i++) {
+    if (i > 0) timeOffset += prevScan.maxClusterTs + 1000;
+    const scanner = i === 0
+      ? createWebmStreamScanner()
+      : createWebmStreamScanner({ clustersOnly: true, timeOffset, videoTrack });
+    await forEachSessionChunk(segments[i].sessionId, (data) => {
+      chunkCount++;
+      onChunk && onChunk(i, data);
+      scanner.push(new Uint8Array(data));
+    });
+    const ok = scanner.finish();
+    if (!ok) return { bail: 'segment scan not ok' };
+    const scan = scanner.result();
+    if (i === 0) videoTrack = scan.videoTrack;
+    segScans.push({ ok, scan });
+    prevScan = scan;
+  }
+
+  const plan = buildStitchPlanParts(segScans);
+  if (plan.bail) return { bail: plan.bail };
+  return { plan, chunkCount };
+}
+
 // Fire-and-forget download (Firefox — no File System Access API). Arrival
 // cannot be confirmed, so this NEVER counts as a confirmed save: callers keep
 // the session until the user confirms the file landed.
@@ -2616,6 +2667,138 @@ async function saveSessionStreamedDownload(source, suggestedName) {
     parts = chunkBlobs;   // un-indexed: the raw recording, byte for byte
   }
   return startDownload(new Blob(parts, { type: source.mimeType || 'video/webm' }), suggestedName);
+}
+
+// Streamed save of MULTIPLE sessions, stitched into one file (Known
+// Limitation #1, closed): pass 1 is scanSegmentsForStitch, pass 2 mirrors the
+// v1.11 sinks above with entries generalized per-segment. Never a whole
+// segment, let alone the whole chain, in memory. Returns
+// 'saved' | 'cancelled' | 'downloaded' | 'bail' — 'bail' means pass 1 found
+// doubt somewhere in the chain; the caller falls back to streamed separate
+// parts (§3.4 of the handoff), never to the buffered stitch.
+async function saveSessionsStreamedStitch(segments, suggestedName) {
+  suggestedName = suggestedName || `recording-${formatDateForFilename()}.webm`;
+
+  if ('showSaveFilePicker' in window) {
+    let handle;
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName,
+        types: [{
+          description: 'WebM Video',
+          accept: { 'video/webm': ['.webm'] },
+        }],
+      });
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        updateStatus('idle', 'Save cancelled — recording preserved, reload to recover it');
+        return 'cancelled';
+      }
+      throw err;
+    }
+
+    updateStatus('idle', 'Preparing your video…');
+    const passOne = await scanSegmentsForStitch(segments);
+    if (passOne.bail) {
+      console.warn('Streamed stitch bailed: ' + passOne.bail);
+      // Chrome creates the picked file at picker time — don't leave a stray
+      // empty file behind on a bail.
+      if (handle.remove) { try { await handle.remove(); } catch (e) { /* best effort */ } }
+      return 'bail';
+    }
+    const { plan, chunkCount } = passOne;
+
+    const writable = await handle.createWritable();
+    try {
+      let written = 0, lastPct = -1;
+      const progress = () => {
+        written++;
+        const pct = chunkCount ? Math.min(100, Math.floor((written / chunkCount) * 100)) : 100;
+        if (pct >= lastPct + 5 || pct === 100) { lastPct = pct; updateStatus('idle', 'Saving… ' + pct + '%'); }
+      };
+      for (const part of plan.head) await writable.write(part);
+      for (let s = 0; s < segments.length; s++) {
+        // Generalized v1.11 range-slicing loop: segment 0's entries are
+        // verbatim ranges [start,end); segments 1..N's are a headerBytes
+        // write (once, guarded by headerWritten) immediately before the
+        // remainder range [remStart,remEnd).
+        const segEntries = plan.entries.filter((e) => e.seg === s);
+        const headerWritten = new Array(segEntries.length).fill(false);
+        let ei = 0, fileOff = 0;
+        await forEachSessionChunk(segments[s].sessionId, async (data) => {
+          const chunkStart = fileOff, chunkEnd = fileOff + data.byteLength;
+          while (ei < segEntries.length) {
+            const e = segEntries[ei];
+            const rStart = e.verbatim ? e.start : e.remStart;
+            const rEnd = e.verbatim ? e.end : e.remEnd;
+            if (rStart >= chunkEnd) break;   // this entry starts in a later chunk
+            if (!e.verbatim && !headerWritten[ei]) { await writable.write(e.headerBytes); headerWritten[ei] = true; }
+            const off0 = Math.max(rStart, chunkStart), off1 = Math.min(rEnd, chunkEnd);
+            if (off1 > off0) await writable.write(new Uint8Array(data, off0 - chunkStart, off1 - off0));
+            if (rEnd <= chunkEnd) ei++; else break;
+          }
+          fileOff = chunkEnd;
+          progress();
+        });
+        // An entry's remainder can be empty and land exactly at the segment's
+        // end (a Timestamp-only cluster) — the strict `<` above never admits
+        // it, since its start equals the final chunk's end, not less than it.
+        // Its header still has to reach the file.
+        while (ei < segEntries.length) {
+          const e = segEntries[ei];
+          if (!e.verbatim && !headerWritten[ei]) await writable.write(e.headerBytes);
+          ei++;
+        }
+      }
+      if (plan.cues) await writable.write(plan.cues);
+      await writable.close();
+    } catch (err) {
+      try { await writable.abort(); } catch (abortErr) { /* swap file is discarded either way */ }
+      throw err;
+    }
+    updateStatus('idle', 'Saved successfully');
+    return 'saved';
+  }
+
+  // Firefox: download. Retain per-segment chunk Blob refs + running offsets
+  // during pass 1 (the v1.11 pattern, once per segment), then compose the
+  // final Blob from head parts + per-entry (headerBytes + Blob.slice refs) +
+  // Cues. Peak ~1× browser-managed, no contiguous full-chain buffer.
+  updateStatus('idle', 'Preparing your video…');
+  const segChunkBlobs = segments.map(() => []);
+  const segOffsets = segments.map(() => []);
+  const segFileOff = segments.map(() => 0);
+  const passOne = await scanSegmentsForStitch(segments, (i, data) => {
+    segOffsets[i].push(segFileOff[i]);
+    segFileOff[i] += data.byteLength;
+    segChunkBlobs[i].push(new Blob([data]));
+  });
+  if (passOne.bail) {
+    console.warn('Streamed stitch bailed: ' + passOne.bail);
+    return 'bail';
+  }
+  const { plan } = passOne;
+
+  const parts = plan.head.slice();
+  let curSeg = -1, k = 0;   // reset the forward pointer whenever entries cross a segment boundary
+  for (const e of plan.entries) {
+    if (e.seg !== curSeg) { curSeg = e.seg; k = 0; }
+    const chunkBlobs = segChunkBlobs[curSeg], offsets = segOffsets[curSeg];
+    if (!e.verbatim) parts.push(e.headerBytes);
+    const rStart = e.verbatim ? e.start : e.remStart;
+    const rEnd = e.verbatim ? e.end : e.remEnd;
+    while (k < chunkBlobs.length && offsets[k] + chunkBlobs[k].size <= rStart) k++;
+    let p = rStart, j = k;
+    while (p < rEnd && j < chunkBlobs.length) {
+      const cStart = offsets[j], cEnd = cStart + chunkBlobs[j].size;
+      const sOff = Math.max(p, cStart), eOff = Math.min(rEnd, cEnd);
+      if (eOff > sOff) parts.push(chunkBlobs[j].slice(sOff - cStart, eOff - cStart));
+      p = eOff;
+      j++;
+    }
+  }
+  if (plan.cues) parts.push(plan.cues);
+  return startDownload(new Blob(parts, { type: segments[0].mimeType || 'video/webm' }), suggestedName);
 }
 
 // ============================================================
@@ -2933,8 +3116,9 @@ async function finalizeRecording() {
     }
 
     if (state.priorSegments.length > 0) {
-      // Multi-segment: stitch prior segments + current into one file
-      // (buffered — see BUILD_LOG Known Limitation #1).
+      // Multi-segment: streamed stitch of prior segments + current into one
+      // file (Known Limitation #1, closed in v1.13 — this used to buffer
+      // every segment; see saveSessionsStreamedStitch).
       await stitchAndSave(sessionMimeType);
     } else {
       // Single segment: streamed save. Only delete the session on a CONFIRMED save.
@@ -2957,8 +3141,29 @@ async function finalizeRecording() {
   }
 }
 
-// Stitch multiple recording segments into one file and save.
-// Falls back to saving segments separately if stitching fails.
+// Rider 1: the shared streamed-parts fallback. Each part is a v1.11
+// single-segment streamed save ({kind:'session'} source) — bounded memory
+// even in the fallback, the same shape stitchAndSave and recoverRecording
+// both bail to. Deletes (or, for a download, marks pending) each part as it
+// lands; stops at the first cancel, leaving the rest recoverable. Empty
+// segments are dropped with no save attempt.
+async function saveSegmentsAsParts(segments) {
+  let fileNum = 1, cancelled = false;
+  const downloadedIds = [];
+  for (const seg of segments) {
+    if ((await sessionChunkStats(seg.sessionId)).count === 0) { await deleteSession(seg.sessionId); continue; }
+    const r = await saveFile({ kind: 'session', sessionId: seg.sessionId, mimeType: seg.mimeType }, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
+    if (r === 'saved') { await deleteSession(seg.sessionId); fileNum++; }
+    else if (r === 'downloaded') { downloadedIds.push(seg.sessionId); fileNum++; }
+    else { cancelled = true; break; }
+  }
+  return { cancelled, downloadedIds };
+}
+
+// Stitch multiple recording segments into one file and save (streamed —
+// Known Limitation #1, closed). Any doubt in pass 1 anywhere in the chain
+// bails to the in-app stitch-fallback banner (Rider 2, REVIEW #10) instead of
+// the old blocking confirm() — the banner drives saveSegmentsAsParts.
 async function stitchAndSave(currentMimeType) {
   updateStatus('idle', 'Stitching segments together...');
 
@@ -2975,16 +3180,18 @@ async function stitchAndSave(currentMimeType) {
       // Only the current recording has data — stream it directly.
       result = await saveFile({ kind: 'session', sessionId: state.sessionId, mimeType: currentMimeType });
     } else {
-      // Concatenate using the EBML parser (buffered — Known Limitation #1)
-      const segmentBlobs = [];
-      for (const seg of priorsWithData) {
-        const chunks = await getSessionChunks(seg.sessionId);
-        segmentBlobs.push(new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType }));
+      const currentHasData = (await sessionChunkStats(state.sessionId)).count > 0;
+      const segments = priorsWithData.slice();
+      if (currentHasData) segments.push({ sessionId: state.sessionId, mimeType: currentMimeType });
+
+      result = segments.length === 1
+        ? await saveFile({ kind: 'session', sessionId: segments[0].sessionId, mimeType: segments[0].mimeType })
+        : await saveSessionsStreamedStitch(segments);
+
+      if (result === 'bail') {
+        offerStitchFallback(segments);
+        return;
       }
-      const currentChunks = await getSessionChunks(state.sessionId);
-      segmentBlobs.push(new Blob(currentChunks.map(c => new Blob([c.data])), { type: currentMimeType }));
-      const stitched = await concatenateWebM(segmentBlobs);
-      result = await saveFile(stitched);
     }
 
     if (result === 'saved') {
@@ -3003,49 +3210,18 @@ async function stitchAndSave(currentMimeType) {
 
   } catch (err) {
     console.error('Stitching failed:', err);
-
-    // Fallback: offer to save segments separately
-    const fallback = confirm(
-      'Stitching failed (' + err.message + '). Save each segment as a separate file instead?'
-    );
-    if (fallback) {
-      let fileNum = 1;
-      let cancelled = false;
-      const downloadedIds = [];
-      for (const seg of state.priorSegments) {
-        const chunks = await getSessionChunks(seg.sessionId);
-        if (chunks.length === 0) { await deleteSession(seg.sessionId); continue; }
-        const blob = new Blob(chunks.map(c => new Blob([c.data])), { type: seg.mimeType });
-        const r = await saveFile(blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
-        if (r === 'saved') { await deleteSession(seg.sessionId); fileNum++; }
-        else if (r === 'downloaded') { downloadedIds.push(seg.sessionId); fileNum++; }
-        else { cancelled = true; break; }
-      }
-      if (!cancelled) {
-        const currentChunks = await getSessionChunks(state.sessionId);
-        const currentBlob = new Blob(currentChunks.map(c => new Blob([c.data])), { type: currentMimeType });
-        const r = await saveFile(currentBlob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
-        if (r === 'saved') { await deleteSession(state.sessionId); }
-        else if (r === 'downloaded') { downloadedIds.push(state.sessionId); }
-        else { cancelled = true; }
-      }
-      if (cancelled) {
-        showError('Save cancelled — remaining segments are still here. Reload the page to recover them.');
-      } else if (downloadedIds.length > 0) {
-        offerDownloadConfirm(downloadedIds, downloadedIds.length);
-      } else {
-        state.priorSegments = [];
-      }
-    } else {
-      showError('Stitching failed. Your recordings are safe in the browser — refresh and use Recovery.');
-    }
+    const segments = [...state.priorSegments, { sessionId: state.sessionId, mimeType: currentMimeType }];
+    offerStitchFallback(segments);
   }
 }
 
-// Save a recording to disk. `source` is either a Blob (buffered path — stitched
-// files and separate-part fallbacks) or `{ kind: 'session', sessionId, mimeType }`
-// (streamed path, REVIEW #5 — the recording goes from IndexedDB to disk one
-// chunk at a time and is never materialized in memory). Returns one of:
+// Save a recording to disk. `source` is either a Blob (buffered path — now
+// reachable only from tests and the concatenateWebM/makeSeekable reference
+// path, since every app save flow passes {kind:'session'} — single segments
+// directly, stitch fallback parts via saveSegmentsAsParts) or
+// `{ kind: 'session', sessionId, mimeType }` (streamed path, REVIEW #5 — the
+// recording goes from IndexedDB to disk one chunk at a time and is never
+// materialized in memory). Returns one of:
 //   'saved'      — File System Access API confirmed the write (Chrome/Edge)
 //   'cancelled'  — the user cancelled the save picker
 //   'downloaded' — download fallback fired (Firefox); arrival CANNOT be confirmed,
@@ -3059,9 +3235,9 @@ async function saveFile(source, suggestedName) {
   }
 
   let blob = source;
-  // Inject Duration + Cues so the saved file is seekable. Every buffered save
-  // path (stitched, separate-part fallback) funnels through here. Falls back to
-  // the original blob internally on any failure.
+  // Inject Duration + Cues so the saved file is seekable. Test/reference-only
+  // now (see the function comment above) — falls back to the original blob
+  // internally on any failure.
   blob = await makeSeekable(blob);
   // Try File System Access API first
   if ('showSaveFilePicker' in window) {
@@ -3138,6 +3314,39 @@ function keepDownloadSession() {
   showError(bannerUp
     ? 'Your recording is kept safe in this browser — click "Recover & save" above to try again.'
     : 'Your recording is kept safe in this browser. Reload the page and click "Recover & save" to try again.');
+}
+
+// ============================================================
+// Stitch fallback (Rider 2, REVIEW #10) — replaces the old blocking confirm()
+// with the same in-app banner pattern as recoveryBanner/downloadConfirm.
+// ============================================================
+var stitchFallbackSegments = null;
+
+function offerStitchFallback(segments) {
+  stitchFallbackSegments = segments;
+  document.getElementById('stitchFallback').classList.add('visible');
+}
+
+async function stitchFallbackSaveParts() {
+  const segments = stitchFallbackSegments || [];
+  stitchFallbackSegments = null;
+  document.getElementById('stitchFallback').classList.remove('visible');
+  const { cancelled, downloadedIds } = await saveSegmentsAsParts(segments);
+  if (cancelled) {
+    showError('Save cancelled — remaining segments are still here. Reload the page to recover them.');
+  } else if (downloadedIds.length > 0) {
+    // Sessions stay until the download is confirmed — same pattern as every
+    // other download-fallback save; confirmDownloadArrived clears priorSegments.
+    offerDownloadConfirm(downloadedIds, downloadedIds.length);
+  } else {
+    state.priorSegments = [];
+  }
+}
+
+function stitchFallbackKeep() {
+  stitchFallbackSegments = null;
+  document.getElementById('stitchFallback').classList.remove('visible');
+  showError('Stitching failed. Your recordings are safe in the browser — refresh and use Recovery.');
 }
 
 // ============================================================
@@ -3235,53 +3444,33 @@ async function recoverRecording() {
       return;
     }
 
-    // Multiple segments from repeated crashes: try to stitch them into one file.
-    // Stitching needs the segment bytes, so this path stays buffered (Known
-    // Limitation #1); single-crash recovery above is fully streamed.
+    // Multiple segments from repeated crashes: streamed stitch (Known
+    // Limitation #1, closed in v1.13 — this path used to buffer every
+    // segment; single-crash recovery above was already fully streamed).
     updateStatus('idle', 'Stitching recovered segments...');
-    for (const s of segments) {
-      const chunks = await getSessionChunks(s.id);
-      s.blob = new Blob(chunks.map(c => new Blob([c.data])), { type: s.mimeType });
-    }
-    let stitched = null;
-    try {
-      stitched = await concatenateWebM(segments.map(s => s.blob));
-    } catch (stitchErr) {
-      console.warn('Stitch failed during recovery:', stitchErr);
-    }
+    const stitchSegs = segments.map(s => ({ sessionId: s.id, mimeType: s.mimeType }));
+    const result = await saveSessionsStreamedStitch(stitchSegs);
 
-    if (stitched) {
-      const result = await saveFile(stitched);
-      if (result === 'saved') {
-        for (const s of segments) await deleteSession(s.id);
-        document.getElementById('recoveryBanner').classList.remove('visible');
-      } else if (result === 'downloaded') {
-        offerDownloadConfirm(segments.map(s => s.id), 1);
-      } else {
-        showError('Save cancelled — all segments stay in the list until you save them.');
-      }
+    if (result === 'saved') {
+      for (const s of segments) await deleteSession(s.id);
+      document.getElementById('recoveryBanner').classList.remove('visible');
+      return;
+    }
+    if (result === 'downloaded') {
+      offerDownloadConfirm(segments.map(s => s.id), 1);
+      return;
+    }
+    if (result === 'cancelled') {
+      showError('Save cancelled — all segments stay in the list until you save them.');
       return;
     }
 
-    // Stitching failed — save each segment as its own numbered file instead of silently
-    // keeping only the newest. Delete only the segments we actually write.
+    // 'bail' — pass 1 found doubt somewhere in the chain. Recovery auto-proceeds
+    // straight to streamed parts (no in-app prompt here, unlike stitchAndSave —
+    // same auto-proceed pattern recovery always used, just streamed instead of
+    // buffered). Delete only the segments we actually write.
     showError('Could not stitch the segments — saving each part as a separate file.');
-    let fileNum = 1;
-    let cancelled = false;
-    const downloadedIds = [];
-    for (const s of segments) {
-      const r = await saveFile(s.blob, `recording-${formatDateForFilename()}-part${fileNum}.webm`);
-      if (r === 'saved') {
-        await deleteSession(s.id);
-        fileNum++;
-      } else if (r === 'downloaded') {
-        downloadedIds.push(s.id);
-        fileNum++;
-      } else {
-        cancelled = true;
-        break;   // stop at the first cancel; remaining segments stay recoverable
-      }
-    }
+    const { cancelled, downloadedIds } = await saveSegmentsAsParts(stitchSegs);
     if (cancelled) {
       showError('Save cancelled — the remaining parts stay in the list until you save them.');
     } else if (downloadedIds.length > 0) {
