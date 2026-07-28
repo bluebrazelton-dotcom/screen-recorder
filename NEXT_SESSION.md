@@ -1,66 +1,77 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-07-27 (post-v1.12.2). An Aegis session also has the fuller
+Close-out snapshot, 2026-07-28 (post-v1.13). An Aegis session also has the fuller
 `project_screen_recorder.md` project memory — read that too if available.
 
 ## Where things stand
 
-- v1.12.1 is committed and pushed (`9a65827`) — the 07-23 close-out's step zero is
-  done.
-- v1.12.2 is committed and pushed (`05222cd`), Blue's real-Firefox acceptance
-  passed: a 2nd unresolved Firefox download now APPENDS to the confirm bar (ID
-  dedupe + `downloadPendingFiles` counter in the message) instead of overwriting
-  the 1st's IDs, and filenames gained seconds (same-minute saves no longer
-  collide). Harness green (31 scenarios / 208 assertions, new scenario AK).
-- Standing preference (in Aegis memory too): Blue wants future DidaRec work run
-  as orchestrator + Sonnet 5 subagents (`Agent` tool, `model: "sonnet"`) to save
-  tokens — Fable plans/reviews/presents, Sonnet drafts/explores/runs tests. The
-  File Edit Rule still applies at the orchestrator level.
-- v1.12 = REVIEW P2 #7 closed: zero permission prompts at load; grants happen lazily
-  at first webcam/mic use; labels upgrade on grant and a blank re-enumeration never
-  overwrites a good name; `state.sources.camera` defaults off (the root cause of
-  camera-only being unreachable); the at-least-one guard explains itself.
-- v1.12.1 = camera-only preview actually renders: Screen-off composites the live
-  camera; leaving camera-only restores the placeholder.
-- Standing lesson from 07-23 (three bugs caught ONLY in a real browser): the harness
-  proves logic; only a browser proves pixels — assert what the viewer SHOWS, and
-  never skip the browser pass.
+- v1.13 is committed and pushed (`20b3ea8`): the streaming multi-segment stitch.
+  `saveSessionsStreamedStitch` (FSA + download sinks) streams Continue Recording
+  chains and multi-crash recovery with bounded memory, byte-identical to the old
+  buffered `concatenateWebM`+`makeSeekable` output (differential-tested). Any
+  doubt in the scan bails to streamed separate-parts saves — never the buffered
+  path. Rider 1: the last chunk-store `getAll` is gone (`getSessionChunks`
+  deleted). Rider 2: the blocking `confirm()` in `stitchAndSave` is replaced by
+  the in-app `#stitchFallback` banner. BUILD_LOG Known Limitation #1 closed;
+  REVIEW #5 closed in full; REVIEW #10 closed. Harness: 54 scenarios /
+  344 assertions (new AR–AX; D, S reseeded with real WebM; E/E2/T updated for
+  bail-not-throw semantics).
+- Phase 3 owner acceptance (2026-07-28): **Firefox — the primary browser —
+  passed across the board.** Chrome: the recording saved, but the microphone
+  didn't pick up the owner's voice — only interference-like sounds. That is a
+  CAPTURE problem, not a save/stitch problem (v1.13 touched no recording-pipeline
+  code), now queue item 1 below.
+- Standing preference (in Aegis memory too): run DidaRec work as orchestrator +
+  Sonnet 5 subagents (`Agent` tool, `model: "sonnet"`) — Fable plans/reviews/
+  presents, Sonnet drafts/explores/runs tests in a scratch copy. The File Edit
+  Rule still applies at the orchestrator level.
+- Standing lesson from 07-23 (three bugs caught ONLY in a real browser): the
+  harness proves logic; only a browser proves pixels — and now, only a browser
+  proves audio. Never skip the browser pass.
 
 ## Read first
 
-- `BUILD_LOG.md` — architecture + full version history (through v1.12.1).
+- `BUILD_LOG.md` — architecture + full version history (through v1.13).
 - `REVIEW.md` — the build queue and what's fixed.
-- `test.cjs` — Node harness (37 scenarios / 268 assertions). `npm i fake-indexeddb`
+- `test.cjs` — Node harness (54 scenarios / 344 assertions). `npm i fake-indexeddb`
   then `node test.cjs`. Extend it; don't bypass it.
-- `PERMISSION_UX_HANDOFF.md` / `STREAMING_SAVE_HANDOFF.md` — how the last two passes
-  were run (untracked working docs).
+- `STREAMING_STITCH_HANDOFF.md` / `STREAMING_SAVE_HANDOFF.md` — how the last two
+  passes were run (untracked working docs).
 
 ## Ground rules (unchanged)
 
 Zero dependencies, single `index.html`, no build step. WebM / streamable only. Don't
-touch the recording pipeline (~1s-max-loss crash guarantee) or the v1.11 streamed
-save flow. Firefox is the primary browser — test there, not just Chrome. Faculty
-audience: messages suggest an action, never a stack trace. Show Blue every proposed
-change in full and wait for approval before writing any file. End with a working
-page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when done.
+touch the recording pipeline (~1s-max-loss crash guarantee) or the v1.11/v1.13
+streamed save flows. Firefox is the primary browser — test there, not just Chrome.
+Faculty audience: messages suggest an action, never a stack trace. Show Blue every
+proposed change in full and wait for approval before writing any file. End with a
+working page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when done.
 
 ## Open queue (priority order)
 
-1. Streaming stitch — IN PROGRESS. Read `STREAMING_STITCH_HANDOFF.md` (design ratified
-   by Blue 2026-07-27, incl. Rider 2 = REVIEW #10 confirm() replacement). Phase 0
-   (oracle, AL–AO, `57dd209`) and Phase 1 (scanner + plan, AP–AQ; harness now 37
-   scenarios / 268 assertions) are DONE and pushed. Phase 1 landed
-   `webmRewriteClusterHeader` (one shared rewrite implementation, 8-byte marker
-   canonicalization preserved), the clusters-only scanner mode
-   (`createWebmStreamScanner({ clustersOnly, timeOffset, videoTrack })` — videoTrack
-   is SEGMENT 1's, oracle fidelity), and `buildStitchPlanParts` (→ `{head,entries,cues}`
-   or `{bail:reason}`). All unreachable from save flows; no version bump yet — v1.13's
-   BUILD_LOG entry comes with Phase 2. Next: Phase 2 — wire the sinks
-   (`saveSessionsStreamedStitch` FSA + download, `stitchAndSave`/`recoverRecording`
-   switch, bail → streamed parts, Riders 1+2), per HANDOFF §3.3–3.5/§5. Phase 2 notes:
-   plan entries carry `seg` index for the per-segment chunk walks; the
-   truncated-known-size-cluster bail branch in clusters-only mode has no dedicated
-   scenario yet — add one when the sinks make it drivable. Window closes Aug 19.
+1. **Mic device selection is broken; Chrome records interference instead of voice**
+   (found during v1.13 acceptance; diagnosed with the owner 2026-07-28). Owner-
+   confirmed findings, BOTH browsers: the mic dropdown only ever shows
+   "Default microphone" / "Microphone 1" placeholders and never upgrades to real
+   device names, even after a grant; on Chrome the dropdown doesn't populate
+   until recording starts. Code-confirmed mechanism (`enumerateDevices` /
+   `captureMic` / `onDeviceSelected`, index.html ~860–975): pre-grant,
+   browsers return blank labels AND blank deviceIds, so the placeholder options
+   get `value=""` — colliding with the Default option — and selecting one is a
+   no-op (falsy `state.selectedMic` → no deviceId constraint reaches
+   getUserMedia). The v1.12 post-grant fire-and-forget re-enumeration
+   (captureMic → enumerateDevices) SHOULD rebuild the list with real names but
+   demonstrably doesn't land in the UI — that's the core bug to find. With
+   selection inert, Chrome falls back to its OS default input (default vs
+   communications-device split, or a loopback-style device), which records
+   interference; Firefox's default happens to be the real mic, which is why
+   Firefox "works". Scope for the fix session: make the post-grant label
+   upgrade actually reach the dropdown; stop offering fake pre-grant choices
+   with empty ids; then verify Chrome records real voice once a real device is
+   selectable. Recording pipeline untouched — enumeration/selection UI only;
+   don't regress the v1.12 guarantees (zero prompts at load, lazy grant, blank
+   re-enumeration never overwrites a good name); real-browser pass in BOTH
+   browsers is the acceptance (only a browser proves audio).
 2. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
    Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT), chapter-
    marker hotkeys, sidecar export convention. The caption editor deserves its own
@@ -75,3 +86,6 @@ page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when done.
 - Staging can serve a stale copy — confirm with a fresh shell read.
 - `.gitignore` covers `node_modules/`, `_to_delete/`, `*.webm`, `*_HANDOFF.md`,
   `*_completion_report.md`.
+- Scenario-count bookkeeping drifts (earlier docs said "37 scenarios" when there
+  were 46 labels) — the assertion total from `node test.cjs` is ground truth;
+  count `await scenario(` calls if you need the scenario number.
