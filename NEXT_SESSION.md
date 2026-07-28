@@ -51,9 +51,9 @@ page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when done.
    buffered-stitch oracle, scenarios AL–AO) is DONE and pushed (`57dd209`, harness now
    35 scenarios / 224 assertions) — it also caught that `webmRewriteCluster`
    canonicalizes unknown-size markers to 8-byte for rewritten clusters (HANDOFF gotcha
-   #2 updated; the Phase 1 header helper must replicate this). Next: Phase 1 (scanner
-   clusters-only mode + `webmRewriteClusterHeader` extraction + merged plan builder,
-   differential vs the oracle). Window closes Aug 19.
+   #2 updated; the Phase 1 header helper must replicate this). Next: Phase 1 —
+   operational brief in `STITCH_PHASE1_HANDOFF.md` (untracked; read it after the main
+   HANDOFF). Window closes Aug 19.
 2. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
    Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT), chapter-
    marker hotkeys, sidecar export convention. The caption editor deserves its own
