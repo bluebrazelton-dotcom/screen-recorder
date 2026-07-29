@@ -1,42 +1,73 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-07-28 (post-v1.13). An Aegis session also has the fuller
-`project_screen_recorder.md` project memory — read that too if available.
+Close-out snapshot, 2026-07-29 (post-v1.14, pending commit). An Aegis session also has
+the fuller `project_screen_recorder.md` project memory — read that too if available.
 
 ## Where things stand
 
-- v1.13 is committed and pushed (`20b3ea8`): the streaming multi-segment stitch.
-  `saveSessionsStreamedStitch` (FSA + download sinks) streams Continue Recording
-  chains and multi-crash recovery with bounded memory, byte-identical to the old
-  buffered `concatenateWebM`+`makeSeekable` output (differential-tested). Any
-  doubt in the scan bails to streamed separate-parts saves — never the buffered
-  path. Rider 1: the last chunk-store `getAll` is gone (`getSessionChunks`
-  deleted). Rider 2: the blocking `confirm()` in `stitchAndSave` is replaced by
-  the in-app `#stitchFallback` banner. BUILD_LOG Known Limitation #1 closed;
-  REVIEW #5 closed in full; REVIEW #10 closed. Harness: 54 scenarios /
-  344 assertions (new AR–AX; D, S reseeded with real WebM; E/E2/T updated for
-  bail-not-throw semantics).
-- Phase 3 owner acceptance (2026-07-28): **Firefox — the primary browser —
-  passed across the board.** Chrome: the recording saved, but the microphone
-  didn't pick up the owner's voice — only interference-like sounds. That is a
-  CAPTURE problem, not a save/stitch problem (v1.13 touched no recording-pipeline
-  code), now queue item 1 below.
+- **v1.14 is done, pending commit.** This session ran in a sandboxed scratch copy of
+  the repo (see Gotchas below) — the owner commits from a normal shell. v1.14 is the
+  mic device selection overhaul that fixes the interference/no-voice bug found during
+  v1.13's Chrome acceptance: an early `primeMicLabels()` grant path (gesture-gated,
+  so zero-prompts-at-load still holds), blank-id placeholder options removed, an
+  anonymized-re-enumeration guard, a persistent `micEnumAnonymized` verdict so DidaRec
+  stops re-prompting once an environment has proven it can't deliver names, an honest
+  Default-option placeholder, and `captureMic` surfacing the granted track's own
+  label. Full write-up in `BUILD_LOG.md`; closes REVIEW.md #15 and this file's old
+  queue item 1.
+- v1.13 (streaming multi-segment stitch) is committed and pushed (`20b3ea8`) and
+  unaffected by this session — v1.14 touched enumeration/selection UI only, never the
+  recording or save pipeline.
+- Harness: 67 scenarios / 392 assertions (new AY–BK this session). `node test.cjs`
+  prints the assertion total, not a scenario count — see Gotchas.
+- Real acceptance (owner, both browsers, 2026-07-29): **Chrome** — zero prompts from
+  the mic dropdown or toggle; only the platform's own record-start permission pop-up
+  remains (it doubles as the mic picker in file:// Chrome); "Microphone: <device>"
+  shown correctly during recording; real voice on playback. **Firefox** — full named
+  dropdown works end to end, no regressions.
 - Standing preference (in Aegis memory too): run DidaRec work as orchestrator +
   Sonnet 5 subagents (`Agent` tool, `model: "sonnet"`) — Fable plans/reviews/
   presents, Sonnet drafts/explores/runs tests in a scratch copy. The File Edit
-  Rule still applies at the orchestrator level.
-- Standing lesson from 07-23 (three bugs caught ONLY in a real browser): the
-  harness proves logic; only a browser proves pixels — and now, only a browser
-  proves audio. Never skip the browser pass.
+  Rule still applies at the orchestrator level. This session ran exactly that way,
+  iteratively: an initial fix, then two owner field reports (a re-prompt loop, then a
+  lingering nag even after the environment had already been proven incapable) each
+  drove one more correction pass in the same scratch copy before acceptance passed.
+- Standing lesson from 07-23 (three bugs caught ONLY in a real browser), reconfirmed
+  07-28/07-29: the harness proves logic; only a browser proves pixels — and now, only
+  a browser proves audio, and only the owner's actual machine proves what a specific
+  permission environment (file://, a specific Chrome build, a specific Bluetooth
+  headset) actually does. This session's real root cause needed an owner-run
+  diagnostic the harness could never have produced by itself. Never skip the browser
+  pass.
+
+## Permanent platform knowledge (not a bug — read before touching mic code again)
+
+- **file://-served Chrome cannot list mic devices in-app, ever.** Confirmed Chrome
+  150, 2026-07-28: `enumerateDevices()` returns a blank deviceId AND a blank label at
+  every stage — pre-grant, during a live granted stream, after the stream stops, and
+  on a second grant. This is because file:// origins never persist a `getUserMedia`
+  grant. Chrome's own per-capture permission pop-up is the only working device
+  picker in this environment, and it reappears once per recording by design — that
+  is expected platform behavior, not a regression to chase. `micEnumAnonymized` in
+  `localStorage` (set by v1.14) records the verdict so DidaRec's own UI stops
+  re-prompting once this is proven. Serving the app over `http://localhost` (or any
+  http(s) origin) restores persisted grants and the full named in-app dropdown.
+- **The original "interference" was a Bluetooth headset's hands-free profile.** With
+  mic selection inert (the pre-v1.14 bug), Chrome fell back to `Headset (T9
+  Hands-Free AG Audio) (Bluetooth)` — 8–16 kHz telephony-band audio, which is what
+  sounded like "interference." Firefox happened to default to the real mic, which is
+  why Firefox "worked" throughout v1.9–v1.13. If a future session hears
+  "interference" or "no voice" again, check which physical device is actually
+  granted before assuming a new capture regression.
 
 ## Read first
 
-- `BUILD_LOG.md` — architecture + full version history (through v1.13).
+- `BUILD_LOG.md` — architecture + full version history (through v1.14).
 - `REVIEW.md` — the build queue and what's fixed.
-- `test.cjs` — Node harness (54 scenarios / 344 assertions). `npm i fake-indexeddb`
+- `test.cjs` — Node harness (67 scenarios / 392 assertions). `npm i fake-indexeddb`
   then `node test.cjs`. Extend it; don't bypass it.
-- `STREAMING_STITCH_HANDOFF.md` / `STREAMING_SAVE_HANDOFF.md` — how the last two
-  passes were run (untracked working docs).
+- `STREAMING_STITCH_HANDOFF.md` / `STREAMING_SAVE_HANDOFF.md` — how the v1.11/v1.13
+  passes were run (untracked working docs; predate the mic work).
 
 ## Ground rules (unchanged)
 
@@ -49,30 +80,7 @@ working page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when don
 
 ## Open queue (priority order)
 
-1. **Mic device selection is broken; Chrome records interference instead of voice**
-   (found during v1.13 acceptance; diagnosed with the owner 2026-07-28). Owner-
-   confirmed findings, BOTH browsers: the mic dropdown only ever shows
-   "Default microphone" / "Microphone 1" placeholders and never upgrades to real
-   device names, even after a grant; on Chrome the dropdown doesn't populate
-   until recording starts. Code-confirmed mechanism (`enumerateDevices` /
-   `captureMic` / `onDeviceSelected`, index.html ~860–975): pre-grant,
-   browsers return blank labels AND blank deviceIds, so the placeholder options
-   get `value=""` — colliding with the Default option — and selecting one is a
-   no-op (falsy `state.selectedMic` → no deviceId constraint reaches
-   getUserMedia). The v1.12 post-grant fire-and-forget re-enumeration
-   (captureMic → enumerateDevices) SHOULD rebuild the list with real names but
-   demonstrably doesn't land in the UI — that's the core bug to find. With
-   selection inert, Chrome falls back to its OS default input (default vs
-   communications-device split, or a loopback-style device), which records
-   interference; Firefox's default happens to be the real mic, which is why
-   Firefox "works". Scope for the fix session: make the post-grant label
-   upgrade actually reach the dropdown; stop offering fake pre-grant choices
-   with empty ids; then verify Chrome records real voice once a real device is
-   selectable. Recording pipeline untouched — enumeration/selection UI only;
-   don't regress the v1.12 guarantees (zero prompts at load, lazy grant, blank
-   re-enumeration never overwrites a good name); real-browser pass in BOTH
-   browsers is the acceptance (only a browser proves audio).
-2. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
+1. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
    Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT), chapter-
    marker hotkeys, sidecar export convention. The caption editor deserves its own
    brief and likely multiple sessions.

@@ -19,6 +19,8 @@ let addChunkCalls = 0;
 let downloadClicks = [];
 let getUserMediaCalls = []; // every getUserMedia(constraints) call, for permission-prompt assertions
 let mockDevices = [];       // controllable enumerateDevices() result for label-upgrade tests
+let localStorageStore = {}; // real in-memory backing for the localStorage mock below —
+                             // a no-op stub can't verify the micEnumAnonymized flag's persistence
 
 // ---------- DOM / platform mocks ----------
 const ctxStub = new Proxy({}, {
@@ -38,8 +40,10 @@ function makeStream(tracks) {
 function makeEl(id) {
   const cls = new Set();
   const children = [];
+  const _handlers = {};
+  let defaultOpt = null; // the single <option value="...">text</option> baked into an innerHTML reset — tracked separately from `children` (see innerHTML setter) so querySelectorAll('option[value]')'s count keeps meaning "real, appended options" for every existing scenario, while applyMicDefaultText() can still find and retext it.
   return {
-    id, style: {}, _cls: cls,
+    id, style: {}, _cls: cls, _handlers,
     classList: {
       add: (c) => cls.add(c), remove: (c) => cls.delete(c),
       toggle: (c, f) => { const on = f === undefined ? !cls.has(c) : f; on ? cls.add(c) : cls.delete(c); },
@@ -51,23 +55,40 @@ function makeEl(id) {
     set value(v) { this._v = v; }, get value() { return this._v || ''; },
     // innerHTML clears tracked children — matches real DOM semantics closely enough
     // for the dropdown-rebuild pattern enumerateDevices() uses (clear then appendChild).
-    set innerHTML(v) { this._h = v; children.length = 0; }, get innerHTML() { return this._h || ''; },
+    // Also parses out the single default-option literal enumerateDevices() resets
+    // with (e.g. '<option value="">Default microphone</option>') into `defaultOpt`,
+    // mirroring what a real browser's HTML parser would do — but kept out of
+    // `children` so querySelectorAll('option[value]') still counts only real options.
+    set innerHTML(v) {
+      this._h = v; children.length = 0;
+      const m = /^<option value="([^"]*)">([^<]*)<\/option>$/.exec(v);
+      defaultOpt = m ? { value: m[1], _t: m[2], get textContent() { return this._t; }, set textContent(t) { this._t = t; } } : null;
+    },
+    get innerHTML() { return this._h || ''; },
     set srcObject(v) { this._s = v; }, get srcObject() { return this._s; },
     appendChild(child) { children.push(child); return child; },
     removeChild(child) { const i = children.indexOf(child); if (i >= 0) children.splice(i, 1); },
     // Minimal selector support: only what enumerateDevices() needs —
-    // option[value] / option[value="X"] over appended children.
+    // option[value] / option[value="X"] over appended children, plus the
+    // parsed-out defaultOpt for option[value=""] specifically.
     querySelector(sel) {
       const m = /^option\[value(?:="([^"]*)")?\]$/.exec(sel);
       if (!m) return null;
-      if (m[1] !== undefined) return children.find(c => c.value === m[1]) || null;
+      if (m[1] !== undefined) {
+        if (m[1] === '' && defaultOpt) return defaultOpt;
+        return children.find(c => c.value === m[1]) || null;
+      }
       return children.find(c => c.value !== undefined) || null;
     },
     querySelectorAll(sel) {
       return /^option\[value\]$/.test(sel) ? children.filter(c => c.value !== undefined) : [];
     },
     click() {},
-    addEventListener() {}, removeEventListener() {},
+    // Same registration pattern as navigator.mediaDevices._handlers below —
+    // stored per event type so a scenario can fire the exact listener a
+    // real dispatchEvent would invoke, without a real DOM event system.
+    addEventListener(type, fn) { (_handlers[type] = _handlers[type] || []).push(fn); },
+    removeEventListener() {},
     getContext() { return ctxStub; },
     getBoundingClientRect() { return { left: 0, top: 0, width: 1280, height: 720 }; },
     captureStream() { return makeStream([{ kind: 'video', stop() {} }]); },
@@ -131,7 +152,11 @@ const sandbox = {
     getDisplayMedia: async () => makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]),
     enumerateDevices: async () => mockDevices,
   } },
-  localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
+  localStorage: {
+    getItem: (k) => (Object.prototype.hasOwnProperty.call(localStorageStore, k) ? localStorageStore[k] : null),
+    setItem: (k, v) => { localStorageStore[k] = String(v); },
+    removeItem: (k) => { delete localStorageStore[k]; },
+  },
   URL: { createObjectURL: (b) => { objectUrlBlobs.push(b); return 'blob:mock'; }, revokeObjectURL: () => {} },
   requestAnimationFrame: (cb) => { rafId++; rafQueue.push({ id: rafId, cb }); return rafId; },
   cancelAnimationFrame: (id) => { rafQueue = rafQueue.filter(x => x.id !== id); },
@@ -154,7 +179,11 @@ vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app_new.js' });
 const api = sandbox.__api;
 const state = api.state;
-const ORIG = { addChunk: sandbox.addChunk, concatenateWebM: sandbox.concatenateWebM };
+const ORIG = {
+  addChunk: sandbox.addChunk, concatenateWebM: sandbox.concatenateWebM,
+  getUserMedia: sandbox.navigator.mediaDevices.getUserMedia,
+  mdEnumerateDevices: sandbox.navigator.mediaDevices.enumerateDevices,
+};
 sandbox.showError = (m) => { recordedErrors.push(m || ''); };
 const ORIG_updateStatus = sandbox.updateStatus;
 sandbox.updateStatus = (mode, text) => { statusHistory.push(text); return ORIG_updateStatus(mode, text); };
@@ -165,6 +194,7 @@ function flushRaf() { const q = rafQueue; rafQueue = []; for (const { cb } of q)
 const drain = async (n = 60) => { for (let i = 0; i < n; i++) await new Promise(r => setImmediate(r)); };
 function resetDB() { return new Promise((res) => { const r = gidb.deleteDatabase('screen-recorder-db'); r.onsuccess = r.onerror = r.onblocked = () => res(); }); }
 function dispatchDeviceChange() { (sandbox.navigator.mediaDevices._handlers.devicechange || []).forEach(fn => fn({})); }
+function dispatchEl(id, type) { (documentMock.getElementById(id)._handlers[type] || []).forEach(fn => fn({})); }
 function readStore(name) {
   return new Promise((resolve) => {
     const req = gidb.open('screen-recorder-db');
@@ -209,10 +239,13 @@ function pickerSequence(outcomes) {
 }
 async function resetState() {
   await resetDB();
-  Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, cameraStream: null, micStream: null, audioContext: null, compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [] });
+  Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, cameraStream: null, micStream: null, audioContext: null, compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [], lastMicLabel: null });
   windowMock._recoverySessions = null; windowMock._recoverySessionId = null; windowMock._recoveryMimeType = null;
   delete windowMock.showSaveFilePicker;   // absent = Firefox mode; FSA scenarios set their own picker
   sandbox.addChunk = ORIG.addChunk; sandbox.concatenateWebM = ORIG.concatenateWebM;
+  sandbox.navigator.mediaDevices.getUserMedia = ORIG.getUserMedia;
+  sandbox.navigator.mediaDevices.enumerateDevices = ORIG.mdEnumerateDevices;
+  sandbox.micPrimeInFlight = false; sandbox.micPrimeAttempted = false;
   sandbox.downloadPendingIds = [];
   sandbox.downloadPendingFiles = 0;
   sandbox.stitchFallbackSegments = null;
@@ -224,6 +257,7 @@ async function resetState() {
   writeCalls = []; abortCalls = 0; closedFiles = 0; failWriteAfter = -1;
   statusHistory = []; objectUrlBlobs = [];
   getUserMediaCalls = []; mockDevices = [];
+  localStorageStore = {};
   sandbox.STREAM_CARRY_CAP = ORIG_CARRY_CAP;
 }
 
@@ -1608,6 +1642,334 @@ async function scenario(name, fn) {
       assert(sessions.length === 2, 'both sessions intact after bail');
       sandbox.stitchFallbackKeep();
     }
+  });
+
+  // ============================================================
+  // Mic label priming (v1.13) — enumerateDevices() skips blank-deviceId
+  // placeholders; primeMicLabels() is the mic's early grant path
+  // ============================================================
+  await scenario('AY pre-grant enumeration (blank deviceId) yields only the Default option in both dropdowns', async () => {
+    // DOM element mocks persist across scenarios (AF leaves real camera
+    // options behind) — a genuinely empty device list is unambiguous
+    // removal, not anonymization, so this always rebuilds to Default-only
+    // and gives us a clean pre-grant starting point for the real assertion.
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    mockDevices = [
+      { kind: 'videoinput', deviceId: '', label: '' },
+      { kind: 'audioinput', deviceId: '', label: '' },
+    ];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    const camSelect = documentMock.getElementById('cameraSelect');
+    const micSelect = documentMock.getElementById('micSelect');
+    assert(camSelect.innerHTML === '<option value="">Default camera</option>', 'camera dropdown is just the Default option, no fake placeholder appended (got: ' + camSelect.innerHTML + ')');
+    assert(micSelect.innerHTML === '<option value="">Default microphone</option>', 'mic dropdown is just the Default option, no fake placeholder appended (got: ' + micSelect.innerHTML + ')');
+    assert(camSelect.querySelectorAll('option[value]').length === 0, 'no camera option objects were appended beyond the Default (got ' + camSelect.querySelectorAll('option[value]').length + ')');
+    assert(micSelect.querySelectorAll('option[value]').length === 0, 'no mic option objects were appended beyond the Default (got ' + micSelect.querySelectorAll('option[value]').length + ')');
+  });
+
+  await scenario('AZ post-grant enumeration populates real options; selecting one feeds the deviceId constraint', async () => {
+    mockDevices = [
+      { kind: 'videoinput', deviceId: 'cam1', label: 'Logitech BRIO' },
+      { kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' },
+    ];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    const camSelect = documentMock.getElementById('cameraSelect');
+    const micSelect = documentMock.getElementById('micSelect');
+    const camOpt = camSelect.querySelector('option[value="cam1"]');
+    const micOpt = micSelect.querySelector('option[value="mic1"]');
+    assert(camOpt && camOpt.textContent === 'Logitech BRIO', 'real camera option populated (got: ' + (camOpt && camOpt.textContent) + ')');
+    assert(micOpt && micOpt.textContent === 'USB Mic', 'real mic option populated (got: ' + (micOpt && micOpt.textContent) + ')');
+
+    micSelect.value = 'mic1';
+    sandbox.onDeviceSelected('mic');
+    assert(state.selectedMic === 'mic1', 'selecting the option updates state.selectedMic');
+
+    await sandbox.captureMic();
+    const call = getUserMediaCalls[getUserMediaCalls.length - 1];
+    assert(call.audio && call.audio.deviceId && call.audio.deviceId.exact === 'mic1', 'the selected deviceId reaches the getUserMedia constraint (got: ' + JSON.stringify(call.audio) + ')');
+  });
+
+  await scenario('BA primeMicLabels grants, enumerates while the stream is still live, then stops tracks', async () => {
+    // DOM element mocks persist across scenarios — start from a clean,
+    // not-yet-upgraded dropdown so the guard doesn't short-circuit on a
+    // real option left over from an earlier scenario.
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    const order = [];
+    const track = { kind: 'audio', stop() { order.push('stop'); } };
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      order.push('getUserMedia');
+      return makeStream([track]);
+    };
+    sandbox.navigator.mediaDevices.enumerateDevices = async () => { order.push('enumerate'); return mockDevices; };
+    mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
+
+    await sandbox.primeMicLabels();
+
+    assert(getUserMediaCalls.length === 1, 'getUserMedia called once (got ' + getUserMediaCalls.length + ')');
+    assert(getUserMediaCalls[0].audio === true && getUserMediaCalls[0].video === false, 'audio-only grant (got: ' + JSON.stringify(getUserMediaCalls[0]) + ')');
+    assert(order.join(',') === 'getUserMedia,enumerate,stop', 'enumerate runs while the stream is live, before the tracks stop (got: ' + order.join(',') + ')');
+
+    const micOpt = documentMock.getElementById('micSelect').querySelector('option[value="mic1"]');
+    assert(micOpt && micOpt.textContent === 'USB Mic', 'real label landed via the primed enumerate (got: ' + (micOpt && micOpt.textContent) + ')');
+  });
+
+  await scenario('BB primeMicLabels is a no-op once real mic options already exist', async () => {
+    mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    await sandbox.primeMicLabels();
+    assert(getUserMediaCalls.length === 0, 'guard skips getUserMedia when labels are already upgraded (got ' + getUserMediaCalls.length + ')');
+  });
+
+  await scenario('BC primeMicLabels failure path leaves the dropdown intact and throws nothing', async () => {
+    mockDevices = []; // reset to placeholder-only state so the guard doesn't short-circuit
+    await sandbox.enumerateDevices();
+    await drain();
+
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      const e = new Error('Permission denied'); e.name = 'NotAllowedError'; throw e;
+    };
+
+    let threw = false;
+    try { await sandbox.primeMicLabels(); } catch (e) { threw = true; }
+
+    assert(!threw, 'primeMicLabels swallows the rejection (no throw)');
+    assert(getUserMediaCalls.length === 1, 'getUserMedia was attempted (got ' + getUserMediaCalls.length + ')');
+    const micSelect = documentMock.getElementById('micSelect');
+    assert(micSelect.innerHTML === '<option value="">Default microphone</option>', 'dropdown still just Default microphone after a failed grant (got: ' + micSelect.innerHTML + ')');
+    assert(micSelect.querySelectorAll('option[value]').length === 0, 'no options were fabricated on failure');
+  });
+
+  await scenario('BD interacting with #micSelect itself primes mic labels, and is a no-op once already upgraded', async () => {
+    mockDevices = []; // clean, not-yet-upgraded state
+    await sandbox.enumerateDevices();
+    await drain();
+
+    mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
+    dispatchEl('micSelect', 'mousedown');
+    await drain();
+
+    assert(getUserMediaCalls.length === 1, 'mousedown on #micSelect triggers primeMicLabels\' getUserMedia (got ' + getUserMediaCalls.length + ')');
+    const micOpt = documentMock.getElementById('micSelect').querySelector('option[value="mic1"]');
+    assert(micOpt && micOpt.textContent === 'USB Mic', 'real label landed via the mousedown-triggered prime (got: ' + (micOpt && micOpt.textContent) + ')');
+
+    // Labels are upgraded now — a later focus event must not re-prompt.
+    dispatchEl('micSelect', 'focus');
+    await drain();
+    assert(getUserMediaCalls.length === 1, 'focus after labels are upgraded does not re-trigger getUserMedia (got ' + getUserMediaCalls.length + ')');
+  });
+
+  // ============================================================
+  // Chrome acceptance fixes — re-entrancy/attempted-once guard on
+  // primeMicLabels(), and the anonymized-list guard on enumerateDevices()
+  // ============================================================
+  await scenario('BE overlapping primeMicLabels calls make only one getUserMedia call (in-flight guard)', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    let resolveGUM;
+    const gumPromise = new Promise((res) => { resolveGUM = res; });
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return gumPromise; // stays unresolved until manually resolved below
+    };
+    mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
+
+    // primeMicLabels runs synchronously up to its `await getUserMedia(...)`
+    // — by the time this line returns, micPrimeInFlight is already true and
+    // the (single) getUserMedia call has already been made.
+    const p1 = sandbox.primeMicLabels();
+    const p2 = sandbox.primeMicLabels(); // fires while p1's grant is still unresolved (e.g. the prompt-return focus)
+
+    assert(getUserMediaCalls.length === 1, 'only one getUserMedia call while the first is still in flight (got ' + getUserMediaCalls.length + ')');
+
+    resolveGUM(makeStream([{ kind: 'audio', stop() {} }]));
+    await p1;
+    await p2;
+    await drain();
+
+    assert(getUserMediaCalls.length === 1, 'still exactly one getUserMedia call once both settle (got ' + getUserMediaCalls.length + ')');
+    const micOpt = documentMock.getElementById('micSelect').querySelector('option[value="mic1"]');
+    assert(micOpt && micOpt.textContent === 'USB Mic', 'the single grant still upgraded the label (got: ' + (micOpt && micOpt.textContent) + ')');
+  });
+
+  await scenario('BF anonymized re-enumeration (entries present, ids blank) preserves a granted list; genuine removal still rebuilds', async () => {
+    // Establish a granted list for both kinds.
+    mockDevices = [
+      { kind: 'videoinput', deviceId: 'cam1', label: 'Logitech BRIO' },
+      { kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' },
+    ];
+    await sandbox.enumerateDevices();
+    await drain();
+    const camSelect = documentMock.getElementById('cameraSelect');
+    const micSelect = documentMock.getElementById('micSelect');
+    camSelect.value = 'cam1';
+    micSelect.value = 'mic1';
+
+    // Anonymized re-enumeration: entries present for both kinds, but every
+    // deviceId is blank (permission lapsed, e.g. a file:// origin that
+    // doesn't persist the grant) — not a genuine unplug.
+    mockDevices = [
+      { kind: 'videoinput', deviceId: '', label: '' },
+      { kind: 'audioinput', deviceId: '', label: '' },
+    ];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    assert(camSelect.querySelector('option[value="cam1"]') && camSelect.querySelector('option[value="cam1"]').textContent === 'Logitech BRIO', 'camera keeps its granted list through an anonymized re-enumerate');
+    assert(micSelect.querySelector('option[value="mic1"]') && micSelect.querySelector('option[value="mic1"]').textContent === 'USB Mic', 'mic keeps its granted list through an anonymized re-enumerate');
+    assert(camSelect.value === 'cam1', 'camera selection untouched by the skipped rebuild (got: ' + camSelect.value + ')');
+    assert(micSelect.value === 'mic1', 'mic selection untouched by the skipped rebuild (got: ' + micSelect.value + ')');
+
+    // A third enumerate with a genuinely different real list still rebuilds normally.
+    mockDevices = [
+      { kind: 'videoinput', deviceId: 'cam2', label: 'External webcam' },
+      { kind: 'audioinput', deviceId: 'mic2', label: 'Headset mic' },
+    ];
+    await sandbox.enumerateDevices();
+    await drain();
+    assert(camSelect.querySelector('option[value="cam2"]') && camSelect.querySelector('option[value="cam2"]').textContent === 'External webcam', 'a real, different list still rebuilds the camera dropdown');
+    assert(micSelect.querySelector('option[value="mic2"]') && micSelect.querySelector('option[value="mic2"]').textContent === 'Headset mic', 'a real, different list still rebuilds the mic dropdown');
+    assert(camSelect.querySelector('option[value="cam1"]') === null, 'the stale cam1 option is gone after the real rebuild');
+    assert(micSelect.querySelector('option[value="mic1"]') === null, 'the stale mic1 option is gone after the real rebuild');
+
+    // Genuine removal (no audioinput entries at all) still rebuilds — existing unplug semantics.
+    mockDevices = [
+      { kind: 'videoinput', deviceId: 'cam2', label: 'External webcam' },
+      // no audioinput entries at all
+    ];
+    await sandbox.enumerateDevices();
+    await drain();
+    assert(micSelect.innerHTML === '<option value="">Default microphone</option>', 'mic dropdown drops to Default-only on genuine removal (got: ' + micSelect.innerHTML + ')');
+  });
+
+  await scenario('BG after a failed prime, the passive path does not retry but the forced toggle path does', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      const e = new Error('Permission denied'); e.name = 'NotAllowedError'; throw e;
+    };
+
+    await sandbox.primeMicLabels(); // first automatic attempt (mousedown/focus path) — fails
+    assert(getUserMediaCalls.length === 1, 'first attempt calls getUserMedia (got ' + getUserMediaCalls.length + ')');
+
+    await sandbox.primeMicLabels(); // passive path again — no retry after one attempted+failed grant
+    assert(getUserMediaCalls.length === 1, 'passive re-attempt is suppressed after one failed automatic attempt (got ' + getUserMediaCalls.length + ')');
+
+    await sandbox.primeMicLabels(true); // forced path (explicit mic toggle-ON click) — retries
+    assert(getUserMediaCalls.length === 2, 'forced call retries even after a prior failed attempt (got ' + getUserMediaCalls.length + ')');
+  });
+
+  // ============================================================
+  // Graceful degradation for environments that can never list mic devices
+  // (file://-served Chrome — the grant succeeds but enumeration stays
+  // anonymized forever; the granted track's own .label is all we get)
+  // ============================================================
+  await scenario('BH a completed grant+enumerate that stays blank-id sets the flag and explains the placeholder', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    // Grant succeeds (getUserMedia resolves) but the environment can only
+    // ever report a blank-id audioinput — file://-served Chrome, per the
+    // field report.
+    mockDevices = [{ kind: 'audioinput', deviceId: '', label: '' }];
+    await sandbox.primeMicLabels();
+
+    assert(getUserMediaCalls.length === 1, 'the grant was attempted (got ' + getUserMediaCalls.length + ')');
+    assert(sandbox.localStorage.getItem('micEnumAnonymized') === '1', 'flag persisted after a completed grant+enumerate that yielded no real options');
+    const defaultOpt = documentMock.getElementById('micSelect').querySelector('option[value=""]');
+    assert(defaultOpt && defaultOpt.textContent === 'Chosen in the browser pop-up', 'placeholder explains where selection really happens (got: ' + (defaultOpt && defaultOpt.textContent) + ')');
+  });
+
+  await scenario('BI with the flag set, neither passive nor forced primeMicLabels prompts; captureMic\'s own re-enumerate is the real escape hatch', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+    sandbox.localStorage.setItem('micEnumAnonymized', '1'); // environment already proved it can't deliver names
+
+    await sandbox.primeMicLabels(); // passive path (mousedown/focus)
+    assert(getUserMediaCalls.length === 0, 'passive prime makes no getUserMedia call once the flag is set (got ' + getUserMediaCalls.length + ')');
+
+    await sandbox.primeMicLabels(true); // forced path (explicit toggle-ON click) — force only bypasses the attempted-once guard, not the anonymized verdict
+    assert(getUserMediaCalls.length === 0, 'forced prime also makes no getUserMedia call once the flag is set (got ' + getUserMediaCalls.length + ')');
+
+    // The real escape hatch: the environment changed (e.g. now served over
+    // http) and a real list is available. No prime path re-checks this —
+    // it's captureMic's own post-grant fire-and-forget re-enumerate (the
+    // one that runs whenever a recording actually starts) that discovers
+    // and clears the flag.
+    mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
+    await sandbox.captureMic();
+    await drain();
+
+    assert(sandbox.localStorage.getItem('micEnumAnonymized') === null, 'a real-option rebuild clears the flag, reached via captureMic rather than a forced prime');
+    const micOpt = documentMock.getElementById('micSelect').querySelector('option[value="mic1"]');
+    assert(micOpt && micOpt.textContent === 'USB Mic', 'real label shown once the environment recovers (got: ' + (micOpt && micOpt.textContent) + ')');
+  });
+
+  await scenario('BJ captureMic surfaces the granted track\'s own label when there are no real options, and it survives an anonymized re-enumerate', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    // No real options available; the granted stream's track still knows its own name.
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'audio', label: 'USB Mic', stop() {} }]);
+    };
+    await sandbox.captureMic();
+    await drain();
+
+    let defaultOpt = documentMock.getElementById('micSelect').querySelector('option[value=""]');
+    assert(defaultOpt && defaultOpt.textContent === 'Microphone: USB Mic', 'Default option shows the granted track\'s own label (got: ' + (defaultOpt && defaultOpt.textContent) + ')');
+
+    // A later anonymized re-enumeration (entries present, blank ids) must not wipe this —
+    // e.g. devicechange firing right after recording stops.
+    mockDevices = [{ kind: 'audioinput', deviceId: '', label: '' }];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    defaultOpt = documentMock.getElementById('micSelect').querySelector('option[value=""]');
+    assert(defaultOpt && defaultOpt.textContent === 'Microphone: USB Mic', 'text survives a later anonymized re-enumeration (got: ' + (defaultOpt && defaultOpt.textContent) + ')');
+  });
+
+  await scenario('BK environments with real options: captureMic does not overwrite the dropdown, and the flag stays unset', async () => {
+    mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
+    await sandbox.enumerateDevices();
+    await drain();
+    const micSelect = documentMock.getElementById('micSelect');
+    micSelect.value = 'mic1';
+
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'audio', label: 'Some Other Mic', stop() {} }]);
+    };
+    await sandbox.captureMic();
+    await drain();
+
+    const micOpt = micSelect.querySelector('option[value="mic1"]');
+    assert(micOpt && micOpt.textContent === 'USB Mic', 'real option/label untouched by captureMic (got: ' + (micOpt && micOpt.textContent) + ')');
+    assert(micSelect.value === 'mic1', 'selection untouched (got: ' + micSelect.value + ')');
+    assert(sandbox.localStorage.getItem('micEnumAnonymized') === null, 'flag stays unset when real options exist');
+    assert(state.lastMicLabel === null, 'lastMicLabel is not set when real options already exist (got: ' + state.lastMicLabel + ')');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

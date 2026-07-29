@@ -539,6 +539,8 @@ const state = {
   sources: { screen: true, camera: false, mic: true },
   selectedCamera: '',  // deviceId, empty = default
   selectedMic: '',     // deviceId, empty = default
+  lastMicLabel: null,  // runtime-only: last granted track's own label, for
+                        // environments that can never list real mic options
   recording: false,
   paused: false,
   mediaRecorder: null,
@@ -794,6 +796,19 @@ function toggleSource(source) {
       stopCameraPreview();
     }
   }
+
+  // Prime real mic labels on a genuine toggle-ON click. toggleSource is only
+  // reachable from the toggle buttons' onclick — never called during
+  // init/recovery — so this is a user gesture and can't fire a permission
+  // prompt at page load, even though mic defaults on in state.sources.
+  // Forced: an explicit click is new intent, so it retries even if the
+  // passive mousedown/focus path already made (and gave up on) an attempt
+  // this session — but it still won't re-prompt once micEnumAnonymized is
+  // set; that verdict only clears on its own, via a capable environment's
+  // next real-option rebuild (see primeMicLabels).
+  if (source === 'mic' && state.sources.mic) {
+    primeMicLabels(true); // fire-and-forget — doesn't block the toggle UI
+  }
 }
 
 // Start the webcam and show it on the canvas immediately (for preview before recording)
@@ -857,6 +872,31 @@ function updateToggleUI() {
 // ============================================================
 // Device enumeration
 // ============================================================
+
+// When the mic dropdown has no real options, the single Default option is
+// the only thing the user sees — make it tell the truth instead of just
+// saying "Default microphone". No-ops the moment real options exist, so it
+// never touches a working dropdown (Firefox / http(s) Chrome keep working
+// exactly as before). Called from enumerateDevices' mic branch, and from
+// captureMic/primeMicLabels whenever lastMicLabel or the anonymized flag
+// changes, since those don't always run through a full enumerate.
+function applyMicDefaultText() {
+  const micSelect = document.getElementById('micSelect');
+  const hasReal = Array.from(micSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+  if (hasReal) return;
+  const defaultOpt = micSelect.querySelector('option[value=""]');
+  if (!defaultOpt) return;
+  let anonymized = false;
+  try { anonymized = localStorage.getItem('micEnumAnonymized') === '1'; } catch (e) { /* ignore */ }
+  if (state.lastMicLabel) {
+    defaultOpt.textContent = `Microphone: ${state.lastMicLabel}`;
+  } else if (anonymized) {
+    defaultOpt.textContent = 'Chosen in the browser pop-up';
+  } else {
+    defaultOpt.textContent = 'Default microphone';
+  }
+}
+
 async function enumerateDevices() {
   try {
     // No temp getUserMedia here anymore — enumerate as-is; labels come back
@@ -864,43 +904,137 @@ async function enumerateDevices() {
     // at first use (captureCamera/captureMic), which re-enumerates afterward.
     const devices = await navigator.mediaDevices.enumerateDevices();
 
-    const cameras = devices.filter(d => d.kind === 'videoinput');
-    const mics = devices.filter(d => d.kind === 'audioinput');
+    const rawCameras = devices.filter(d => d.kind === 'videoinput');
+    const rawMics = devices.filter(d => d.kind === 'audioinput');
+    const camSelect = document.getElementById('cameraSelect');
+    const micSelect = document.getElementById('micSelect');
+
+    // Anonymized re-enumeration: entries of this kind are present but every
+    // one has a blank deviceId — the permission lapsed (e.g. file:// origins
+    // don't persist a mic/camera grant) rather than the device being
+    // unplugged. This is the v1.12 "a blank re-enumeration never overwrites
+    // a good name" guarantee extended to ids: if we already hold a granted
+    // list, an anonymized list must not clobber it — skip the rebuild and
+    // keep the known-good options and selection. Genuine removal (no
+    // entries of that kind at all) and mixed lists (some real ids) still
+    // rebuild below, same as before.
+    const camAnonymized = rawCameras.length > 0 && rawCameras.every(d => d.deviceId === '');
+    const micAnonymized = rawMics.length > 0 && rawMics.every(d => d.deviceId === '');
+    const camHasReal = Array.from(camSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+    const micHasReal = Array.from(micSelect.querySelectorAll('option[value]')).some(opt => opt.value);
 
     // Populate camera dropdown — never let a blank label overwrite a known-good
     // one (Firefox blanks labels again once the granting stream stops)
-    const camSelect = document.getElementById('cameraSelect');
-    const priorCamLabels = {};
-    camSelect.querySelectorAll('option[value]').forEach(opt => { if (opt.value) priorCamLabels[opt.value] = opt.textContent; });
-    camSelect.innerHTML = '<option value="">Default camera</option>';
-    cameras.forEach((cam, i) => {
-      const opt = document.createElement('option');
-      opt.value = cam.deviceId;
-      opt.textContent = cam.label || priorCamLabels[cam.deviceId] || `Camera ${i + 1}`;
-      camSelect.appendChild(opt);
-    });
+    if (!(camAnonymized && camHasReal)) {
+      const cameras = rawCameras.filter(d => d.deviceId !== '');
+      const priorCamLabels = {};
+      camSelect.querySelectorAll('option[value]').forEach(opt => { if (opt.value) priorCamLabels[opt.value] = opt.textContent; });
+      camSelect.innerHTML = '<option value="">Default camera</option>';
+      cameras.forEach((cam, i) => {
+        const opt = document.createElement('option');
+        opt.value = cam.deviceId;
+        opt.textContent = cam.label || priorCamLabels[cam.deviceId] || `Camera ${i + 1}`;
+        camSelect.appendChild(opt);
+      });
+      if (state.selectedCamera && camSelect.querySelector(`option[value="${state.selectedCamera}"]`)) {
+        camSelect.value = state.selectedCamera;
+      }
+    }
 
     // Populate mic dropdown — same rule
-    const micSelect = document.getElementById('micSelect');
-    const priorMicLabels = {};
-    micSelect.querySelectorAll('option[value]').forEach(opt => { if (opt.value) priorMicLabels[opt.value] = opt.textContent; });
-    micSelect.innerHTML = '<option value="">Default microphone</option>';
-    mics.forEach((mic, i) => {
-      const opt = document.createElement('option');
-      opt.value = mic.deviceId;
-      opt.textContent = mic.label || priorMicLabels[mic.deviceId] || `Microphone ${i + 1}`;
-      micSelect.appendChild(opt);
-    });
-
-    // Restore previous selections if still available
-    if (state.selectedCamera && camSelect.querySelector(`option[value="${state.selectedCamera}"]`)) {
-      camSelect.value = state.selectedCamera;
-    }
-    if (state.selectedMic && micSelect.querySelector(`option[value="${state.selectedMic}"]`)) {
-      micSelect.value = state.selectedMic;
+    if (!(micAnonymized && micHasReal)) {
+      const mics = rawMics.filter(d => d.deviceId !== '');
+      const priorMicLabels = {};
+      micSelect.querySelectorAll('option[value]').forEach(opt => { if (opt.value) priorMicLabels[opt.value] = opt.textContent; });
+      micSelect.innerHTML = '<option value="">Default microphone</option>';
+      mics.forEach((mic, i) => {
+        const opt = document.createElement('option');
+        opt.value = mic.deviceId;
+        opt.textContent = mic.label || priorMicLabels[mic.deviceId] || `Microphone ${i + 1}`;
+        micSelect.appendChild(opt);
+      });
+      if (state.selectedMic && micSelect.querySelector(`option[value="${state.selectedMic}"]`)) {
+        micSelect.value = state.selectedMic;
+      }
+      // Real options landed — the environment can deliver names after all;
+      // clear the "can't do it" verdict so the placeholder stops apologizing.
+      if (mics.length > 0) {
+        try { localStorage.removeItem('micEnumAnonymized'); } catch (e) { /* ignore */ }
+      }
+      applyMicDefaultText(); // rebuilt with no real options — say why, not just "Default microphone"
+    } else {
+      applyMicDefaultText(); // skipped rebuild — re-apply so a stale placeholder text can't linger
     }
   } catch (err) {
     console.warn('Could not enumerate devices:', err);
+  }
+}
+
+// Re-entrancy + attempted-once guards for primeMicLabels(). The permission
+// prompt closing hands focus back to #micSelect, which fires the 'focus'
+// listener again — without these, a still-blank result (grant didn't stick,
+// see the anonymized-list guard above) loops into a second prompt on every
+// refocus. micPrimeInFlight blocks an overlapping call outright;
+// micPrimeAttempted blocks only the passive mousedown/focus path after one
+// automatic attempt — a faculty user who dismisses the prompt once must not
+// be nagged every time the select regains focus.
+// var, not let: STREAM_CARRY_CAP below sets the precedent for module-level
+// state a test harness needs to reach and reset between scenarios.
+var micPrimeInFlight = false;
+var micPrimeAttempted = false;
+
+// Explicit-intent mic grant + label upgrade, mirroring the camera's early
+// preview/grant path. Without this, the only mic getUserMedia lives inside
+// startRecording (via captureMic), which lands after updateToggleUI() has
+// already disabled the select — real labels arrive too late to ever show.
+// force=true (the mic toggle-ON path) only bypasses the attempted-once guard
+// below — retrying after a denied/dismissed prompt in a CAPABLE environment.
+// It does NOT bypass the anonymized verdict: once a completed grant+enumerate
+// has proven this environment can't deliver names, no path prompts again.
+// Re-detection needs no prime of its own — any capable environment clears
+// the flag on its own, either at page load (a persisted-grant environment
+// lists real names in the load-time enumerate, and the real-option rebuild
+// clears it) or at the first recording (captureMic's post-grant
+// fire-and-forget enumerate lands real options and clears it there too).
+async function primeMicLabels(force) {
+  const micSelect = document.getElementById('micSelect');
+  // Labels already upgraded (a real option exists) — no reason to re-prompt.
+  const alreadyUpgraded = Array.from(micSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+  if (alreadyUpgraded || micPrimeInFlight) return;
+  // A completed grant + enumerate already proved this environment can't
+  // deliver real mic names (file://-served Chrome can anonymize the list
+  // even post-grant — see the anonymized-list guard). Nagging for another
+  // prompt buys nothing here, regardless of which path asked — force only
+  // controls the attempted-once guard below, not this one.
+  let anonymized = false;
+  try { anonymized = localStorage.getItem('micEnumAnonymized') === '1'; } catch (e) { /* ignore */ }
+  if (anonymized) return;
+  if (!force && micPrimeAttempted) return;
+  micPrimeInFlight = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+    // Must enumerate before the tracks stop — Firefox blanks labels again
+    // once the granting stream ends, and the prior-label cache in
+    // enumerateDevices() only has something to cache while it's live.
+    await enumerateDevices();
+    // The grant succeeded — did the environment actually deliver names?
+    // Persist the verdict so the passive path stops re-prompting once we've
+    // genuinely tried and failed (enumerateDevices() also clears this on
+    // any successful real-option rebuild, from any caller).
+    const gotRealOptions = Array.from(micSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+    try {
+      if (gotRealOptions) localStorage.removeItem('micEnumAnonymized');
+      else localStorage.setItem('micEnumAnonymized', '1');
+    } catch (e) { /* ignore */ }
+    applyMicDefaultText();
+    stream.getTracks().forEach(t => t.stop());
+  } catch (err) {
+    // No user-facing error — recording start already has its own
+    // mic-failure handling. The dropdown just stays at "Default microphone".
+    console.warn('Could not prime mic labels:', err);
+  } finally {
+    micPrimeAttempted = true;
+    micPrimeInFlight = false;
   }
 }
 
@@ -930,6 +1064,17 @@ function onQualityChanged() {
 if (navigator.mediaDevices?.addEventListener) {
   navigator.mediaDevices.addEventListener('devicechange', enumerateDevices);
 }
+
+// Prime real mic labels on first interaction with the select itself too —
+// mic defaults on at load, so a user who never touches the toggle button
+// still sees real names before recording, not just after. onchange on this
+// select is wired inline in the HTML; mousedown+focus are wired here instead
+// since a pair of listeners is cleaner than stacking inline attributes.
+// Both only fire on a user gesture, so zero-prompts-at-load still holds, and
+// the select is disabled during recording, so they can't fire mid-recording.
+const micSelectEl = document.getElementById('micSelect');
+micSelectEl.addEventListener('mousedown', () => primeMicLabels());
+micSelectEl.addEventListener('focus', () => primeMicLabels());
 
 // ============================================================
 // Media capture
@@ -970,6 +1115,18 @@ async function captureMic() {
     audio: audioConstraints,
     video: false,
   });
+  // The environment may never be able to list devices at all (see the
+  // anonymized-list guard), but a granted track still exposes its own
+  // label. Capture it before the re-enumerate below runs, so a rebuild
+  // that lands no real options still tells the truth in the Default slot
+  // instead of falling back to "Default microphone".
+  const micSelect = document.getElementById('micSelect');
+  const hasRealMicOption = Array.from(micSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+  const trackLabel = stream.getAudioTracks()[0]?.label;
+  if (trackLabel && !hasRealMicOption) {
+    state.lastMicLabel = trackLabel;
+    applyMicDefaultText();
+  }
   enumerateDevices(); // mic permission is live now — upgrade labels (fire-and-forget)
   return stream;
 }

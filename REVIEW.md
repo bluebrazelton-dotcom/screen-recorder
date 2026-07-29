@@ -164,6 +164,40 @@ files. Was safe — recovery-banner backstop — just dishonest about coverage.)
 
 ---
 
+## Mic device selection (2026-07-28 – 2026-07-29)
+
+### 15. Mic dropdown never showed real names; Chrome recorded a Bluetooth headset instead of the mic — P0 — ✓ FIXED v1.14
+Found during v1.13's Chrome acceptance pass (2026-07-28): the recording saved fine,
+but picked up no voice, only interference-like sounds. Root cause was four-layered:
+no pre-recording mic grant path (the only `getUserMedia` lived inside `startRecording`
+via `captureMic`, so the v1.12 label upgrade landed exactly as `updateToggleUI()`
+disabled the select); pre-grant placeholder options carried `value=""`, colliding
+with the Default option, so selecting one never reached a deviceId constraint; an
+owner-run diagnostic (Chrome 150, file:// scheme) then found `enumerateDevices()`
+returns blank ids AND labels at every stage, including during a live granted stream
+— file:// origins never persist a `getUserMedia` grant, so an in-app device list is
+structurally impossible there and Chrome's own per-capture permission pop-up is the
+only thing that ever worked. With selection inert, Chrome fell back to a Bluetooth
+headset's hands-free profile (8–16 kHz telephony audio) — the actual source of the
+"interference"; Firefox happened to default to the real mic, which is why Firefox
+worked all along.
+
+**Fix (v1.14):** `primeMicLabels()` early grant path (toggle-ON forced, `#micSelect`
+mousedown/focus passive, all gesture-gated); blank-id placeholder options removed; an
+anonymized-re-enumeration guard extends the v1.12 "blank never overwrites good" rule
+to ids; a persistent `micEnumAnonymized` verdict stops any prime path from
+re-prompting once a completed grant+enumerate has proven the environment can't
+deliver names, self-clearing on any real-option rebuild; an honest Default-option
+placeholder (`Chosen in the browser pop-up` / `Microphone: <granted track label>`);
+`captureMic` surfaces the granted track's own label as a UI-only side effect.
+Recording pipeline untouched — enumeration/selection UI only. Real acceptance
+(owner, both browsers, 2026-07-29): Chrome — zero prompts from the dropdown/toggle
+(only the platform's own record-start prompt remains, which doubles as the mic
+picker in this environment), correct "Microphone: <device>" label shown, real voice
+on playback; Firefox — full dropdown works, no regressions.
+
+---
+
 ## Feature map vs. the research-derived plan
 
 **Tier 1 (~70% done):** DONE — screen+webcam+mic, PiP (drag/resize/shape — exceeds

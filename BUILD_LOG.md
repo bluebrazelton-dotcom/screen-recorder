@@ -820,14 +820,114 @@ RECORDING path, unrelated to saving; `concatenateWebM`, the buffered oracle;
 and `makeSeekable`, now reachable only from `saveFile`'s Blob branch, which no
 app save flow passes into anymore).
 
-**Real acceptance (Phase 3, both browsers) — PENDING:** a long Continue
-Recording chain (≥ 2 crashes, ≥ 30 min total, Best quality, Task Manager
-open — memory should stay roughly flat through the stitch, not just the
-single-segment save); output must seek correctly across every stitch point
-and stay in sync past the seams; a deliberate zero-cluster or truncated
-final-segment chain should surface the in-app fallback banner, not a
-JavaScript error; then a short sanity clip. Not yet run against a real
-browser — this entry covers the harness-verified implementation only.
+**Real acceptance (Phase 3, 2026-07-28):** Firefox (the primary browser) —
+full pass, owner-verified. Chrome — the stitch/save flow worked, but
+acceptance surfaced a microphone-capture problem: the recording picked up no
+voice, only interference-like sounds. That is a capture-side issue (this
+version touched no recording-pipeline code — mic capture is upstream of
+everything v1.13 changed) and is tracked as open queue item 1 in
+`NEXT_SESSION.md` / the next REVIEW pass. Left for a dedicated diagnosis
+session: device-selection suspects first (wrong input device, v1.12
+lazy-permission enumeration, OS default/communications split), environmental
+causes second.
+
+---
+
+### v1.14 — Mic device selection overhaul: early grant path, anonymized-list guard, graceful degradation (2026-07-29)
+
+**Commit:** `mic device selection overhaul: early grant path, anonymized-list guard, graceful degradation for permission-less environments`
+
+Closes NEXT_SESSION.md open queue item 1 (found during v1.13 acceptance, diagnosed
+2026-07-28). Enumeration/selection UI only — the recording pipeline (`captureScreen`,
+`MediaRecorder`, chunk store, save flows) is untouched.
+
+**Root causes (four, layered — each one masked the next):**
+
+1. **No pre-recording grant path.** The only mic `getUserMedia` call lived inside
+   `startRecording()` via `captureMic()`. Its v1.12 post-grant re-enumerate landed
+   exactly as `updateToggleUI()` disabled the select for recording — too late to ever
+   be seen. Camera didn't have this problem; the Webcam toggle's preview path already
+   grants early.
+2. **Pre-grant placeholder options carried `value=""`.** Blank pre-grant deviceIds
+   became options with `value=""`, colliding with the Default option's own value.
+   Picking one was a no-op — `state.selectedMic` stayed falsy, so no deviceId
+   constraint ever reached `getUserMedia`.
+3. **Owner-run diagnostic (Chrome 150, file:// scheme, 2026-07-28):** even after (1)
+   and (2) were fixed, `enumerateDevices()` kept returning a blank id AND a blank
+   label at every stage — pre-grant, DURING a live granted stream, after the stream
+   stopped, and on a second grant. An in-app device list is structurally impossible
+   in this environment: file:// origins never persist a `getUserMedia` grant, so
+   Chrome's own per-capture permission pop-up — which doubles as its own device
+   picker — is the only thing that ever worked, and it re-prompts on every single
+   `getUserMedia` call.
+4. **The original "interference" symptom, finally explained.** With selection inert,
+   Chrome fell back to a Bluetooth headset's hands-free profile ("Headset (T9
+   Hands-Free AG Audio) (Bluetooth)") — 8–16 kHz telephony-band audio, which is what
+   "interference" actually was. Firefox happened to default to the real mic, which is
+   why Firefox "worked" all along.
+
+**What was built:**
+
+1. **`primeMicLabels()` — an early mic grant path**, mirroring the camera's early
+   preview/grant. Wired to the mic toggle turning ON (forced) and to `#micSelect`'s
+   own `mousedown`/`focus` (passive) — both are user gestures, so the
+   zero-prompts-at-load guarantee holds even though mic defaults on in
+   `state.sources`. Guarded against re-entrancy (`micPrimeInFlight`) and, on the
+   passive path, against nagging after one attempt this session
+   (`micPrimeAttempted`).
+2. **Blank-id placeholder options removed.** `enumerateDevices()` filters out any
+   device with `deviceId === ''` before building options — pre-grant, both
+   dropdowns are just their Default option; no more `value=""` collision.
+3. **Anonymized-re-enumeration guard.** If a re-enumerate for a kind returns entries
+   but every one has a blank id (permission lapsed, not a real unplug) and that
+   dropdown already holds a granted list, the rebuild is skipped — the v1.12 "a
+   blank label never overwrites a known-good one" guarantee, extended to ids. A
+   genuinely empty list (no entries of that kind at all) still rebuilds to
+   Default-only, same as before.
+4. **Persistent `micEnumAnonymized` verdict (`localStorage`).** Once a completed
+   grant + enumerate proves the environment can't deliver real names, no prime path
+   — passive or forced — prompts again; a click that can only ever repeat the same
+   failed pop-up is nagging, not a working control. The verdict self-clears the
+   moment any real-option rebuild happens, with no dedicated re-check needed: a
+   capable environment shows real names in its own load-time enumerate, or
+   `captureMic`'s post-grant fire-and-forget re-enumerate lands them at the first
+   recording.
+5. **`applyMicDefaultText()`** keeps the Default option honest whenever there are no
+   real options: `Microphone: <granted track's own label>` once a track has
+   actually been granted, else `Chosen in the browser pop-up` once the anonymized
+   verdict is set, else the original `Default microphone`. Never touches a working
+   dropdown — no-ops the moment real options exist.
+6. **`captureMic()` surfaces the granted track's own `.label`** — a UI-only side
+   effect added after the stream is obtained; constraints, error paths, and the
+   returned stream are untouched. This is what makes "Microphone: Headset (…)
+   (Bluetooth)" or "Microphone: USB Mic" visible during an anonymized-environment
+   recording, and it survives a later anonymized re-enumeration (e.g. `devicechange`
+   right after the recording stops).
+
+**Verification:** harness now 67 scenarios / 392 assertions (new AY–BK). Covers:
+pre-grant enumeration yields Default-only in both dropdowns (no fake placeholders); a
+real device list populates real options and feeds the deviceId constraint through to
+`getUserMedia`; `primeMicLabels` grants, enumerates while the stream is still live
+(before stopping the tracks — Firefox blanks labels once the granting stream ends),
+and is a no-op once real options exist; overlapping prime calls make exactly one
+`getUserMedia` call; a failed grant doesn't loop-reprompt on the passive path but a
+forced (toggle) retry still works — unless the anonymized verdict is set, in which
+case NEITHER path prompts and only a real-option rebuild (via
+`enumerateDevices`/`captureMic`) clears it; an anonymized re-enumeration preserves a
+granted list and its current selection while a genuinely different real list, or a
+genuine removal, still rebuilds normally; `applyMicDefaultText` shows the right
+placeholder in each state and never touches a working dropdown. `localStorage` mock
+upgraded from a no-op stub to a real in-memory store (needed to test the persisted
+verdict); element mocks gained `addEventListener` capture (for the mousedown/focus
+wiring) and separate Default-option tracking (so `querySelector('option[value=""]')`
+works without changing what `querySelectorAll('option[value]')` counts as a real
+option — several existing scenarios depend on that count staying placeholder-free).
+
+**Real acceptance (owner, both browsers, 2026-07-29):** Chrome (file:// scheme) —
+zero prompts from the dropdown or the mic toggle; only the platform's own
+record-start permission pop-up remains, and it doubles as the mic picker in this
+environment; "Microphone: \<device\>" shown correctly during recording; real voice on
+playback. Firefox — full named dropdown works end to end, no regressions.
 
 ---
 
@@ -851,6 +951,15 @@ browser — this entry covers the harness-verified implementation only.
 8. **Firefox private windows:** IndexedDB is in-memory in private browsing, so crash
    recovery does not survive a private-window crash. Record in a normal window.
 
+9. **file://-served Chrome cannot list mic devices in-app:** confirmed on Chrome 150
+   (2026-07-28) — `enumerateDevices()` returns blank ids and blank labels at every
+   stage because file:// origins never persist a `getUserMedia` grant. Chrome's own
+   per-capture permission pop-up (which also serves as its device picker) reappears
+   once per recording; this is unavoidable and, as of v1.14, by design once
+   `micEnumAnonymized` is set — DidaRec's own UI stops re-prompting once it's proven
+   the environment can't deliver names. Serving the app over `http://localhost` (or
+   any http(s) origin) restores persisted grants and the full named dropdown.
+
 ---
 
 ## Future features (roadmap)
@@ -869,12 +978,12 @@ browser — this entry covers the harness-verified implementation only.
 
 ```
 screen-recorder/
-├── index.html      # The entire app (HTML + CSS + JS, ~3300 lines)
+├── index.html      # The entire app (HTML + CSS + JS, ~3700 lines)
 ├── README.md       # Project description and usage
 ├── LICENSE         # MIT License
 ├── BUILD_LOG.md    # This file
 ├── REVIEW.md       # Fable 5 code review — tracked items + build queue
-└── test.cjs        # Node harness (40 scenarios / 200 assertions; npm i fake-indexeddb)
+└── test.cjs        # Node harness (67 scenarios / 392 assertions; npm i fake-indexeddb)
 ```
 
 ---
