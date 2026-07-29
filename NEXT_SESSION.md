@@ -1,12 +1,11 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-07-29 (post-v1.14, pending commit). An Aegis session also has
+Close-out snapshot, 2026-07-29 (post-v1.14). An Aegis session also has
 the fuller `project_screen_recorder.md` project memory — read that too if available.
 
 ## Where things stand
 
-- **v1.14 is done, pending commit.** This session ran in a sandboxed scratch copy of
-  the repo (see Gotchas below) — the owner commits from a normal shell. v1.14 is the
+- **v1.14 is committed and pushed (`4cfdf4c`).** v1.14 is the
   mic device selection overhaul that fixes the interference/no-voice bug found during
   v1.13's Chrome acceptance: an early `primeMicLabels()` grant path (gesture-gated,
   so zero-prompts-at-load still holds), blank-id placeholder options removed, an
@@ -80,7 +79,32 @@ working page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when don
 
 ## Open queue (priority order)
 
-1. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
+1. **v1.14 follow-ups: camera-side honest labels + mic toggle default OFF**
+   (owner-requested at v1.14 close-out, 2026-07-29). Both are
+   enumeration/selection/UI only — recording pipeline untouched:
+   - **Chrome never shows the webcam's name in the camera dropdown, even when the
+     webcam is on and granted.** Same anonymized file:// environment as the mic
+     (see Permanent platform knowledge): the camera dropdown can only ever hold
+     "Default camera" there. v1.14 built the honest-label machinery for the mic
+     only — `applyMicDefaultText()`, `state.lastMicLabel`, `captureMic` surfacing
+     the granted track's `.label`, the `micEnumAnonymized` verdict. Extend it to
+     the camera: surface the granted video track's own label ("Camera: <label>")
+     in the Default slot, generalizing the helper rather than duplicating it, and
+     decide whether the camera shares the mic's verdict flag or gets its own
+     (mic and camera are granted separately, so probably its own). No priming
+     work needed — the camera already grants early via the Webcam toggle's
+     preview path (`startCameraPreview` → `captureCamera`).
+   - **Mic toggle should default OFF at load, matching the webcam.** Touch
+     points: `state.sources.mic` init; the two comments that say "mic defaults
+     on" (the `toggleSource` priming hook and the `primeMicLabels` block); the
+     mic select's disabled state while the toggle is off in `updateToggleUI`;
+     the at-least-one-source guard on the record button; any harness scenarios
+     that assume mic-on defaults. Zero-prompts-at-load must keep holding (it
+     gets easier — toggle-ON becomes the natural first mic gesture), and the
+     v1.14 verdict behavior must be unchanged.
+   Acceptance as always: harness green throughout; real-browser pass in BOTH
+   browsers (only a browser proves audio/labels).
+2. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
    Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT), chapter-
    marker hotkeys, sidecar export convention. The caption editor deserves its own
    brief and likely multiple sessions.
