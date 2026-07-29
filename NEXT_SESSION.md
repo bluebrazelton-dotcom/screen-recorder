@@ -1,72 +1,80 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-07-29 (post-v1.14). An Aegis session also has
+Close-out snapshot, 2026-07-29 (post-v1.16). An Aegis session also has
 the fuller `project_screen_recorder.md` project memory — read that too if available.
 
 ## Where things stand
 
-- **v1.14 is committed and pushed (`4cfdf4c`).** v1.14 is the
-  mic device selection overhaul that fixes the interference/no-voice bug found during
-  v1.13's Chrome acceptance: an early `primeMicLabels()` grant path (gesture-gated,
-  so zero-prompts-at-load still holds), blank-id placeholder options removed, an
-  anonymized-re-enumeration guard, a persistent `micEnumAnonymized` verdict so DidaRec
-  stops re-prompting once an environment has proven it can't deliver names, an honest
-  Default-option placeholder, and `captureMic` surfacing the granted track's own
-  label. Full write-up in `BUILD_LOG.md`; closes REVIEW.md #15 and this file's old
-  queue item 1.
-- v1.13 (streaming multi-segment stitch) is committed and pushed (`20b3ea8`) and
-  unaffected by this session — v1.14 touched enumeration/selection UI only, never the
-  recording or save pipeline.
-- Harness: 67 scenarios / 392 assertions (new AY–BK this session). `node test.cjs`
-  prints the assertion total, not a scenario count — see Gotchas.
-- Real acceptance (owner, both browsers, 2026-07-29): **Chrome** — zero prompts from
-  the mic dropdown or toggle; only the platform's own record-start permission pop-up
-  remains (it doubles as the mic picker in file:// Chrome); "Microphone: <device>"
-  shown correctly during recording; real voice on playback. **Firefox** — full named
-  dropdown works end to end, no regressions.
+- **v1.15 and v1.16 are owner-accepted (both browsers, 2026-07-29) but may not be
+  committed yet** — check `git status` first; if dirty, the suggested commit
+  messages are in their BUILD_LOG entries. v1.14 (`4cfdf4c`) was the last push.
+- **v1.15** — camera-side honest labels + mic toggle defaults OFF. The v1.14 mic
+  machinery generalized: shared `applyDeviceDefaultText(type)`, camera surfaces
+  the granted video track's own label ("Camera: <label>") via
+  `state.lastCameraLabel`, separate `camEnumAnonymized` verdict set/cleared in
+  `captureCamera` (which now awaits its internal enumerate). Mic defaults OFF at
+  load, matching the webcam. Closes REVIEW.md #16.
+- **v1.16** — the mic hold. Toggle-ON acquires AND HOLDS the mic stream
+  (`acquireMicHold` / `state.heldMicStream` / `state.heldMicDeviceId`), mirroring
+  the webcam preview; `captureMic` reuses the live, selection-matching hold at
+  record with ZERO getUserMedia calls, so Record starts instantly and prompt-free
+  — the permission pop-up moved to toggle-ON, where in file:// Chrome it doubles
+  as the device picker. Recording stop preserves the hold while the toggle is on
+  (`releaseMicRecordingRef`, which also promotes a mid-recording fallback stream
+  into the new hold); denial reverts the toggle with failure-matched copy;
+  `primeMicLabels` and the passive prime are GONE; `micEnumAnonymized` now
+  governs only the dropdown's Default-slot text. Mic goes hot at toggle-ON
+  (browser indicator pre-recording) — by design, matches the camera. Closes
+  REVIEW.md #17.
+- Harness: 86 scenarios / 472 assertions (v1.15 added BL–BR, v1.16 added BS–CD
+  and deliberately rewrote ten v1.14-era scenarios that encoded prime-then-stop).
+  `node test.cjs` prints the assertion total, not a scenario count — see Gotchas.
+- Recording pipeline (~1s-max-loss guarantee) and v1.11/v1.13 streamed save
+  flows untouched by both versions; v1.16's closest approach is
+  `releaseMicRecordingRef` in `cleanupStreams`, which is stream teardown only.
 - Standing preference (in Aegis memory too): run DidaRec work as orchestrator +
   Sonnet 5 subagents (`Agent` tool, `model: "sonnet"`) — Fable plans/reviews/
-  presents, Sonnet drafts/explores/runs tests in a scratch copy. The File Edit
-  Rule still applies at the orchestrator level. This session ran exactly that way,
-  iteratively: an initial fix, then two owner field reports (a re-prompt loop, then a
-  lingering nag even after the environment had already been proven incapable) each
-  drove one more correction pass in the same scratch copy before acceptance passed.
-- Standing lesson from 07-23 (three bugs caught ONLY in a real browser), reconfirmed
-  07-28/07-29: the harness proves logic; only a browser proves pixels — and now, only
-  a browser proves audio, and only the owner's actual machine proves what a specific
-  permission environment (file://, a specific Chrome build, a specific Bluetooth
-  headset) actually does. This session's real root cause needed an owner-run
-  diagnostic the harness could never have produced by itself. Never skip the browser
-  pass.
+  presents, Sonnet drafts/explores/tests in a scratch copy. The File Edit Rule
+  still applies at the orchestrator level. This session ran that way for both
+  versions; orchestrator review caught two real defects in the v1.16 draft (a
+  stale-selection race around the grant `await`, and permission-blaming copy on
+  device failures) — the review pass earns its keep.
 
-## Permanent platform knowledge (not a bug — read before touching mic code again)
+## Permanent platform knowledge (read before touching mic/camera/save code)
 
-- **file://-served Chrome cannot list mic devices in-app, ever.** Confirmed Chrome
-  150, 2026-07-28: `enumerateDevices()` returns a blank deviceId AND a blank label at
-  every stage — pre-grant, during a live granted stream, after the stream stops, and
-  on a second grant. This is because file:// origins never persist a `getUserMedia`
-  grant. Chrome's own per-capture permission pop-up is the only working device
-  picker in this environment, and it reappears once per recording by design — that
-  is expected platform behavior, not a regression to chase. `micEnumAnonymized` in
-  `localStorage` (set by v1.14) records the verdict so DidaRec's own UI stops
-  re-prompting once this is proven. Serving the app over `http://localhost` (or any
-  http(s) origin) restores persisted grants and the full named in-app dropdown.
-- **The original "interference" was a Bluetooth headset's hands-free profile.** With
-  mic selection inert (the pre-v1.14 bug), Chrome fell back to `Headset (T9
-  Hands-Free AG Audio) (Bluetooth)` — 8–16 kHz telephony-band audio, which is what
-  sounded like "interference." Firefox happened to default to the real mic, which is
-  why Firefox "worked" throughout v1.9–v1.13. If a future session hears
-  "interference" or "no voice" again, check which physical device is actually
-  granted before assuming a new capture regression.
+- **file://-served Chrome cannot list mic OR camera device names in-app, ever.**
+  Confirmed Chrome 150, 2026-07-28: `enumerateDevices()` returns blank deviceId
+  AND label at every stage, even during a live granted stream — file:// origins
+  never persist a `getUserMedia` grant. The per-kind verdict flags
+  (`micEnumAnonymized`, `camEnumAnonymized` in localStorage) record this so the
+  dropdowns explain themselves; since v1.16 they gate NO prompting behavior,
+  only the Default-slot text. The granted track's own `.label` still works and
+  is surfaced ("Microphone: <device>" / "Camera: <device>"). Serving over
+  http(s) restores persisted grants and full named dropdowns.
+- **file:// Chrome NOW EXPOSES `showSaveFilePicker` (owner console check
+  2026-07-29; earlier builds lacked FSA on file://).** Saves in Chrome therefore
+  take the FSA picker path — write confirmed by the API, `'saved'` result — and
+  the gray `#downloadConfirm` bar does NOT appear, by design; that bar only
+  backs the unverifiable anchor-download path (still Firefox's route). This was
+  reported as a missing banner during v1.16 acceptance and diagnosed as a Chrome
+  auto-update, not an app change (differential harness repro showed v1.15/v1.16
+  byte-identical through the whole stop-and-save flow). Don't chase a missing
+  Chrome save-bar as a regression — check `'showSaveFilePicker' in window` first.
+  Corollary: Chrome's per-recording record-start pop-ups are also gone now —
+  the toggle-ON grant is held and reused across recordings (v1.16).
+- **A Bluetooth headset's hands-free profile masquerades as "interference."**
+  8–16 kHz telephony-band audio from `Headset (… Hands-Free AG Audio)` was the
+  original v1.13-era "interference/no-voice" bug. If it's ever heard again,
+  check which physical device the granted track's label names before assuming a
+  capture regression.
 
 ## Read first
 
-- `BUILD_LOG.md` — architecture + full version history (through v1.14).
-- `REVIEW.md` — the build queue and what's fixed.
-- `test.cjs` — Node harness (67 scenarios / 392 assertions). `npm i fake-indexeddb`
+- `BUILD_LOG.md` — architecture + full version history (through v1.16, including
+  the FSA field note).
+- `REVIEW.md` — the build queue and what's fixed (through #17).
+- `test.cjs` — Node harness (86 scenarios / 472 assertions). `npm i fake-indexeddb`
   then `node test.cjs`. Extend it; don't bypass it.
-- `STREAMING_STITCH_HANDOFF.md` / `STREAMING_SAVE_HANDOFF.md` — how the v1.11/v1.13
-  passes were run (untracked working docs; predate the mic work).
 
 ## Ground rules (unchanged)
 
@@ -79,45 +87,26 @@ working page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when don
 
 ## Open queue (priority order)
 
-1. **v1.14 follow-ups: camera-side honest labels + mic toggle default OFF**
-   (owner-requested at v1.14 close-out, 2026-07-29). Both are
-   enumeration/selection/UI only — recording pipeline untouched:
-   - **Chrome never shows the webcam's name in the camera dropdown, even when the
-     webcam is on and granted.** Same anonymized file:// environment as the mic
-     (see Permanent platform knowledge): the camera dropdown can only ever hold
-     "Default camera" there. v1.14 built the honest-label machinery for the mic
-     only — `applyMicDefaultText()`, `state.lastMicLabel`, `captureMic` surfacing
-     the granted track's `.label`, the `micEnumAnonymized` verdict. Extend it to
-     the camera: surface the granted video track's own label ("Camera: <label>")
-     in the Default slot, generalizing the helper rather than duplicating it, and
-     decide whether the camera shares the mic's verdict flag or gets its own
-     (mic and camera are granted separately, so probably its own). No priming
-     work needed — the camera already grants early via the Webcam toggle's
-     preview path (`startCameraPreview` → `captureCamera`).
-   - **Mic toggle should default OFF at load, matching the webcam.** Touch
-     points: `state.sources.mic` init; the two comments that say "mic defaults
-     on" (the `toggleSource` priming hook and the `primeMicLabels` block); the
-     mic select's disabled state while the toggle is off in `updateToggleUI`;
-     the at-least-one-source guard on the record button; any harness scenarios
-     that assume mic-on defaults. Zero-prompts-at-load must keep holding (it
-     gets easier — toggle-ON becomes the natural first mic gesture), and the
-     v1.14 verdict behavior must be unchanged.
-   Acceptance as always: harness green throughout; real-browser pass in BOTH
-   browsers (only a browser proves audio/labels).
-2. Tier 1: caption editor with VTT/SRT import/export (highest-value open item — ADA
-   Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT), chapter-
-   marker hotkeys, sidecar export convention. The caption editor deserves its own
-   brief and likely multiple sessions.
+1. **Tier 1: caption editor with VTT/SRT import/export** (highest-value open item —
+   ADA Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT).
+   Deserves its own brief and likely multiple sessions.
+2. Chapter-marker hotkeys, sidecar export convention (Tier 1 remainder).
 
 ## Gotchas (learned the hard way)
 
 - Don't run index-touching git (`status`/`add`/`commit`) from a restricted sandbox —
   stale `.git/index.lock` blocks later git; read-only checks there, real git in a
-  normal shell. (Blue's machine once had a stale `.git/HEAD.lock` from an interrupted
-  git — same cure: `rm` it.)
+  normal shell. (Blue's machine once had a stale `.git/HEAD.lock` from an
+  interrupted git — same cure: `rm` it.)
 - Staging can serve a stale copy — confirm with a fresh shell read.
 - `.gitignore` covers `node_modules/`, `_to_delete/`, `*.webm`, `*_HANDOFF.md`,
   `*_completion_report.md`.
-- Scenario-count bookkeeping drifts (earlier docs said "37 scenarios" when there
-  were 46 labels) — the assertion total from `node test.cjs` is ground truth;
-  count `await scenario(` calls if you need the scenario number.
+- Scenario-count bookkeeping drifts — the assertion total from `node test.cjs` is
+  ground truth; count `await scenario(` calls if you need the scenario number.
+- The harness proves logic; only a browser proves pixels/audio/permissions — and
+  (new this session) the owner's environment can change UNDER you: a Chrome
+  auto-update flipped save-path behavior mid-project. When "it changed and we
+  didn't touch it," a differential harness repro (same flow, both versions) plus
+  a one-line owner console check settles it cheaply. `repro_banner.cjs` in this
+  session's scratch was the pattern: 2×2 (version × save-mode) over the exact
+  reported flow.

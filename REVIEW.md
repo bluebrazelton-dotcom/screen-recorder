@@ -196,6 +196,53 @@ Recording pipeline untouched — enumeration/selection UI only. Real acceptance
 picker in this environment), correct "Microphone: <device>" label shown, real voice
 on playback; Firefox — full dropdown works, no regressions.
 
+## v1.14 follow-ups (2026-07-29)
+
+### 16. Camera dropdown never shows the webcam's name in file:// Chrome; mic toggle defaulted on — P2 — ✓ FIXED v1.15 (owner-accepted 2026-07-29)
+Owner-requested at v1.14 close-out. Same anonymized file:// environment as the mic:
+the camera dropdown could only ever hold "Default camera" there, even with the
+webcam on and granted, because v1.14 built the honest-label machinery for the mic
+only. And the mic toggle defaulting ON no longer matched the webcam's OFF default.
+
+**Fix (v1.15):** `applyMicDefaultText` generalized into a shared
+`applyDeviceDefaultText(type)`; `captureCamera` surfaces the granted video track's
+own label (`Camera: <label>`) via `state.lastCameraLabel`; a separate persistent
+`camEnumAnonymized` verdict (mic and camera are granted separately), set/cleared in
+`captureCamera` itself — no priming needed, the Webcam toggle's preview path already
+grants early. Mic toggle now defaults OFF at load; toggle-ON is the natural first
+priming gesture, zero-prompts-at-load still holds, v1.14 verdict behavior unchanged.
+Recording pipeline untouched. Harness 74 scenarios / 416 assertions (new BL–BR).
+Owner-accepted 2026-07-29, both browsers, combined with v1.16.
+
+## Record-time mic prompt (2026-07-29)
+
+### 17. Mic permission pop-up fired at the Record click, stalling the start of every recording — P1 — ✓ FIXED v1.16 (owner-accepted 2026-07-29)
+Owner-reported during the v1.15 browser pass. The mic was only ever acquired
+inside `startRecording` → `captureMic`, so in environments without persisted
+grants (file:// Chrome always; Firefox without a remembered grant) the pop-up
+fired at the Record click — recording doesn't begin until the grant resolves, so
+a user who starts talking immediately loses their opening words to the pop-up.
+
+**Fix (v1.16):** the mic mirrors the webcam's preview-hold pattern. Toggle-ON
+acquires and HOLDS the stream (`acquireMicHold`/`state.heldMicStream`) — the
+prompt moves to setup time, where in file:// Chrome it doubles as the device
+picker; `captureMic` reuses the live, selection-matching hold at record with
+zero getUserMedia calls, falling back to fresh acquire for dead tracks or a
+changed selection; recording stop preserves the hold while the toggle stays on
+(`releaseMicRecordingRef`, which also promotes a mid-recording fallback stream
+into the new hold); denied/failed grants revert the toggle with copy matched to
+the actual failure; `primeMicLabels` and the passive prime are removed, and
+`micEnumAnonymized` now governs only the dropdown's honest text. Orchestrator
+review caught and fixed a stale-selection race (hold's device id is snapshotted
+before the grant `await`) and permission-blaming copy on device failures.
+Recording pipeline untouched. Harness 86 scenarios / 472 assertions (new BS–CD;
+ten v1.14-era scenarios deliberately rewritten for the new design). Mic now goes
+hot at toggle-ON (browser indicator shows pre-recording), matching the camera.
+Owner-accepted 2026-07-29, both browsers. During acceptance the owner reported
+Chrome's gray download-confirm bar missing after Stop & save — resolved as
+platform, not app: their Chrome now exposes FSA on file:// (see BUILD_LOG v1.16
+field note), so saves take the verified picker path that never needed the bar.
+
 ---
 
 ## Feature map vs. the research-derived plan

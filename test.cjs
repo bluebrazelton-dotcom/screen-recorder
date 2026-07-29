@@ -41,7 +41,7 @@ function makeEl(id) {
   const cls = new Set();
   const children = [];
   const _handlers = {};
-  let defaultOpt = null; // the single <option value="...">text</option> baked into an innerHTML reset — tracked separately from `children` (see innerHTML setter) so querySelectorAll('option[value]')'s count keeps meaning "real, appended options" for every existing scenario, while applyMicDefaultText() can still find and retext it.
+  let defaultOpt = null; // the single <option value="...">text</option> baked into an innerHTML reset — tracked separately from `children` (see innerHTML setter) so querySelectorAll('option[value]')'s count keeps meaning "real, appended options" for every existing scenario, while applyDeviceDefaultText() can still find and retext it.
   return {
     id, style: {}, _cls: cls, _handlers,
     classList: {
@@ -179,6 +179,11 @@ vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app_new.js' });
 const api = sandbox.__api;
 const state = api.state;
+// Snapshot state.sources' true script-load default before any scenario gets
+// a chance to mutate the (shared, never-reset-by-resetState) live object —
+// scenarios below freely reassign state.sources, so reading it later would
+// only prove what the last scenario left behind, not what index.html ships.
+const INITIAL_SOURCES_MIC = state.sources.mic;
 const ORIG = {
   addChunk: sandbox.addChunk, concatenateWebM: sandbox.concatenateWebM,
   getUserMedia: sandbox.navigator.mediaDevices.getUserMedia,
@@ -239,13 +244,13 @@ function pickerSequence(outcomes) {
 }
 async function resetState() {
   await resetDB();
-  Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, cameraStream: null, micStream: null, audioContext: null, compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [], lastMicLabel: null });
+  Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, cameraStream: null, micStream: null, heldMicStream: null, heldMicDeviceId: null, audioContext: null, compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [], lastMicLabel: null, lastCameraLabel: null });
   windowMock._recoverySessions = null; windowMock._recoverySessionId = null; windowMock._recoveryMimeType = null;
   delete windowMock.showSaveFilePicker;   // absent = Firefox mode; FSA scenarios set their own picker
   sandbox.addChunk = ORIG.addChunk; sandbox.concatenateWebM = ORIG.concatenateWebM;
   sandbox.navigator.mediaDevices.getUserMedia = ORIG.getUserMedia;
   sandbox.navigator.mediaDevices.enumerateDevices = ORIG.mdEnumerateDevices;
-  sandbox.micPrimeInFlight = false; sandbox.micPrimeAttempted = false;
+  sandbox.micHoldInFlight = false;
   sandbox.downloadPendingIds = [];
   sandbox.downloadPendingFiles = 0;
   sandbox.stitchFallbackSegments = null;
@@ -1696,16 +1701,17 @@ async function scenario(name, fn) {
     assert(call.audio && call.audio.deviceId && call.audio.deviceId.exact === 'mic1', 'the selected deviceId reaches the getUserMedia constraint (got: ' + JSON.stringify(call.audio) + ')');
   });
 
-  await scenario('BA primeMicLabels grants, enumerates while the stream is still live, then stops tracks', async () => {
+  await scenario('BA acquireMicHold grants, enumerates while the stream is still live, and does NOT stop the tracks (the hold)', async () => {
     // DOM element mocks persist across scenarios — start from a clean,
-    // not-yet-upgraded dropdown so the guard doesn't short-circuit on a
-    // real option left over from an earlier scenario.
+    // not-yet-upgraded dropdown so nothing here depends on state left by an
+    // earlier scenario.
     mockDevices = [];
     await sandbox.enumerateDevices();
     await drain();
+    state.sources.mic = true; // acquireMicHold bails without holding if the toggle isn't on
 
     const order = [];
-    const track = { kind: 'audio', stop() { order.push('stop'); } };
+    const track = { kind: 'audio', readyState: 'live', stop() { order.push('stop'); } };
     sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
       getUserMediaCalls.push(c);
       order.push('getUserMedia');
@@ -1714,29 +1720,34 @@ async function scenario(name, fn) {
     sandbox.navigator.mediaDevices.enumerateDevices = async () => { order.push('enumerate'); return mockDevices; };
     mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
 
-    await sandbox.primeMicLabels();
+    await sandbox.acquireMicHold();
 
     assert(getUserMediaCalls.length === 1, 'getUserMedia called once (got ' + getUserMediaCalls.length + ')');
-    assert(getUserMediaCalls[0].audio === true && getUserMediaCalls[0].video === false, 'audio-only grant (got: ' + JSON.stringify(getUserMediaCalls[0]) + ')');
-    assert(order.join(',') === 'getUserMedia,enumerate,stop', 'enumerate runs while the stream is live, before the tracks stop (got: ' + order.join(',') + ')');
+    assert(getUserMediaCalls[0].audio && getUserMediaCalls[0].audio.echoCancellation === true && getUserMediaCalls[0].video === false, 'full recording-quality audio constraints, not a bare audio:true probe (got: ' + JSON.stringify(getUserMediaCalls[0]) + ')');
+    assert(order.join(',') === 'getUserMedia,enumerate', 'enumerate runs while the stream is live, and the tracks are never stopped (got: ' + order.join(',') + ')');
 
     const micOpt = documentMock.getElementById('micSelect').querySelector('option[value="mic1"]');
-    assert(micOpt && micOpt.textContent === 'USB Mic', 'real label landed via the primed enumerate (got: ' + (micOpt && micOpt.textContent) + ')');
+    assert(micOpt && micOpt.textContent === 'USB Mic', 'real label landed via the hold\'s enumerate (got: ' + (micOpt && micOpt.textContent) + ')');
+    assert(state.heldMicStream && state.heldMicStream.getAudioTracks()[0] === track, 'the granted stream is held in state.heldMicStream');
+    assert(state.heldMicDeviceId === state.selectedMic, 'heldMicDeviceId records the selection the hold was acquired under');
   });
 
-  await scenario('BB primeMicLabels is a no-op once real mic options already exist', async () => {
+  await scenario('BB acquireMicHold always re-acquires on toggle-ON, even when real mic options already exist (it holds a STREAM now, not just labels)', async () => {
     mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
     await sandbox.enumerateDevices();
     await drain();
+    state.sources.mic = true;
 
-    await sandbox.primeMicLabels();
-    assert(getUserMediaCalls.length === 0, 'guard skips getUserMedia when labels are already upgraded (got ' + getUserMediaCalls.length + ')');
+    await sandbox.acquireMicHold();
+    assert(getUserMediaCalls.length === 1, 'v1.14\'s "labels already upgraded, skip" guard is gone — the toggle needs a live stream to hold, not just names (got ' + getUserMediaCalls.length + ')');
+    assert(state.heldMicStream !== null, 'a hold was acquired');
   });
 
-  await scenario('BC primeMicLabels failure path leaves the dropdown intact and throws nothing', async () => {
-    mockDevices = []; // reset to placeholder-only state so the guard doesn't short-circuit
+  await scenario('BC acquireMicHold failure path reverts the toggle and shows a friendly error, without throwing', async () => {
+    mockDevices = []; // reset to placeholder-only state
     await sandbox.enumerateDevices();
     await drain();
+    state.sources.mic = true;
 
     sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
       getUserMediaCalls.push(c);
@@ -1744,42 +1755,41 @@ async function scenario(name, fn) {
     };
 
     let threw = false;
-    try { await sandbox.primeMicLabels(); } catch (e) { threw = true; }
+    try { await sandbox.acquireMicHold(); } catch (e) { threw = true; }
 
-    assert(!threw, 'primeMicLabels swallows the rejection (no throw)');
+    assert(!threw, 'acquireMicHold swallows the rejection (no throw)');
     assert(getUserMediaCalls.length === 1, 'getUserMedia was attempted (got ' + getUserMediaCalls.length + ')');
+    assert(state.sources.mic === false, 'the toggle is reverted to off after a denied grant (got ' + state.sources.mic + ')');
+    assert(state.heldMicStream === null, 'no hold exists after a denied grant');
+    assert(recordedErrors.some(m => /declined|denied/i.test(m) && /toggle/i.test(m)), 'a friendly message tells the user to toggle the mic on again (got: ' + JSON.stringify(recordedErrors) + ')');
     const micSelect = documentMock.getElementById('micSelect');
     assert(micSelect.innerHTML === '<option value="">Default microphone</option>', 'dropdown still just Default microphone after a failed grant (got: ' + micSelect.innerHTML + ')');
-    assert(micSelect.querySelectorAll('option[value]').length === 0, 'no options were fabricated on failure');
   });
 
-  await scenario('BD interacting with #micSelect itself primes mic labels, and is a no-op once already upgraded', async () => {
+  await scenario('BD the passive mousedown/focus mic-select prime is gone in v1.16 — those events no longer touch getUserMedia at all', async () => {
     mockDevices = []; // clean, not-yet-upgraded state
     await sandbox.enumerateDevices();
     await drain();
-
+    // Toggle stays off (default) — mirrors reality, since #micSelect is only
+    // enabled while the toggle is on (see updateToggleUI), and by then
+    // acquireMicHold has already run via the toggle-ON click itself.
     mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
     dispatchEl('micSelect', 'mousedown');
-    await drain();
-
-    assert(getUserMediaCalls.length === 1, 'mousedown on #micSelect triggers primeMicLabels\' getUserMedia (got ' + getUserMediaCalls.length + ')');
-    const micOpt = documentMock.getElementById('micSelect').querySelector('option[value="mic1"]');
-    assert(micOpt && micOpt.textContent === 'USB Mic', 'real label landed via the mousedown-triggered prime (got: ' + (micOpt && micOpt.textContent) + ')');
-
-    // Labels are upgraded now — a later focus event must not re-prompt.
     dispatchEl('micSelect', 'focus');
     await drain();
-    assert(getUserMediaCalls.length === 1, 'focus after labels are upgraded does not re-trigger getUserMedia (got ' + getUserMediaCalls.length + ')');
+
+    assert(getUserMediaCalls.length === 0, 'mousedown/focus on #micSelect no longer prime anything — v1.16 removed the passive listeners as redundant dead code (got ' + getUserMediaCalls.length + ')');
   });
 
   // ============================================================
-  // Chrome acceptance fixes — re-entrancy/attempted-once guard on
-  // primeMicLabels(), and the anonymized-list guard on enumerateDevices()
+  // Chrome acceptance fixes — re-entrancy guard on acquireMicHold(), and the
+  // anonymized-list guard on enumerateDevices()
   // ============================================================
-  await scenario('BE overlapping primeMicLabels calls make only one getUserMedia call (in-flight guard)', async () => {
+  await scenario('BE overlapping acquireMicHold calls make only one getUserMedia call (in-flight guard)', async () => {
     mockDevices = [];
     await sandbox.enumerateDevices();
     await drain();
+    state.sources.mic = true;
 
     let resolveGUM;
     const gumPromise = new Promise((res) => { resolveGUM = res; });
@@ -1789,15 +1799,15 @@ async function scenario(name, fn) {
     };
     mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
 
-    // primeMicLabels runs synchronously up to its `await getUserMedia(...)`
-    // — by the time this line returns, micPrimeInFlight is already true and
+    // acquireMicHold runs synchronously up to its `await getUserMedia(...)`
+    // — by the time this line returns, micHoldInFlight is already true and
     // the (single) getUserMedia call has already been made.
-    const p1 = sandbox.primeMicLabels();
-    const p2 = sandbox.primeMicLabels(); // fires while p1's grant is still unresolved (e.g. the prompt-return focus)
+    const p1 = sandbox.acquireMicHold();
+    const p2 = sandbox.acquireMicHold(); // fires while p1's grant is still unresolved (e.g. a rapid double toggle-click)
 
     assert(getUserMediaCalls.length === 1, 'only one getUserMedia call while the first is still in flight (got ' + getUserMediaCalls.length + ')');
 
-    resolveGUM(makeStream([{ kind: 'audio', stop() {} }]));
+    resolveGUM(makeStream([{ kind: 'audio', readyState: 'live', stop() {} }]));
     await p1;
     await p2;
     await drain();
@@ -1805,6 +1815,7 @@ async function scenario(name, fn) {
     assert(getUserMediaCalls.length === 1, 'still exactly one getUserMedia call once both settle (got ' + getUserMediaCalls.length + ')');
     const micOpt = documentMock.getElementById('micSelect').querySelector('option[value="mic1"]');
     assert(micOpt && micOpt.textContent === 'USB Mic', 'the single grant still upgraded the label (got: ' + (micOpt && micOpt.textContent) + ')');
+    assert(state.heldMicStream !== null, 'the single grant is held');
   });
 
   await scenario('BF anonymized re-enumeration (entries present, ids blank) preserves a granted list; genuine removal still rebuilds', async () => {
@@ -1857,24 +1868,25 @@ async function scenario(name, fn) {
     assert(micSelect.innerHTML === '<option value="">Default microphone</option>', 'mic dropdown drops to Default-only on genuine removal (got: ' + micSelect.innerHTML + ')');
   });
 
-  await scenario('BG after a failed prime, the passive path does not retry but the forced toggle path does', async () => {
+  await scenario('BG each toggle-ON click is a fresh attempt — no attempted-once suppression survives a denial (v1.14 had one; v1.16 doesn\'t need it since denial reverts the toggle)', async () => {
     mockDevices = [];
     await sandbox.enumerateDevices();
     await drain();
+    state.sources = { screen: true, camera: false, mic: false }; // deterministic starting toggle state — resetState() doesn't touch state.sources
 
     sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
       getUserMediaCalls.push(c);
       const e = new Error('Permission denied'); e.name = 'NotAllowedError'; throw e;
     };
 
-    await sandbox.primeMicLabels(); // first automatic attempt (mousedown/focus path) — fails
-    assert(getUserMediaCalls.length === 1, 'first attempt calls getUserMedia (got ' + getUserMediaCalls.length + ')');
+    sandbox.toggleSource('mic'); // toggle ON -> acquireMicHold -> denied -> reverts to off
+    await drain();
+    assert(getUserMediaCalls.length === 1, 'first toggle-ON attempts getUserMedia (got ' + getUserMediaCalls.length + ')');
+    assert(state.sources.mic === false, 'denial reverted the toggle');
 
-    await sandbox.primeMicLabels(); // passive path again — no retry after one attempted+failed grant
-    assert(getUserMediaCalls.length === 1, 'passive re-attempt is suppressed after one failed automatic attempt (got ' + getUserMediaCalls.length + ')');
-
-    await sandbox.primeMicLabels(true); // forced path (explicit mic toggle-ON click) — retries
-    assert(getUserMediaCalls.length === 2, 'forced call retries even after a prior failed attempt (got ' + getUserMediaCalls.length + ')');
+    sandbox.toggleSource('mic'); // toggle ON again — a fresh attempt, no "attempted once" flag to suppress it
+    await drain();
+    assert(getUserMediaCalls.length === 2, 'a second toggle-ON click retries with no leftover suppression (got ' + getUserMediaCalls.length + ')');
   });
 
   // ============================================================
@@ -1886,43 +1898,57 @@ async function scenario(name, fn) {
     mockDevices = [];
     await sandbox.enumerateDevices();
     await drain();
+    state.sources.mic = true;
 
     // Grant succeeds (getUserMedia resolves) but the environment can only
     // ever report a blank-id audioinput — file://-served Chrome, per the
     // field report.
     mockDevices = [{ kind: 'audioinput', deviceId: '', label: '' }];
-    await sandbox.primeMicLabels();
+    await sandbox.acquireMicHold();
 
     assert(getUserMediaCalls.length === 1, 'the grant was attempted (got ' + getUserMediaCalls.length + ')');
     assert(sandbox.localStorage.getItem('micEnumAnonymized') === '1', 'flag persisted after a completed grant+enumerate that yielded no real options');
     const defaultOpt = documentMock.getElementById('micSelect').querySelector('option[value=""]');
     assert(defaultOpt && defaultOpt.textContent === 'Chosen in the browser pop-up', 'placeholder explains where selection really happens (got: ' + (defaultOpt && defaultOpt.textContent) + ')');
+    assert(state.heldMicStream !== null, 'the stream is still held even though the environment cannot name it');
   });
 
-  await scenario('BI with the flag set, neither passive nor forced primeMicLabels prompts; captureMic\'s own re-enumerate is the real escape hatch', async () => {
+  // v1.16 BEHAVIOR CHANGE: v1.15's primeMicLabels suppressed BOTH the passive
+  // and forced toggle-time prompt once micEnumAnonymized was set, because
+  // that prompt's grant evaporated before Record and bought nothing. Now the
+  // toggle-time prompt is the setup step that acquires the HELD stream
+  // recording depends on — suppressing it would silently bring back the
+  // record-time prompt in exactly the anonymized environments this feature
+  // targets. So toggle-ON must keep prompting every time regardless of the
+  // flag; the flag's only remaining job is the Default-slot text.
+  await scenario('BI with micEnumAnonymized already set, toggle-ON still prompts (once) and still acquires a hold — the flag only controls the Default-slot text now', async () => {
     mockDevices = [];
     await sandbox.enumerateDevices();
     await drain();
-    sandbox.localStorage.setItem('micEnumAnonymized', '1'); // environment already proved it can't deliver names
+    state.sources = { screen: true, camera: false, mic: false }; // deterministic starting toggle state — resetState() doesn't touch state.sources
+    sandbox.localStorage.setItem('micEnumAnonymized', '1'); // environment already proved it can't deliver names, from an earlier session
 
-    await sandbox.primeMicLabels(); // passive path (mousedown/focus)
-    assert(getUserMediaCalls.length === 0, 'passive prime makes no getUserMedia call once the flag is set (got ' + getUserMediaCalls.length + ')');
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'audio', readyState: 'live', label: 'USB Mic', stop() {} }]);
+    };
+    mockDevices = [{ kind: 'audioinput', deviceId: '', label: '' }]; // still can't enumerate real ids
 
-    await sandbox.primeMicLabels(true); // forced path (explicit toggle-ON click) — force only bypasses the attempted-once guard, not the anonymized verdict
-    assert(getUserMediaCalls.length === 0, 'forced prime also makes no getUserMedia call once the flag is set (got ' + getUserMediaCalls.length + ')');
-
-    // The real escape hatch: the environment changed (e.g. now served over
-    // http) and a real list is available. No prime path re-checks this —
-    // it's captureMic's own post-grant fire-and-forget re-enumerate (the
-    // one that runs whenever a recording actually starts) that discovers
-    // and clears the flag.
-    mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
-    await sandbox.captureMic();
+    sandbox.toggleSource('mic'); // the toggle-ON click — IS the setup step now, flag or no flag
     await drain();
 
-    assert(sandbox.localStorage.getItem('micEnumAnonymized') === null, 'a real-option rebuild clears the flag, reached via captureMic rather than a forced prime');
-    const micOpt = documentMock.getElementById('micSelect').querySelector('option[value="mic1"]');
-    assert(micOpt && micOpt.textContent === 'USB Mic', 'real label shown once the environment recovers (got: ' + (micOpt && micOpt.textContent) + ')');
+    assert(getUserMediaCalls.length === 1, 'toggle-ON prompts exactly once even with the anonymized flag already set (got ' + getUserMediaCalls.length + ')');
+    assert(state.heldMicStream !== null, 'the grant is held — this prompt is not a wasted nag anymore');
+    assert(sandbox.localStorage.getItem('micEnumAnonymized') === '1', 'the flag stays set (this environment still can\'t enumerate) — it never gated whether to prompt, only the Default-slot text');
+    const defaultOpt = documentMock.getElementById('micSelect').querySelector('option[value=""]');
+    assert(defaultOpt && defaultOpt.textContent === 'Microphone: USB Mic', 'Default-slot text still prefers the granted track\'s own label over the generic anonymized copy (got: ' + (defaultOpt && defaultOpt.textContent) + ')');
+
+    // And if the environment recovers (real ids come back), the flag clears
+    // exactly as before — that escape hatch is unchanged.
+    mockDevices = [{ kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' }];
+    await sandbox.enumerateDevices();
+    await drain();
+    assert(sandbox.localStorage.getItem('micEnumAnonymized') === null, 'a real-option rebuild still clears the flag');
   });
 
   await scenario('BJ captureMic surfaces the granted track\'s own label when there are no real options, and it survives an anonymized re-enumerate', async () => {
@@ -1970,6 +1996,416 @@ async function scenario(name, fn) {
     assert(micSelect.value === 'mic1', 'selection untouched (got: ' + micSelect.value + ')');
     assert(sandbox.localStorage.getItem('micEnumAnonymized') === null, 'flag stays unset when real options exist');
     assert(state.lastMicLabel === null, 'lastMicLabel is not set when real options already exist (got: ' + state.lastMicLabel + ')');
+  });
+
+  // ============================================================
+  // v1.15 — camera-side honest labels (generalized applyDeviceDefaultText,
+  // camEnumAnonymized as its own flag), mirroring the mic machinery above.
+  // ============================================================
+  await scenario('BL captureCamera surfaces the granted track\'s own label when there are no real options, and it survives an anonymized re-enumerate', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    // No real options available; the granted stream's track still knows its own name.
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'video', label: 'HD Webcam', stop() {} }]);
+    };
+    await sandbox.captureCamera();
+    await drain();
+
+    let defaultOpt = documentMock.getElementById('cameraSelect').querySelector('option[value=""]');
+    assert(defaultOpt && defaultOpt.textContent === 'Camera: HD Webcam', 'Default option shows the granted track\'s own label (got: ' + (defaultOpt && defaultOpt.textContent) + ')');
+
+    // A later anonymized re-enumeration (entries present, blank ids) must not wipe this —
+    // e.g. devicechange firing right after the camera preview stops.
+    mockDevices = [{ kind: 'videoinput', deviceId: '', label: '' }];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    defaultOpt = documentMock.getElementById('cameraSelect').querySelector('option[value=""]');
+    assert(defaultOpt && defaultOpt.textContent === 'Camera: HD Webcam', 'text survives a later anonymized re-enumeration (got: ' + (defaultOpt && defaultOpt.textContent) + ')');
+  });
+
+  await scenario('BM environments with real camera options: captureCamera does not overwrite the dropdown, and camEnumAnonymized stays unset', async () => {
+    mockDevices = [{ kind: 'videoinput', deviceId: 'cam1', label: 'Logitech BRIO' }];
+    await sandbox.enumerateDevices();
+    await drain();
+    const camSelect = documentMock.getElementById('cameraSelect');
+    camSelect.value = 'cam1';
+
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'video', label: 'Some Other Camera', stop() {} }]);
+    };
+    await sandbox.captureCamera();
+    await drain();
+
+    const camOpt = camSelect.querySelector('option[value="cam1"]');
+    assert(camOpt && camOpt.textContent === 'Logitech BRIO', 'real option/label untouched by captureCamera (got: ' + (camOpt && camOpt.textContent) + ')');
+    assert(camSelect.value === 'cam1', 'selection untouched (got: ' + camSelect.value + ')');
+    assert(sandbox.localStorage.getItem('camEnumAnonymized') === null, 'camera flag stays unset when real options exist');
+    assert(state.lastCameraLabel === null, 'lastCameraLabel is not set when real options already exist (got: ' + state.lastCameraLabel + ')');
+  });
+
+  await scenario('BN a completed camera grant+enumerate that stays blank-id sets camEnumAnonymized and explains the placeholder', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    // Grant succeeds (getUserMedia resolves) but the environment can only
+    // ever report a blank-id videoinput — file://-served Chrome, same as the
+    // mic field report, extended to the camera.
+    mockDevices = [{ kind: 'videoinput', deviceId: '', label: '' }];
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'video', stop() {} }]); // no label either — worst case
+    };
+    await sandbox.captureCamera();
+    await drain();
+
+    assert(getUserMediaCalls.length === 1, 'the grant was attempted (got ' + getUserMediaCalls.length + ')');
+    assert(sandbox.localStorage.getItem('camEnumAnonymized') === '1', 'flag persisted after a completed grant+enumerate that yielded no real options');
+    const defaultOpt = documentMock.getElementById('cameraSelect').querySelector('option[value=""]');
+    assert(defaultOpt && defaultOpt.textContent === 'Chosen in the browser pop-up', 'placeholder explains where selection really happens (got: ' + (defaultOpt && defaultOpt.textContent) + ')');
+  });
+
+  await scenario('BO mic and camera anonymized verdicts are tracked independently', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+
+    // Camera-only anonymized grant: a completed grant+enumerate stays blank-id.
+    mockDevices = [{ kind: 'videoinput', deviceId: '', label: '' }];
+    await sandbox.captureCamera();
+    await drain();
+    assert(sandbox.localStorage.getItem('camEnumAnonymized') === '1', 'camera verdict set after a blank-id grant+enumerate');
+    assert(sandbox.localStorage.getItem('micEnumAnonymized') === null, 'mic verdict untouched by a camera-only anonymized grant (got: ' + sandbox.localStorage.getItem('micEnumAnonymized') + ')');
+
+    // Mic-only anonymized grant, via acquireMicHold: stays blank-id too — the
+    // already-set camera verdict must survive untouched.
+    state.sources.mic = true;
+    mockDevices = [{ kind: 'audioinput', deviceId: '', label: '' }];
+    await sandbox.acquireMicHold();
+    assert(sandbox.localStorage.getItem('micEnumAnonymized') === '1', 'mic verdict set independently');
+    assert(sandbox.localStorage.getItem('camEnumAnonymized') === '1', 'camera verdict survives an unrelated mic grant (got: ' + sandbox.localStorage.getItem('camEnumAnonymized') + ')');
+  });
+
+  // ============================================================
+  // v1.15 — mic toggle defaults OFF at load (matching the webcam)
+  // ============================================================
+  await scenario('BP mic defaults off at load, matching the webcam', async () => {
+    assert(INITIAL_SOURCES_MIC === false, 'state.sources.mic\'s script-load default is false (got ' + INITIAL_SOURCES_MIC + ')');
+  });
+
+  await scenario('BQ mic select is disabled while the mic toggle is off, and toggling mic on is the priming gesture (zero prompts at load still holds)', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+    assert(getUserMediaCalls.length === 0, 'zero prompts at load even after an explicit enumerate');
+
+    state.sources = { screen: true, camera: false, mic: false };
+    sandbox.updateToggleUI();
+    assert(documentMock.getElementById('micSelect').disabled === true, 'mic select disabled while the toggle is off');
+    assert(getUserMediaCalls.length === 0, 'syncing the UI for mic-off still makes no getUserMedia call');
+
+    sandbox.toggleSource('mic'); // the explicit toggle-ON click — a user gesture
+    await drain();
+    assert(state.sources.mic === true, 'mic toggle turned on');
+    assert(documentMock.getElementById('micSelect').disabled === false, 'mic select re-enabled once the toggle is on');
+    assert(getUserMediaCalls.length === 1, 'toggle-ON is the acquire-hold gesture: exactly one getUserMedia call (got ' + getUserMediaCalls.length + ')');
+    // v1.16: this is no longer a throwaway audio:true label probe — it's the
+    // real recording-quality grant, since the stream now gets HELD and reused
+    // at record time (see acquireMicHold / micAudioConstraints).
+    assert(getUserMediaCalls[0].video === false, 'video: false (got: ' + JSON.stringify(getUserMediaCalls[0]) + ')');
+    assert(getUserMediaCalls[0].audio && getUserMediaCalls[0].audio.echoCancellation === true && getUserMediaCalls[0].audio.noiseSuppression === true, 'full recording-quality audio constraints from the toggle-ON hold (got: ' + JSON.stringify(getUserMediaCalls[0].audio) + ')');
+    assert(state.heldMicStream !== null, 'the toggle-ON grant is held, not stopped, for record-time reuse');
+  });
+
+  await scenario('BR the record button guard is unaffected by mic defaulting off — screen/camera decide, not mic', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = null;
+    sandbox.updateRecordButton();
+    assert(documentMock.getElementById('btnRecord').disabled === true, 'no screen stream yet -> disabled, even with mic off (the default now)');
+
+    state.screenStream = makeStream([{ kind: 'video', stop() {} }]);
+    sandbox.updateRecordButton();
+    assert(documentMock.getElementById('btnRecord').disabled === false, 'screen stream present -> enabled, even though mic is off');
+
+    // Camera-only mode (screen off) is always enabled regardless of mic too.
+    state.sources = { screen: false, camera: true, mic: false };
+    state.screenStream = null;
+    sandbox.updateRecordButton();
+    assert(documentMock.getElementById('btnRecord').disabled === false, 'camera-only mode enabled regardless of mic (got disabled=' + documentMock.getElementById('btnRecord').disabled + ')');
+  });
+
+  // ============================================================
+  // v1.16 — held mic stream (toggle-ON acquires and KEEPS the mic, mirroring
+  // the webcam preview hold), so record-time start is prompt-free and
+  // instant instead of firing getUserMedia (and losing the recording's
+  // opening words) at the Record click.
+  // ============================================================
+  await scenario('BS toggle-ON drives acquireMicHold end-to-end: exactly one getUserMedia call, and the granted tracks are never stopped', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+    state.sources = { screen: true, camera: false, mic: false };
+
+    let stopped = false;
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'audio', readyState: 'live', stop() { stopped = true; } }]);
+    };
+
+    sandbox.toggleSource('mic');
+    await drain();
+
+    assert(state.sources.mic === true, 'toggle turned on');
+    assert(getUserMediaCalls.length === 1, 'exactly one getUserMedia call from the toggle click (got ' + getUserMediaCalls.length + ')');
+    assert(state.heldMicStream !== null, 'the grant is held');
+    assert(!stopped, 'the held tracks are never stopped just from acquiring — no prime-then-stop anymore');
+  });
+
+  await scenario('BT captureMic reuses a live, matching hold with zero additional getUserMedia calls, returning the exact held stream object', async () => {
+    state.sources.mic = true;
+    const track = { kind: 'audio', readyState: 'live', stop() {} };
+    const held = makeStream([track]);
+    state.heldMicStream = held;
+    state.heldMicDeviceId = state.selectedMic; // '' — matches the default selection
+
+    const stream = await sandbox.captureMic();
+
+    assert(getUserMediaCalls.length === 0, 'no getUserMedia call — the hold is reused (got ' + getUserMediaCalls.length + ')');
+    assert(stream === held, 'the exact held stream object is returned');
+  });
+
+  await scenario('BU captureMic falls back to a fresh acquire when the held track is dead (e.g. a Bluetooth mic dropout), without disturbing the stale hold itself', async () => {
+    state.sources.mic = true;
+    const deadTrack = { kind: 'audio', readyState: 'ended', stop() {} };
+    state.heldMicStream = makeStream([deadTrack]);
+    state.heldMicDeviceId = state.selectedMic;
+
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'audio', readyState: 'live', stop() {} }]);
+    };
+
+    const stream = await sandbox.captureMic();
+
+    assert(getUserMediaCalls.length === 1, 'a dead held track forces a fresh getUserMedia call (got ' + getUserMediaCalls.length + ')');
+    assert(stream !== state.heldMicStream, 'the fresh stream is returned, not the dead hold');
+    assert(state.heldMicStream && state.heldMicStream.getAudioTracks()[0] === deadTrack, 'captureMic itself does not touch/replace the stale hold — promoting a fresh stream into the hold is releaseMicRecordingRef\'s job at recording stop, not captureMic\'s');
+  });
+
+  await scenario('BV changing the mic dropdown selection while the toggle is on stops the old hold and re-acquires under the new deviceId constraint', async () => {
+    mockDevices = [
+      { kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' },
+      { kind: 'audioinput', deviceId: 'mic2', label: 'Headset Mic' },
+    ];
+    await sandbox.enumerateDevices();
+    await drain();
+    state.sources.mic = true;
+    state.selectedMic = 'mic1';
+
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return makeStream([{ kind: 'audio', readyState: 'live', stop() {} }]);
+    };
+    await sandbox.acquireMicHold(); // establishes the initial hold under mic1
+    const oldHeld = state.heldMicStream;
+    let oldStopped = false;
+    oldHeld.getAudioTracks()[0].stop = () => { oldStopped = true; };
+    assert(getUserMediaCalls.length === 1, 'sanity: initial hold acquired (got ' + getUserMediaCalls.length + ')');
+
+    // Simulate picking a different device from the dropdown (onchange="onDeviceSelected('mic')" in the HTML).
+    documentMock.getElementById('micSelect').value = 'mic2';
+    sandbox.onDeviceSelected('mic');
+    await drain();
+
+    assert(state.selectedMic === 'mic2', 'state.selectedMic updated from the dropdown');
+    assert(oldStopped, 'the old hold\'s tracks are stopped before re-acquiring');
+    assert(getUserMediaCalls.length === 2, 'a second getUserMedia call re-acquires under the new device (got ' + getUserMediaCalls.length + ')');
+    assert(getUserMediaCalls[1].audio && getUserMediaCalls[1].audio.deviceId && getUserMediaCalls[1].audio.deviceId.exact === 'mic2', 'the new hold requests the newly-selected deviceId (got: ' + JSON.stringify(getUserMediaCalls[1].audio) + ')');
+    assert(state.heldMicStream !== oldHeld, 'a new stream object is now held');
+    assert(state.heldMicDeviceId === 'mic2', 'heldMicDeviceId tracks the new selection');
+  });
+
+  await scenario('BW toggling mic off stops the held tracks and clears the hold state', async () => {
+    state.sources.mic = true;
+    let stopped = false;
+    const track = { kind: 'audio', readyState: 'live', stop() { stopped = true; } };
+    state.heldMicStream = makeStream([track]);
+    state.heldMicDeviceId = state.selectedMic;
+
+    sandbox.toggleSource('mic'); // was on -> toggles off
+
+    assert(state.sources.mic === false, 'toggle turned off');
+    assert(stopped, 'the held stream\'s tracks are stopped on toggle-OFF');
+    assert(state.heldMicStream === null, 'heldMicStream cleared');
+    assert(state.heldMicDeviceId === null, 'heldMicDeviceId cleared');
+    assert(getUserMediaCalls.length === 0, 'toggling off makes no getUserMedia call');
+  });
+
+  await scenario('BX recording stop (cleanupStreams) preserves the hold while the toggle is on; the next captureMic call still makes zero getUserMedia calls', async () => {
+    state.sources.mic = true;
+    const track = { kind: 'audio', readyState: 'live', stop() {} };
+    const held = makeStream([track]);
+    state.heldMicStream = held;
+    state.heldMicDeviceId = state.selectedMic;
+    state.micStream = held; // captureMic returned the SAME object during the recording that just ended
+
+    let stopped = false;
+    track.stop = () => { stopped = true; };
+
+    sandbox.cleanupStreams();
+
+    assert(!stopped, 'the held stream\'s tracks are NOT stopped by a recording-stop cleanup while the toggle is on');
+    assert(state.heldMicStream === held, 'the hold survives recording stop');
+    assert(state.micStream === null, 'the recording-time reference is cleared');
+
+    getUserMediaCalls = [];
+    const reused = await sandbox.captureMic();
+    assert(getUserMediaCalls.length === 0, 'the NEXT captureMic call reuses the surviving hold with zero getUserMedia calls (got ' + getUserMediaCalls.length + ')');
+    assert(reused === held, 'captureMic returns the exact held stream object');
+  });
+
+  await scenario('BY recording stop promotes a fallback recording stream into the new hold when the toggle is on, retiring the stale dead hold', async () => {
+    state.sources.mic = true;
+    const deadTrack = { kind: 'audio', readyState: 'ended', stop() {} };
+    const deadHeld = makeStream([deadTrack]);
+    state.heldMicStream = deadHeld;
+    state.heldMicDeviceId = state.selectedMic;
+    let deadStopped = false;
+    deadTrack.stop = () => { deadStopped = true; };
+
+    // captureMic had to fall back mid-recording because the held track was dead
+    // (see BU) — that fresh grant is state.micStream now, a DIFFERENT object
+    // from state.heldMicStream.
+    const freshTrack = { kind: 'audio', readyState: 'live', stop() {} };
+    const fresh = makeStream([freshTrack]);
+    state.micStream = fresh;
+    let freshStopped = false;
+    freshTrack.stop = () => { freshStopped = true; };
+
+    sandbox.cleanupStreams();
+
+    assert(deadStopped, 'the stale dead hold is stopped once a fresh stream replaces it');
+    assert(!freshStopped, 'the fresh recording stream is NOT stopped — it becomes the new hold');
+    assert(state.heldMicStream === fresh, 'the fresh stream is promoted into heldMicStream');
+    assert(state.heldMicDeviceId === state.selectedMic, 'heldMicDeviceId is updated to the current selection');
+    assert(state.micStream === null, 'the recording-time reference is cleared');
+  });
+
+  await scenario('BZ recording stop still stops mic tracks the old way when the toggle is off (releaseMicRecordingRef\'s toggle-off branch)', async () => {
+    state.sources.mic = false;
+    let stopped = false;
+    const track = { kind: 'audio', stop() { stopped = true; } };
+    state.micStream = makeStream([track]);
+
+    sandbox.cleanupStreams();
+
+    assert(stopped, 'mic tracks are still stopped on cleanup when the toggle is off');
+    assert(state.micStream === null, 'recording-time reference cleared');
+  });
+
+  await scenario('CA a denied toggle-ON grant (via a real toggle click) reverts the toggle to off and shows a friendly message', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+    state.sources = { screen: true, camera: false, mic: false };
+
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      const e = new Error('Permission denied'); e.name = 'NotAllowedError'; throw e;
+    };
+
+    sandbox.toggleSource('mic');
+    await drain();
+
+    assert(state.sources.mic === false, 'toggle reverted to off after the denial');
+    assert(documentMock.getElementById('toggleMic').classList.contains('active') === false, 'toggle button UI reflects the revert, not left showing active with no hold behind it');
+    assert(recordedErrors.some(m => /declined|denied/i.test(m)), 'a friendly error explains the denial (got: ' + JSON.stringify(recordedErrors) + ')');
+    assert(state.heldMicStream === null, 'no hold exists after a denied grant');
+  });
+
+  await scenario('CB toggling off while a toggle-ON grant is still pending stops the late stream instead of holding it (race safety)', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+
+    let resolveGUM;
+    const gumPromise = new Promise((res) => { resolveGUM = res; });
+    let stopped = false;
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      return gumPromise;
+    };
+
+    sandbox.toggleSource('mic'); // toggle ON — kicks off acquireMicHold, still pending
+    assert(state.sources.mic === true, 'toggle is on while the grant is pending');
+
+    sandbox.toggleSource('mic'); // toggle OFF again before the grant resolves — stopMicHold no-ops (nothing held yet)
+    assert(state.sources.mic === false, 'toggle is off again');
+
+    resolveGUM(makeStream([{ kind: 'audio', readyState: 'live', stop() { stopped = true; } }]));
+    await drain();
+
+    assert(stopped, 'the late-arriving grant is stopped immediately instead of held, since the toggle is off by the time it resolves');
+    assert(state.heldMicStream === null, 'no hold was left behind by the late grant');
+  });
+
+  await scenario('CC a selection change while the toggle-ON grant is pending books the hold under the acquisition-time device, so captureMic falls back instead of reusing the wrong mic', async () => {
+    mockDevices = [
+      { kind: 'audioinput', deviceId: 'mic1', label: 'USB Mic' },
+      { kind: 'audioinput', deviceId: 'mic2', label: 'Headset Mic' },
+    ];
+    await sandbox.enumerateDevices();
+    await drain();
+    state.sources = { screen: true, camera: false, mic: false };
+    state.selectedMic = 'mic1';
+    documentMock.getElementById('micSelect').value = 'mic1';
+
+    let resolveGUM;
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      if (getUserMediaCalls.length === 1) return new Promise((res) => { resolveGUM = res; });
+      return makeStream([{ kind: 'audio', readyState: 'live', stop() {} }]);
+    };
+
+    sandbox.toggleSource('mic'); // toggle ON — the mic1 grant is still pending
+    // The user changes the dropdown while the prompt is still up. The
+    // re-acquire in onDeviceSelected is swallowed by the in-flight guard,
+    // so the grant that eventually resolves is still the mic1 one.
+    documentMock.getElementById('micSelect').value = 'mic2';
+    sandbox.onDeviceSelected('mic');
+    resolveGUM(makeStream([{ kind: 'audio', readyState: 'live', stop() {} }]));
+    await drain();
+
+    assert(state.heldMicDeviceId === 'mic1', 'the hold is booked under the device it was actually acquired for, not the drifted selection (got: ' + state.heldMicDeviceId + ')');
+
+    const before = getUserMediaCalls.length;
+    await sandbox.captureMic();
+    assert(getUserMediaCalls.length === before + 1, 'captureMic falls back to a fresh acquire instead of reusing the mic1 hold (calls went ' + before + ' -> ' + getUserMediaCalls.length + ')');
+    assert(getUserMediaCalls[before].audio.deviceId && getUserMediaCalls[before].audio.deviceId.exact === 'mic2', 'the fallback requests the currently-selected device (got: ' + JSON.stringify(getUserMediaCalls[before].audio) + ')');
+  });
+
+  await scenario('CD a device failure at toggle-ON (not a denial) reverts the toggle with a message about the device, not about permission', async () => {
+    mockDevices = [];
+    await sandbox.enumerateDevices();
+    await drain();
+    state.sources = { screen: true, camera: false, mic: false };
+
+    sandbox.navigator.mediaDevices.getUserMedia = async (c) => {
+      getUserMediaCalls.push(c);
+      const e = new Error('Could not start audio source'); e.name = 'NotReadableError'; throw e;
+    };
+
+    sandbox.toggleSource('mic');
+    await drain();
+
+    assert(state.sources.mic === false, 'toggle reverted to off after the device failure');
+    assert(state.heldMicStream === null, 'no hold exists after the failure');
+    assert(recordedErrors.some(m => /connected|in use by another app/i.test(m)), 'the message points at the device, not permission (got: ' + JSON.stringify(recordedErrors) + ')');
+    assert(!recordedErrors.some(m => /declined/i.test(m)), 'the denial copy is not shown for a non-denial failure');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

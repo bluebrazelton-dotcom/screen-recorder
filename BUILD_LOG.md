@@ -929,6 +929,152 @@ record-start permission pop-up remains, and it doubles as the mic picker in this
 environment; "Microphone: \<device\>" shown correctly during recording; real voice on
 playback. Firefox — full named dropdown works end to end, no regressions.
 
+### v1.15 — Camera-side honest labels + mic toggle defaults off (2026-07-29)
+
+**Commit:** `camera-side honest labels (shared applyDeviceDefaultText, camEnumAnonymized verdict) + mic toggle defaults off at load`
+
+Closes NEXT_SESSION.md open queue item 1 (owner-requested at v1.14 close-out,
+2026-07-29). Enumeration/selection/UI only — the recording pipeline and the
+v1.11/v1.13 streamed save flows are untouched.
+
+**What was built:**
+
+1. **`applyMicDefaultText()` generalized into `applyDeviceDefaultText(type)`** —
+   one shared helper (`type` is `'mic'` or `'camera'`) picking the right select,
+   verdict flag, last-label field, and copy for each kind. Mic behavior is
+   byte-for-byte what v1.14 shipped; the camera now gets the same honest Default
+   slot: `Camera: <granted track's own label>` once a track has been granted, else
+   `Chosen in the browser pop-up` once the camera's anonymized verdict is set, else
+   the original `Default camera`. Still no-ops the moment real options exist.
+2. **`captureCamera()` surfaces the granted video track's own `.label`** into
+   `state.lastCameraLabel` (parallel to `lastMicLabel`), so file://-served Chrome —
+   which can never list camera names in-app, same as the mic — still shows the real
+   webcam name in the dropdown's Default slot. Survives a later anonymized
+   re-enumeration, same as the mic machinery.
+3. **Persistent `camEnumAnonymized` verdict (`localStorage`)** — the camera's own
+   flag, not shared with `micEnumAnonymized`, since mic and camera are granted
+   separately and one going anonymized says nothing about the other. Set/cleared
+   inside `captureCamera()` itself rather than a new priming function: the camera
+   has no separate prime path (it grants via the Webcam toggle's preview), so
+   `captureCamera` is the one place a completed grant+enumerate is known to have
+   happened. To read the verdict off the rebuilt dropdown, its internal
+   `enumerateDevices()` went from fire-and-forget to awaited — a few extra ms
+   during preview/record-start *setup* (before any `MediaRecorder` exists), never
+   inside the recording pipeline. Like the mic's verdict, it self-clears the moment
+   any real-option camera rebuild happens.
+4. **Mic toggle defaults OFF at load, matching the webcam** — `state.sources.mic`
+   init flipped to `false` plus the two "mic defaults on" comments rewritten
+   (`toggleSource`'s priming hook, the `#micSelect` listener block). Nothing else
+   needed changing: `updateToggleUI()` already disables the mic select while the
+   toggle is off, and `updateRecordButton()` never referenced mic at all — both now
+   verified by scenarios instead. Zero-prompts-at-load still holds and gets more
+   natural: the toggle-ON click is now the first mic gesture. v1.14 verdict
+   behavior unchanged.
+
+**Verification:** harness now 74 scenarios / 416 assertions (new BL–BR). Covers:
+`captureCamera` surfacing the granted track's label when no real options exist and
+that label surviving an anonymized re-enumeration (BL); real-option environments
+where `captureCamera` touches nothing and the flag stays unset (BM); a completed
+blank-id grant+enumerate setting `camEnumAnonymized` and the placeholder explaining
+itself (BN); mic and camera verdicts tracked independently in both directions (BO);
+the true script-load mic default, snapshotted before any scenario can mutate
+`state.sources` (BP); the mic select disabled while the toggle is off, zero
+getUserMedia calls until the toggle-ON gesture, which primes exactly once (BQ); the
+record-button guard indifferent to mic in both screen and camera-only modes (BR).
+No existing scenario needed weakening — the recording scenarios already set
+`mic: false` explicitly, and none asserted a mic-on default.
+
+**Real acceptance (owner, both browsers, 2026-07-29, combined with v1.16):**
+Chrome (file://) — camera dropdown's Default slot shows the webcam's real name
+once granted; mic toggle starts OFF with the dropdown disabled; zero prompts at
+load. Firefox — named dropdowns intact end to end, no regressions.
+
+### v1.16 — Mic hold: acquire at toggle-ON, prompt-free record start (2026-07-29)
+
+**Commit:** `mic hold: acquire at toggle-ON and reuse at record, killing the record-time permission prompt`
+
+Owner-reported during the v1.15 browser pass: in environments that don't persist
+getUserMedia grants (file://-served Chrome always; Firefox without a remembered
+grant), the mic pop-up fired AT THE RECORD CLICK — recording doesn't start until
+the grant resolves, so a user who clicks Record and starts talking loses their
+opening words to the pop-up. Everything should be set up before Record is clicked.
+
+**The design:** the mic now mirrors the webcam's preview-hold pattern. Stream
+setup/teardown and enumeration/selection UI only — the MediaRecorder/chunk-store/
+crash-recovery pipeline and the v1.11/v1.13 streamed save flows are untouched.
+
+1. **Toggle mic ON → acquire AND HOLD the stream** (`state.heldMicStream`,
+   `acquireMicHold()`). The toggle-ON gesture fires `getUserMedia` — in file://
+   Chrome that pop-up doubles as the device picker, and its grant now persists
+   into recording via the hold. All v1.14/v1.15 label/verdict machinery runs on
+   this path (enumerate while the stream is live, surface the track's own label,
+   set/clear `micEnumAnonymized`). Acquired with the same constraints `captureMic`
+   uses (shared `micAudioConstraints()`), so the held stream and a recorded stream
+   are always built identically. `state.heldMicDeviceId` records the selection
+   *at acquisition time* — snapshotted before the `await`, since the select is
+   enabled while the prompt is still pending and a drifted selection must not
+   mislabel an old-device hold (it instead fails the reuse check below and falls
+   back). Toggle OFF → `stopMicHold()`.
+2. **`captureMic()` reuses the hold** when it exists, its track is live, and
+   `heldMicDeviceId` matches the current selection — zero getUserMedia calls at
+   record start, so recording begins instantly. Dead track (Bluetooth dropout),
+   drifted selection, or no hold → the pre-v1.16 fresh-acquire path, unchanged.
+3. **Dropdown change while the toggle is on → re-acquire** under the new device
+   (`onDeviceSelected` stops the old hold first).
+4. **Recording stop preserves the hold** (`releaseMicRecordingRef()`, replacing
+   the unconditional mic-track stop in `cleanupStreams` and `startRecording`'s
+   failure path). While the toggle stays on, held tracks survive recording stop —
+   the NEXT recording is prompt-free too. A mid-recording fallback stream gets
+   *promoted* into the new hold (stale hold stopped) rather than orphaned. With
+   the toggle off, tracks stop exactly as before.
+5. **Denied/failed grant at toggle-ON → revert the toggle** with the right
+   message: permission copy for `NotAllowedError`, device copy ("connected / in
+   use by another app") for everything else. A toggle left on with no hold would
+   silently reintroduce the record-time prompt this version exists to kill. A
+   grant resolving after the user already toggled off again is stopped, not held.
+6. **`primeMicLabels` and the passive mousedown/focus prime are removed** — the
+   hold subsumes them. `micEnumAnonymized` no longer suppresses the toggle-ON
+   acquisition (that suppression made sense when the toggle prompt was a useless
+   nag whose grant evaporated before Record; now it's the setup step). The flag
+   governs ONLY the dropdown's honest Default-slot text.
+
+**Behavior change to know:** the mic goes hot at toggle-ON — the browser's
+mic-in-use indicator shows before recording starts, same as the camera preview
+always has. Zero-prompts-at-load still holds (mic defaults off since v1.15;
+nothing acquires outside a user gesture).
+
+**Verification:** harness now 86 scenarios / 472 assertions (new BS–CD). Covers:
+toggle-ON acquires exactly once and never stops the tracks (BS); `captureMic`
+reuses the hold with zero additional calls (BT); dead-track fallback (BU);
+selection change re-acquires under the new deviceId (BV); toggle OFF stops the
+hold (BW); recording stop preserves the hold and the next `captureMic` still
+makes zero calls (BX); a mid-recording fallback stream is promoted into the hold
+(BY); recording stop still stops tracks when the toggle is off (BZ); denial
+reverts the toggle with the permission message (CA); a grant resolving after
+toggle-off is stopped, not held (CB); a selection change during a pending grant
+books the hold under the acquisition-time device and `captureMic` falls back to
+the newly-selected one (CC); non-denial failures get device copy, not permission
+copy (CD). Ten v1.14-era scenarios (BA–BI, BO, BQ) were deliberately rewritten
+because they encoded the prime-then-stop design — notably BI, which asserted the
+verdict flag suppresses the toggle prompt, inverted on purpose by this design.
+
+**Real acceptance (owner, both browsers, 2026-07-29):** mic prompt fires at
+toggle-ON (where it doubles as the file:// Chrome device picker), Record starts
+instantly with voice present from the first word, repeat recordings need no new
+prompt, pause/resume unaffected, denial reverts the toggle. Firefox unregressed.
+
+**Field note from this acceptance (platform, not app):** the owner's Chrome now
+exposes `showSaveFilePicker` on file:// pages (console check `'showSaveFilePicker'
+in window` → `true`, 2026-07-29 — earlier Chrome builds lacked FSA on file://).
+Saves therefore take the FSA picker path (`'saved'`, write confirmed by the API)
+instead of the download fallback — so the gray `#downloadConfirm` bar no longer
+appears in Chrome BY DESIGN; that bar only exists for unverifiable anchor
+downloads (still Firefox's path). Initially reported as a missing banner after
+Stop & save; a differential harness repro of the full record→pause→resume→stop
+flow against v1.15 and v1.16 showed the two versions byte-identical on every
+observable in both save modes. Don't chase a missing Chrome save-bar as a
+regression — check FSA availability first.
+
 ---
 
 ## Known limitations

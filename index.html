@@ -536,18 +536,29 @@
 // State
 // ============================================================
 const state = {
-  sources: { screen: true, camera: false, mic: true },
+  sources: { screen: true, camera: false, mic: false },
   selectedCamera: '',  // deviceId, empty = default
   selectedMic: '',     // deviceId, empty = default
   lastMicLabel: null,  // runtime-only: last granted track's own label, for
                         // environments that can never list real mic options
+  lastCameraLabel: null, // same, for the camera's granted track
   recording: false,
   paused: false,
   mediaRecorder: null,
   screenStream: null,
   cameraStream: null,
   audioContext: null,
-  micStream: null,
+  micStream: null,      // recording-time reference only (see releaseMicRecordingRef) —
+                         // may be the SAME object as heldMicStream, or a fallback
+                         // fresh-acquire; never assume which without checking
+  heldMicStream: null,   // toggle-ON hold (mirrors cameraStream's preview-hold role
+                          // for the mic) — lives for as long as the mic toggle is on,
+                          // independent of any single recording. See acquireMicHold.
+  heldMicDeviceId: null, // state.selectedMic at the moment heldMicStream was granted;
+                          // captureMic compares against the CURRENT state.selectedMic
+                          // to decide whether the hold still matches the dropdown
+                          // (not the track's own settings — an anonymized environment
+                          // can report a blank deviceId on a live, correctly-selected track)
   compositeStream: null,
   animFrameId: null,
   drawFrame: null,      // current one-frame draw fn while compositing (also a sentinel)
@@ -797,17 +808,19 @@ function toggleSource(source) {
     }
   }
 
-  // Prime real mic labels on a genuine toggle-ON click. toggleSource is only
-  // reachable from the toggle buttons' onclick — never called during
-  // init/recovery — so this is a user gesture and can't fire a permission
-  // prompt at page load, even though mic defaults on in state.sources.
-  // Forced: an explicit click is new intent, so it retries even if the
-  // passive mousedown/focus path already made (and gave up on) an attempt
-  // this session — but it still won't re-prompt once micEnumAnonymized is
-  // set; that verdict only clears on its own, via a capable environment's
-  // next real-option rebuild (see primeMicLabels).
-  if (source === 'mic' && state.sources.mic) {
-    primeMicLabels(true); // fire-and-forget — doesn't block the toggle UI
+  // Start or stop the held mic stream immediately — mirrors the camera
+  // preview above. toggleSource is only reachable from the toggle buttons'
+  // onclick (never called during init/recovery), so this is always a user
+  // gesture and can't fire a permission prompt at page load. See
+  // acquireMicHold for why this replaced v1.14/v1.15's prime-then-stop
+  // (primeMicLabels): the toggle-ON click now needs to acquire and KEEP the
+  // stream, not just borrow it long enough to read labels.
+  if (source === 'mic') {
+    if (state.sources.mic) {
+      acquireMicHold(); // fire-and-forget — doesn't block the toggle UI; reverts the toggle itself on denial
+    } else {
+      stopMicHold();
+    }
   }
 }
 
@@ -853,6 +866,20 @@ function stopCameraPreview() {
   }
 }
 
+// Stop the held mic stream (mic toggled off before recording). Mirrors
+// stopCameraPreview. This only ever touches state.heldMicStream — a live
+// recording's own reference (state.micStream) is separate bookkeeping even
+// on the recordings where it happens to point at the same object; see
+// releaseMicRecordingRef for what decides whether THAT reference's tracks
+// get stopped.
+function stopMicHold() {
+  if (state.heldMicStream) {
+    state.heldMicStream.getTracks().forEach(t => t.stop());
+    state.heldMicStream = null;
+    state.heldMicDeviceId = null;
+  }
+}
+
 function updateToggleUI() {
   document.getElementById('toggleScreen').classList.toggle('active', state.sources.screen);
   document.getElementById('toggleCamera').classList.toggle('active', state.sources.camera);
@@ -873,27 +900,32 @@ function updateToggleUI() {
 // Device enumeration
 // ============================================================
 
-// When the mic dropdown has no real options, the single Default option is
+// When a device dropdown has no real options, the single Default option is
 // the only thing the user sees — make it tell the truth instead of just
-// saying "Default microphone". No-ops the moment real options exist, so it
-// never touches a working dropdown (Firefox / http(s) Chrome keep working
-// exactly as before). Called from enumerateDevices' mic branch, and from
-// captureMic/primeMicLabels whenever lastMicLabel or the anonymized flag
-// changes, since those don't always run through a full enumerate.
-function applyMicDefaultText() {
-  const micSelect = document.getElementById('micSelect');
-  const hasReal = Array.from(micSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+// saying "Default microphone"/"Default camera". No-ops the moment real
+// options exist, so it never touches a working dropdown (Firefox / http(s)
+// Chrome keep working exactly as before). Called from enumerateDevices' per-
+// kind branch, and from captureMic/captureCamera/acquireMicHold whenever
+// lastMicLabel/lastCameraLabel or the relevant anonymized flag changes, since
+// those don't always run through a full enumerate. Shared by mic and camera —
+// they're granted (and can go anonymized) independently, so `type` ('mic' or
+// 'camera') picks the right select/flag/label/copy for each.
+function applyDeviceDefaultText(type) {
+  const isMic = type === 'mic';
+  const select = document.getElementById(isMic ? 'micSelect' : 'cameraSelect');
+  const hasReal = Array.from(select.querySelectorAll('option[value]')).some(opt => opt.value);
   if (hasReal) return;
-  const defaultOpt = micSelect.querySelector('option[value=""]');
+  const defaultOpt = select.querySelector('option[value=""]');
   if (!defaultOpt) return;
   let anonymized = false;
-  try { anonymized = localStorage.getItem('micEnumAnonymized') === '1'; } catch (e) { /* ignore */ }
-  if (state.lastMicLabel) {
-    defaultOpt.textContent = `Microphone: ${state.lastMicLabel}`;
+  try { anonymized = localStorage.getItem(isMic ? 'micEnumAnonymized' : 'camEnumAnonymized') === '1'; } catch (e) { /* ignore */ }
+  const lastLabel = isMic ? state.lastMicLabel : state.lastCameraLabel;
+  if (lastLabel) {
+    defaultOpt.textContent = `${isMic ? 'Microphone' : 'Camera'}: ${lastLabel}`;
   } else if (anonymized) {
     defaultOpt.textContent = 'Chosen in the browser pop-up';
   } else {
-    defaultOpt.textContent = 'Default microphone';
+    defaultOpt.textContent = isMic ? 'Default microphone' : 'Default camera';
   }
 }
 
@@ -939,6 +971,14 @@ async function enumerateDevices() {
       if (state.selectedCamera && camSelect.querySelector(`option[value="${state.selectedCamera}"]`)) {
         camSelect.value = state.selectedCamera;
       }
+      // Real options landed — the environment can deliver names after all;
+      // clear the "can't do it" verdict so the placeholder stops apologizing.
+      if (cameras.length > 0) {
+        try { localStorage.removeItem('camEnumAnonymized'); } catch (e) { /* ignore */ }
+      }
+      applyDeviceDefaultText('camera'); // rebuilt with no real options — say why, not just "Default camera"
+    } else {
+      applyDeviceDefaultText('camera'); // skipped rebuild — re-apply so a stale placeholder text can't linger
     }
 
     // Populate mic dropdown — same rule
@@ -961,80 +1001,118 @@ async function enumerateDevices() {
       if (mics.length > 0) {
         try { localStorage.removeItem('micEnumAnonymized'); } catch (e) { /* ignore */ }
       }
-      applyMicDefaultText(); // rebuilt with no real options — say why, not just "Default microphone"
+      applyDeviceDefaultText('mic'); // rebuilt with no real options — say why, not just "Default microphone"
     } else {
-      applyMicDefaultText(); // skipped rebuild — re-apply so a stale placeholder text can't linger
+      applyDeviceDefaultText('mic'); // skipped rebuild — re-apply so a stale placeholder text can't linger
     }
   } catch (err) {
     console.warn('Could not enumerate devices:', err);
   }
 }
 
-// Re-entrancy + attempted-once guards for primeMicLabels(). The permission
-// prompt closing hands focus back to #micSelect, which fires the 'focus'
-// listener again — without these, a still-blank result (grant didn't stick,
-// see the anonymized-list guard above) loops into a second prompt on every
-// refocus. micPrimeInFlight blocks an overlapping call outright;
-// micPrimeAttempted blocks only the passive mousedown/focus path after one
-// automatic attempt — a faculty user who dismisses the prompt once must not
-// be nagged every time the select regains focus.
-// var, not let: STREAM_CARRY_CAP below sets the precedent for module-level
-// state a test harness needs to reach and reset between scenarios.
-var micPrimeInFlight = false;
-var micPrimeAttempted = false;
+// Shared audio constraints for both the toggle-ON hold (acquireMicHold) and
+// captureMic's fresh-acquire fallback — kept in one place so the stream a
+// user hears themselves through (the hold) and the stream that ends up in
+// the recording are always built the same way.
+function micAudioConstraints() {
+  const constraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+  };
+  if (state.selectedMic) {
+    constraints.deviceId = { exact: state.selectedMic };
+  }
+  return constraints;
+}
 
-// Explicit-intent mic grant + label upgrade, mirroring the camera's early
-// preview/grant path. Without this, the only mic getUserMedia lives inside
-// startRecording (via captureMic), which lands after updateToggleUI() has
-// already disabled the select — real labels arrive too late to ever show.
-// force=true (the mic toggle-ON path) only bypasses the attempted-once guard
-// below — retrying after a denied/dismissed prompt in a CAPABLE environment.
-// It does NOT bypass the anonymized verdict: once a completed grant+enumerate
-// has proven this environment can't deliver names, no path prompts again.
-// Re-detection needs no prime of its own — any capable environment clears
-// the flag on its own, either at page load (a persisted-grant environment
-// lists real names in the load-time enumerate, and the real-option rebuild
-// clears it) or at the first recording (captureMic's post-grant
-// fire-and-forget enumerate lands real options and clears it there too).
-async function primeMicLabels(force) {
-  const micSelect = document.getElementById('micSelect');
-  // Labels already upgraded (a real option exists) — no reason to re-prompt.
-  const alreadyUpgraded = Array.from(micSelect.querySelectorAll('option[value]')).some(opt => opt.value);
-  if (alreadyUpgraded || micPrimeInFlight) return;
-  // A completed grant + enumerate already proved this environment can't
-  // deliver real mic names (file://-served Chrome can anonymize the list
-  // even post-grant — see the anonymized-list guard). Nagging for another
-  // prompt buys nothing here, regardless of which path asked — force only
-  // controls the attempted-once guard below, not this one.
-  let anonymized = false;
-  try { anonymized = localStorage.getItem('micEnumAnonymized') === '1'; } catch (e) { /* ignore */ }
-  if (anonymized) return;
-  if (!force && micPrimeAttempted) return;
-  micPrimeInFlight = true;
+// Re-entrancy guard for acquireMicHold() — a rapid double toggle-click must
+// not stack a second getUserMedia call. var, not let: STREAM_CARRY_CAP below
+// sets the precedent for module-level state a test harness needs to reach
+// and reset between scenarios.
+var micHoldInFlight = false;
+
+// Acquire and HOLD the mic stream for as long as the mic toggle stays on —
+// mirrors the webcam's preview-hold pattern (startCameraPreview /
+// state.cameraStream). Fired on a genuine toggle-ON click (toggleSource) and
+// again, with the new device, when the dropdown selection changes while
+// already on (see onDeviceSelected). captureMic() reuses this held stream at
+// record time instead of acquiring its own — that's the whole point: the
+// permission prompt (and the acquisition delay) now happens at the toggle
+// click, not at Record, so a faculty member's opening words aren't lost
+// while a file://-served Chrome (or Firefox without a persisted grant) waits
+// on the user to answer the pop-up.
+//
+// This supersedes v1.14/v1.15's primeMicLabels, which only ever needed
+// labels: it grabbed a throwaway audio:true stream, enumerated while it was
+// live, and stopped it immediately after. Here the stream itself must
+// survive, so it's acquired with the same constraints captureMic used to
+// build fresh at record time (see micAudioConstraints) and it is NOT stopped
+// once granted — stopMicHold (toggle-OFF) and releaseMicRecordingRef
+// (recording stop) are the only things that ever stop it now.
+//
+// Unlike primeMicLabels, a set micEnumAnonymized verdict no longer
+// suppresses this call. That suppression existed because a toggle-time
+// prompt used to be a useless nag — its grant evaporated before Record ever
+// ran, and the picked device didn't carry over to the recording anyway.
+// With a held stream, the toggle-time prompt IS the setup step: in an
+// anonymized environment it's the device picker (the browser's own
+// pop-up), and the grant now persists into recording via the hold. The flag
+// still governs ONLY the dropdown's Default-slot text (see
+// applyDeviceDefaultText) — that's a separate, unrelated honesty problem.
+async function acquireMicHold() {
+  if (micHoldInFlight) return;
+  micHoldInFlight = true;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    // Must enumerate before the tracks stop — Firefox blanks labels again
-    // once the granting stream ends, and the prior-label cache in
-    // enumerateDevices() only has something to cache while it's live.
+    // Snapshot the selection BEFORE the await: the select is enabled the
+    // moment the toggle flips on, so the user can change it while the
+    // permission prompt is still pending. The stream below is built from
+    // the constraints as they were NOW — recording that under the
+    // post-await selection would label an old-device hold as the new
+    // device, and captureMic's match check would reuse the wrong mic.
+    // Booked truthfully, a drifted selection just fails the match and
+    // falls back to a fresh acquire at record time.
+    const acquiredForDeviceId = state.selectedMic;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: micAudioConstraints(), video: false });
+    if (!state.sources.mic) {
+      // Toggled off again while the prompt was pending — don't hold a
+      // stream nobody wants anymore; stop it instead of leaking it.
+      stream.getTracks().forEach(t => t.stop());
+      return;
+    }
+    state.heldMicStream = stream;
+    state.heldMicDeviceId = acquiredForDeviceId;
+    // Must enumerate before the tracks would ever stop — Firefox blanks
+    // labels again once the granting stream ends (this one doesn't, but the
+    // pattern matches captureCamera/captureMic's post-grant re-enumerate).
     await enumerateDevices();
-    // The grant succeeded — did the environment actually deliver names?
-    // Persist the verdict so the passive path stops re-prompting once we've
-    // genuinely tried and failed (enumerateDevices() also clears this on
-    // any successful real-option rebuild, from any caller).
+    const micSelect = document.getElementById('micSelect');
     const gotRealOptions = Array.from(micSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+    // The environment may never be able to list devices at all, but the
+    // granted track still exposes its own label — surface it in the
+    // Default slot the same way captureCamera/captureMic already do.
+    const trackLabel = stream.getAudioTracks()[0]?.label;
+    if (trackLabel && !gotRealOptions) {
+      state.lastMicLabel = trackLabel;
+    }
     try {
       if (gotRealOptions) localStorage.removeItem('micEnumAnonymized');
       else localStorage.setItem('micEnumAnonymized', '1');
     } catch (e) { /* ignore */ }
-    applyMicDefaultText();
-    stream.getTracks().forEach(t => t.stop());
+    applyDeviceDefaultText('mic');
   } catch (err) {
-    // No user-facing error — recording start already has its own
-    // mic-failure handling. The dropdown just stays at "Default microphone".
-    console.warn('Could not prime mic labels:', err);
+    // Denied/dismissed — or the device itself failed (unplugged, busy in
+    // another app). A toggle left ON with no hold behind it would silently
+    // reintroduce the record-time prompt this feature exists to kill, so
+    // revert the toggle instead and tell the user how to retry — with the
+    // right message for what actually went wrong.
+    console.warn('Mic access failed:', err);
+    state.sources.mic = false;
+    updateToggleUI();
+    showError(err.name === 'NotAllowedError'
+      ? 'Microphone access was declined. Toggle the mic on again to ask once more.'
+      : 'Could not start the microphone. Check that it is connected and not in use by another app, then toggle the mic on again.');
   } finally {
-    micPrimeAttempted = true;
-    micPrimeInFlight = false;
+    micHoldInFlight = false;
   }
 }
 
@@ -1043,6 +1121,13 @@ function onDeviceSelected(type) {
     state.selectedCamera = document.getElementById('cameraSelect').value;
   } else if (type === 'mic') {
     state.selectedMic = document.getElementById('micSelect').value;
+    // Selection changed while the hold is live — re-acquire under the new
+    // device so captureMic keeps reusing a hold that actually matches the
+    // dropdown (see captureMic's held-stream reuse check).
+    if (state.sources.mic) {
+      stopMicHold();
+      acquireMicHold(); // fire-and-forget, same as the toggle-ON path
+    }
   }
 }
 
@@ -1065,16 +1150,14 @@ if (navigator.mediaDevices?.addEventListener) {
   navigator.mediaDevices.addEventListener('devicechange', enumerateDevices);
 }
 
-// Prime real mic labels on first interaction with the select itself too —
-// mic defaults on at load, so a user who never touches the toggle button
-// still sees real names before recording, not just after. onchange on this
-// select is wired inline in the HTML; mousedown+focus are wired here instead
-// since a pair of listeners is cleaner than stacking inline attributes.
-// Both only fire on a user gesture, so zero-prompts-at-load still holds, and
-// the select is disabled during recording, so they can't fire mid-recording.
-const micSelectEl = document.getElementById('micSelect');
-micSelectEl.addEventListener('mousedown', () => primeMicLabels());
-micSelectEl.addEventListener('focus', () => primeMicLabels());
+// v1.14/v1.15 had a passive mousedown/focus prime here (mic defaults OFF at
+// load, so the select stays disabled — see updateToggleUI — until the
+// toggle-ON click already primed labels via the forced path; this was a
+// backstop for later refocuses, e.g. the permission prompt closing handing
+// focus back to the select). It's fully redundant now: the select is only
+// ever enabled once acquireMicHold has already granted AND enumerated, so
+// there's nothing left for a refocus to retry. Removed rather than left
+// as dead code.
 
 // ============================================================
 // Media capture
@@ -1099,20 +1182,57 @@ async function captureCamera() {
     constraints.video.deviceId = { exact: state.selectedCamera };
   }
   const stream = await navigator.mediaDevices.getUserMedia(constraints);
-  enumerateDevices(); // camera permission is live now — upgrade labels (fire-and-forget)
+  // The environment may never be able to list devices at all (see the
+  // anonymized-list guard), but a granted track still exposes its own
+  // label. Capture it before the re-enumerate below runs, so a rebuild
+  // that lands no real options still tells the truth in the Default slot
+  // instead of falling back to "Default camera".
+  const camSelect = document.getElementById('cameraSelect');
+  const hasRealCamOption = Array.from(camSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+  const trackLabel = stream.getVideoTracks()[0]?.label;
+  if (trackLabel && !hasRealCamOption) {
+    state.lastCameraLabel = trackLabel;
+    applyDeviceDefaultText('camera');
+  }
+  // Camera has no separate priming step (it grants directly via the Webcam
+  // toggle's preview path), so — unlike primeMicLabels — this is the one
+  // place a completed grant+enumerate is known to have happened. Await the
+  // enumerate (rather than fire-and-forget) so the verdict can be read off
+  // the dropdown right after, and persist it the same way primeMicLabels
+  // does for the mic: camEnumAnonymized is its own flag, since the mic and
+  // camera are granted separately and one going anonymized says nothing
+  // about the other.
+  await enumerateDevices(); // camera permission is live now — upgrade labels
+  const gotRealCamOptions = Array.from(camSelect.querySelectorAll('option[value]')).some(opt => opt.value);
+  try {
+    if (gotRealCamOptions) localStorage.removeItem('camEnumAnonymized');
+    else localStorage.setItem('camEnumAnonymized', '1');
+  } catch (e) { /* ignore */ }
+  applyDeviceDefaultText('camera');
   return stream;
 }
 
 async function captureMic() {
-  const audioConstraints = {
-    echoCancellation: true,
-    noiseSuppression: true,
-  };
-  if (state.selectedMic) {
-    audioConstraints.deviceId = { exact: state.selectedMic };
+  // Reuse the toggle-ON hold when it's live and still matches the current
+  // selection — zero additional getUserMedia calls, so record-time start is
+  // instant and prompt-free (see acquireMicHold). Matching against
+  // heldMicDeviceId (the selection AT ACQUISITION TIME) rather than reading
+  // the track's own settings back, since an anonymized environment can
+  // report a blank deviceId on a live, correctly-selected track — the
+  // dropdown's onDeviceSelected already keeps heldMicDeviceId in sync with
+  // state.selectedMic whenever the hold is live, so this should normally
+  // agree with it by the time a recording starts.
+  if (state.heldMicStream && state.heldMicDeviceId === state.selectedMic &&
+      state.heldMicStream.getAudioTracks()[0]?.readyState === 'live') {
+    return state.heldMicStream;
   }
+  // Fallback — no hold (shouldn't normally happen; the mic toggle has to be
+  // on to reach here, but this defends against being called before that),
+  // a dead track (e.g. a Bluetooth mic dropped mid-session), or the
+  // selection drifted out from under the hold. Fresh-acquire, unchanged
+  // from before the hold existed.
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: audioConstraints,
+    audio: micAudioConstraints(),
     video: false,
   });
   // The environment may never be able to list devices at all (see the
@@ -1125,7 +1245,7 @@ async function captureMic() {
   const trackLabel = stream.getAudioTracks()[0]?.label;
   if (trackLabel && !hasRealMicOption) {
     state.lastMicLabel = trackLabel;
-    applyMicDefaultText();
+    applyDeviceDefaultText('mic');
   }
   enumerateDevices(); // mic permission is live now — upgrade labels (fire-and-forget)
   return stream;
@@ -3203,10 +3323,7 @@ async function startRecording() {
       state.cameraStream.getTracks().forEach(t => t.stop());
       state.cameraStream = null;
     }
-    if (state.micStream) {
-      state.micStream.getTracks().forEach(t => t.stop());
-      state.micStream = null;
-    }
+    releaseMicRecordingRef(); // preserves the hold if the mic toggle is still on — see its doc comment
     if (state.audioContext) {
       state.audioContext.close().catch(() => {});
       state.audioContext = null;
@@ -3671,6 +3788,43 @@ async function continueRecording() {
 // ============================================================
 // Cleanup
 // ============================================================
+
+// Release the recording-time mic reference (state.micStream) after a
+// recording ends, fails to start, or is cleaned up some other way. Unlike
+// the other streams cleanupStreams tears down unconditionally, mic tracks
+// must NOT die here if the mic toggle is still on: state.heldMicStream (see
+// acquireMicHold) needs to survive so the NEXT recording is prompt-free too,
+// not just this one. The audio mixing graph (state.audioContext) may have
+// consumed this stream via createMediaStreamSource — closing/rebuilding that
+// graph per recording (handled separately, right after this call in every
+// caller) is fine and doesn't touch the underlying tracks.
+function releaseMicRecordingRef() {
+  if (!state.micStream) return;
+  if (state.sources.mic) {
+    if (state.micStream !== state.heldMicStream) {
+      // captureMic had to fall back to a fresh acquire mid-recording (dead
+      // held track, selection drifted underneath it, etc). That fresh grant
+      // is now the best hold available — retire whatever stale hold existed
+      // and promote this one, so future recordings keep reusing it instead
+      // of prompting again.
+      if (state.heldMicStream) {
+        state.heldMicStream.getTracks().forEach(t => t.stop());
+      }
+      state.heldMicStream = state.micStream;
+      state.heldMicDeviceId = state.selectedMic;
+    }
+    // else: state.micStream IS the held stream (the common case) — leave
+    // its tracks alone, the hold keeps them alive for the next recording.
+  } else {
+    // Toggle is off — this was a recording-time-only stream (the toggle
+    // can't flip mid-recording, so this only happens if mic was off for the
+    // whole recording — state.micStream would be null already in that case,
+    // but stop it too if some other path ever sets it while off).
+    state.micStream.getTracks().forEach(t => t.stop());
+  }
+  state.micStream = null;
+}
+
 function cleanupStreams() {
   stopCompositing();
 
@@ -3682,10 +3836,7 @@ function cleanupStreams() {
     state.cameraStream.getTracks().forEach(t => t.stop());
     state.cameraStream = null;
   }
-  if (state.micStream) {
-    state.micStream.getTracks().forEach(t => t.stop());
-    state.micStream = null;
-  }
+  releaseMicRecordingRef(); // preserves the hold if the mic toggle is still on — see its doc comment
   if (state.audioContext) {
     state.audioContext.close().catch(() => {});
     state.audioContext = null;
