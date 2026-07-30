@@ -1351,6 +1351,12 @@ unchanged.
 or the `sessions`/`chunks` IndexedDB stores.** The v1.17 caption-logic
 section is untouched byte-for-byte.
 
+**Real acceptance (owner, 2026-07-29):** initial pass of the v1.18 manual
+list passed in the owner's environment. The owner explicitly wants a full
+regression re-run of ALL features against the final build before release —
+tracked as REVIEW.md #20; the accumulated manual acceptance lists in the
+Testing section below are the master checklist for that pass.
+
 ---
 
 ## Known limitations

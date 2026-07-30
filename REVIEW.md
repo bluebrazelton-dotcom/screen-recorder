@@ -287,9 +287,12 @@ Harness now 115 scenarios / 649 assertions (CQ–CZ then DA–DH), all
 pre-existing assertions unchanged.
 
 **Still open (v1.19 remainder, unchanged scope from the feature map):**
-keyboard shortcuts, split/merge cues, and chapter-marker hotkeys — plus the
-owner's browser acceptance pass for v1.18 itself (manual test list in
-BUILD_LOG's Testing section).
+keyboard shortcuts, split/merge cues, and chapter-marker hotkeys. v1.18
+itself passed the owner's initial acceptance pass (2026-07-29); the full
+regression re-run is deferred to the final-build pass (#20). Whether v1.19
+happens at all is under evaluation — the editor's primary case has been
+reframed as import-and-correct (owner discussion 2026-07-29), and the
+scrap/freeze/polish decision follows the owner's caption-workflow experiment.
 
 ## User documentation (queued 2026-07-29)
 
@@ -316,6 +319,17 @@ the user-facing documentation. Two deliverables:
 
 Not started — deliberately last in the queue so it documents the final shape
 instead of chasing a moving one.
+
+### 20. Final-build full regression pass — owner-requested (2026-07-29)
+Before calling any build "final," the owner will re-test EVERY feature
+end-to-end, not just the newest version's additions. The master checklist is
+the accumulated set of manual acceptance lists in BUILD_LOG's Testing section
+(crash resilience, continue recording, multi-crash, cancel-save, seeking,
+background-tab draw, streaming-save memory, zero-prompt load + camera-only,
+Firefox cancel/failed download, and the v1.18 caption-editor list), run in
+both browsers, Firefox first. Per-version acceptance passes (including
+v1.18's initial pass, 2026-07-29) do not substitute for this. Pairs naturally
+with #19 — same "when the feature set stabilizes" trigger.
 
 ---
 
