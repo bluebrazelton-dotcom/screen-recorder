@@ -1425,6 +1425,118 @@ item is unversioned until built.)
 
 ---
 
+### v1.20 — Re-record from a timestamp (#21), session 2 of 3: review pane + "Re-record from here" flow (2026-07-30)
+
+**Commit:** `#21 session 2: Stop & review pane, Rule-A cut application with undo, discarded-session lifecycle, save-as-is; Firefox seam-formula fix`
+
+Builds the user-facing flow on v1.19's metadata-cut primitive. The Stop &
+save path is untouched; "Stop & review" branches ONLY inside
+finalizeRecording, after capture has fully ended and the last chunk write
+is awaited — the recording pipeline and its ~1s-max-loss guarantee are
+untouched.
+
+**What was built:**
+
+1. **"Stop & review"** (`#btnStopReview`, shown exactly when Stop is) —
+   sets `state.stopMode='review'` and reuses the same stop path. In review
+   mode nothing is saved/completed/deleted: the session stays
+   `completed:false`, so a crash mid-review still hits the recovery banner.
+   During the stop the review button reads "Preparing review..." and the
+   Stop & save button's text is left alone.
+2. **Review pane** (`#reviewPane`, own `#reviewVideo`, module-level
+   `reviewState` — precedent pipState/captionEditorState; same mode-switch
+   convention as the caption editor, which is NOT reused: its player is
+   File-only and entangled with captionEditorState). Zero-chunk segments
+   are filtered out first (stitchAndSave's priorsWithData precedent);
+   filtered-to-empty bails to "No recording data found."
+   `assembleReviewPreview`: ONE chunk walk per segment feeds both Blob
+   parts and a default-mode scanner (earlier cut markers inherited
+   automatically at the forEachSessionChunk choke point); single segment →
+   makeSeekable; multi → concatenateWebM + makeSeekable — the ONE
+   legitimate reach into the buffered oracle path (preview only; every
+   save still goes through the streamed sinks). Size guard at ~1.2 GB
+   (`REVIEW_PREVIEW_SIZE_WARNING_BYTES`) warns, never blocks, and clears
+   once the preview is ready.
+3. **"Re-record from here (m:ss)"** — `computeCutPlan` on the scrub
+   position: `cut` sets the marker (or flags whole segments
+   `discarded:true` for cutAtByte===0), closes the pane into the armed
+   Continue-Recording idle state ("Kept m:ss. Select a screen and click
+   Record to continue from there."); `startOver` routes to the in-pane
+   confirm (never a silent delete); `noop` explains there's nothing after
+   the playhead. **Undo re-record** restores the exact pre-cut state — a
+   re-cut's PREVIOUS marker verbatim, only THIS cut's discarded sessions
+   un-flagged, priorSegments as they were — and disappears the moment a
+   new recording starts (tail bytes still live until final save).
+4. **Save as is / Discard / Back**: save through the real streamed sinks
+   with the standard `recording-<date>.webm` name and identical
+   downloaded/bail handling; cancel keeps the user IN the pane ("Save
+   cancelled — your recording is still here."); Discard uses an in-pane
+   banner confirm; Back arms all segments as priorSegments (the
+   Continue-Recording model).
+5. **Discarded-session lifecycle**: `setSessionDiscarded` +
+   `deleteDiscardedSessions`; excluded from checkForRecovery's list and
+   totals; swept at every confirmed-save/explicit-discard site —
+   finalizeRecording, stitchAndSave, both recoverRecording successes,
+   confirmDownloadArrived, saveSegmentsAsParts, discardRecovery, and the
+   review pane's own save/discard.
+
+**Orchestrator review pass: 4 defects caught in the draft** — (a) an empty
+final segment could reach the preview assembler; (b) stitched save-as-is
+opened the file picker with no filename; (c) cancelling save-as-is dumped
+the user out of the review pane; (d) a review stop set the OTHER button's
+label to "Saving...". All fixed and test-pinned before ship.
+
+**Post-acceptance fixes (2026-07-30, from owner Firefox testing):**
+
+1. **Review-pane failure hardening** — the owner's first Firefox pass hit a
+   silent dead click on "Re-record from here". `assembleReviewPreview` now
+   honors the scanner's `finish()` result (a bailed scan sets
+   `reviewState.scansOk = false`), `openReviewPane` degrades instead of
+   dead-ending (best-effort video; cut button disabled with a plain
+   message — watching/Save-as-is/Discard/Back never need a scan), and
+   `reviewCutFromHere` is scansOk-gated and try/caught: any failure keeps
+   the pane open and says so. Scenario DR pins all of it.
+2. **Seam formula fix (the real Firefox bug)** — byte-level analysis of the
+   owner's broken stitched file proved Firefox emits ~7.5-SECOND clusters
+   (Chrome: ~1s), so the v1.13 seam estimate `maxClusterTs + 1000` rebased
+   each next segment up to ~6.5s BEFORE the previous segment's content
+   ended — a non-monotonic timeline. Firefox stops decoding video at the
+   seam; audio resumes only after the overlap (the owner's exact symptom:
+   video frozen from before the cut point, then delayed audio). Fix: every
+   seam offset is now the previous segment's actual CONTENT END —
+   `Math.max(lastClusterMaxBlockTime, maxClusterTs) + SEAM_GAP_MS` (33ms,
+   one frame) — changed in LOCKSTEP in `concatenateWebM` (oracle + review
+   preview), `scanSegmentsForStitch` (streamed saves), and `computeCutPlan`
+   (cut math); the differential scenarios enforce the three never drift.
+   Chrome seams shrink from ~1s of held frame to ~one frame, and
+   crash-recovery stitching inherits the fix (closes Known Limitation #4).
+   New `syntheticLongClusterWebm` fixture (reproduces the 6.5s overlap
+   under the old formula) + scenario DS, including `assertNoOverlap`: it
+   re-scans real stitched OUTPUT bytes and asserts the timeline never
+   rewinds — the regression check that would have caught this. Scenarios
+   AL/AM/AN/DI/DL/DO and the `streamedPlanBytes` helper were updated from
+   the old formula's expected values.
+
+**Tests:** DM (stop-mode routing — spies prove review never reaches the
+save path; labels checked), DN (preview differentials: single/stitched/
+inherited-cut vs the buffered oracles; stored scans match direct scans of
+the post-cut bytes), DO (cut + undo incl. M1-restore on re-cut, seam-gap
+whole-segment discard, startOver/noop safety), DP (discarded lifecycle
+through real save/discard paths), DQ (save-as-is differentials + cancel
+preservation), DR (failure hardening), DS (long-cluster seam fix +
+no-overlap regression). Harness: **126 scenarios / 812 assertions** (was
+119/722).
+
+**Real acceptance (owner, 2026-07-30, Firefox):** full re-record cycle —
+record, Stop & review, cut ("it cut where I asked it to cut, cleanly"),
+re-record, save — with the stitched output playing smoothly through the
+seam; same screen/webcam/mic across takes. Cross-browser pass and the
+remaining v1.20 manual list items fold into session 3 / #20.
+
+**No changes to** the live recording pipeline or `sessionChunkStats`.
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.
@@ -1433,7 +1545,7 @@ item is unversioned until built.)
 
 3. **WebM only:** No MP4 output. Some platforms (iOS, older Android) have limited WebM support. mediabunny could add MP4 output in a future version.
 
-4. **Timestamp estimation:** When stitching, the duration of each segment is estimated as `lastClusterTimestamp + 1000ms` (one cluster duration). This could produce a tiny gap or overlap at the stitch point. Imperceptible in practice but technically imprecise.
+4. ~~**Timestamp estimation:** When stitching, the duration of each segment is estimated as `lastClusterTimestamp + 1000ms` (one cluster duration). This could produce a tiny gap or overlap at the stitch point. Imperceptible in practice but technically imprecise.~~ — ✓ Fixed in v1.20: seam offsets now use the previous segment's actual content end (`lastClusterMaxBlockTime`) + `SEAM_GAP_MS` (33ms). The old +1000ms estimate overlapped by up to ~6.5s on Firefox's ~7.5-second clusters, breaking video decode at every stitch seam (see the v1.20 entry).
 
 5. **No black frame detection:** Screen switching mid-recording produces a few black frames. Detecting and removing these would require frame-by-frame analysis (decode → inspect → re-encode), which is a significant complexity increase. Noted for future exploration.
 
@@ -1454,6 +1566,13 @@ item is unversioned until built.)
    the environment can't deliver names. Serving the app over `http://localhost` (or
    any http(s) origin) restores persisted grants and the full named dropdown.
 
+10. **Cut precision follows cluster size:** "Re-record from here" cuts at the
+    last cluster boundary at/before the chosen time. Chrome's ~1s clusters
+    give ~1s precision; Firefox's ~7.5s clusters mean the cut can land up to
+    ~7.5s before the chosen point (extra re-recording — never surviving
+    mistake content). Block-precision truncation inside the final kept
+    cluster is the queued fix (REVIEW #22).
+
 ---
 
 ## Future features (roadmap)
@@ -1473,12 +1592,12 @@ item is unversioned until built.)
 
 ```
 screen-recorder/
-├── index.html      # The entire app (HTML + CSS + JS, ~5100 lines)
+├── index.html      # The entire app (HTML + CSS + JS, ~5700 lines)
 ├── README.md       # Project description and usage
 ├── LICENSE         # MIT License
 ├── BUILD_LOG.md    # This file
 ├── REVIEW.md       # Fable 5 code review — tracked items + build queue
-└── test.cjs        # Node harness (119 scenarios / 722 assertions; npm i fake-indexeddb)
+└── test.cjs        # Node harness (126 scenarios / 812 assertions; npm i fake-indexeddb)
 ```
 
 ---
@@ -1657,6 +1776,47 @@ DOM/video element; run in both Firefox (primary) and Chrome (secondary)):**
     defect E).** Open video A, add a couple of cues, then open video B which
     has its own saved draft from a prior session → the draft-restore banner
     for B appears with NO leftover rows from A visible behind it.
+
+**Manual acceptance test (review pane / re-record, v1.20 — run in both browsers, Firefox first):**
+1. **Stop & review.** Record ~30s, click "Stop & review" → recorder controls
+   hide, pane shows, the preview plays and seeks; no save dialog appeared.
+   Repeat from paused.
+2. **Labels.** During the review stop the review button reads "Preparing
+   review..." and "Stop & save" text is unchanged; back at the recorder,
+   both labels are restored.
+3. **Re-record from here.** Scrub mid-recording, click "Re-record from m:ss"
+   → pane closes, "Kept m:ss…" status, "Undo re-record" visible. Record a
+   new take, Stop & save → ONE stitched file that plays through the seam:
+   a brief single-frame glitch at the seam is acceptable; multi-second
+   freezes or silent audio gaps are NOT (v1.20's seam fix). Duration ≈
+   kept + new take.  ✓ Passed in Firefox (owner, 2026-07-30).
+4. **Undo.** After a cut, click "Undo re-record" → prior-segments status
+   returns; record + save → the FULL original plus the new take (no cut
+   applied).
+5. **No-op cut.** With the playhead at the very end, "Re-record from here"
+   → "That's already the end…" message; nothing changes.
+6. **Start over.** "Re-record from 0:00" → confirm banner; "Keep reviewing"
+   changes nothing; confirming discards and lands at clean idle (no
+   recovery banner after reload).
+7. **Save as is.** Single segment → normal save dialog/download; the file
+   plays; reload shows no recovery banner.
+8. **Cancel stays.** Cancel the save-as-is picker → still in the pane,
+   "Save cancelled — your recording is still here."; saving again succeeds.
+9. **Discard.** "Discard recording" → in-pane confirm renders correctly
+   inside the pane; confirm → clean idle.
+10. **Back to recorder.** → "N prior segment(s) preserved…" status; record
+    + Stop & save → stitched file includes the reviewed content.
+11. **Crash mid-review.** Kill the tab with the pane open → reload shows
+    the recovery banner with the recording.
+12. **Multi-segment.** Continue-recording chain → Stop & review → preview
+    plays across seams; cut inside an EARLIER segment → later segment
+    dropped; save → file contains exactly what was kept.
+13. **Caption editor coexistence.** Caption editor still opens/closes
+    normally before and after a review cycle.
+14. **Degraded review (v1.20 hardening).** If a recording can't be scanned,
+    the pane still opens with "Re-record from here" disabled and a plain
+    message; Save as is / Discard / Back all still work. (Hard to trigger
+    manually — covered by harness scenario DR; verify only if it occurs.)
 
 ---
 

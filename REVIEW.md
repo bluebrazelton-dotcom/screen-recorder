@@ -402,8 +402,31 @@ enforcement in `forEachSessionChunk` + `setSessionCut`/`clearSessionCut` +
 differential scenarios DI–DL landed; harness at 119 scenarios / 722
 assertions. Orchestrator review caught 1 draft defect (an `isFinite(null)`
 marker guard that would have turned a corrupt null marker into an empty
-save — now typeof-guarded and test-pinned). Remaining: session 2 (review
-pane + "Re-record from here" flow), session 3 (integration + acceptance).
+save — now typeof-guarded and test-pinned). Remaining: sessions 2–3.
+
+**Session 2 SHIPPED (2026-07-30, v1.20):** Stop & review + review pane +
+Rule-A cut application with exact undo + discarded-session lifecycle +
+save-as-is. Orchestrator review caught 4 draft defects; owner Firefox
+testing surfaced two more, both fixed same-day: silent dead-click
+hardening (scansOk gate + try/catch, scenario DR) and the v1.13 seam
+formula overlapping Firefox's ~7.5-second clusters (content-end offsets +
+SEAM_GAP_MS, scenario DS — also fixes crash-stitch seams and closes
+BUILD_LOG known limitation #4). Harness at 126 scenarios / 812 assertions.
+Owner Firefox re-test PASSED (2026-07-30): clean cut at the chosen point,
+stitched output plays smoothly through the seam. Firefox cut precision is
+cluster-bound (~7.5s there) — queued as #22. Remaining: session 3 —
+integration + the rest of the v1.20 manual acceptance list (items 4–13,
+plus Chrome), which pairs with #20.
+
+### 22. Block-precision re-record cut (queued 2026-07-30)
+
+Firefox's ~7.5s clusters make Rule-A's cluster-boundary cut precision ~7.5s
+there (Chrome: ~1s). Fix: truncate INSIDE the final kept cluster at the last
+block boundary <= T. The kept cluster is the output's final cluster, so an
+unknown-size cluster needs no size rewrite; a known-size one needs its size
+field rewritten (or converted to unknown-size) — and the truncated-known-size
+asymmetry scenario AX pins must be respected. Differential harness coverage
+mandatory. Design brief first; Fable designs/reviews, Sonnet executes.
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature

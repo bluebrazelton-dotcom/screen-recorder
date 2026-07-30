@@ -540,6 +540,45 @@
   }
   .btn-delete-cue:hover { background: rgba(233, 69, 96, 0.1); }
 
+  /* Review pane (REVIEW #21 session 2) */
+  .btn-stop-review {
+    background: var(--border);
+    color: var(--text);
+  }
+  .btn-stop-review:hover { background: #3a4a6c; }
+
+  .btn-undo-rerecord {
+    background: var(--surface);
+    color: var(--green);
+    border: 1px solid var(--green-dim);
+  }
+  .btn-undo-rerecord:hover { background: var(--surface-hover); }
+
+  .btn-rerecord-here {
+    background: var(--surface);
+    color: var(--green);
+    border: 1px solid var(--green-dim);
+  }
+  .btn-rerecord-here:hover { background: var(--surface-hover); }
+  .btn-rerecord-here:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .btn-save-as-is {
+    background: var(--green);
+    color: #111;
+  }
+  .btn-save-as-is:hover { background: #6fe0bb; }
+
+  .review-pane {
+    display: none;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  .review-pane.visible { display: flex; }
+
   /* Footer */
   footer {
     width: 100%;
@@ -670,8 +709,10 @@
       <button class="primary btn-caption-editor" id="btnCaptionEditor" onclick="openCaptionEditor()">Caption editor</button>
       <button class="primary btn-pause" id="btnPause" onclick="pauseResume()" style="display:none;">Pause</button>
       <button class="primary btn-stop" id="btnStop" onclick="stopRecording()" style="display:none;">Stop &amp; save</button>
+      <button class="primary btn-stop-review" id="btnStopReview" onclick="stopAndReview()" style="display:none;">Stop &amp; review</button>
       <button class="primary btn-select-screen" id="btnSelectScreen" onclick="selectScreen()">Select Screen</button>
       <button class="primary btn-record" id="btnRecord" onclick="startRecording()" disabled>Record</button>
+      <button class="primary btn-undo-rerecord" id="btnUndoReRecord" onclick="undoReRecord()" style="display:none;">Undo re-record</button>
     </div>
   </div>
 
@@ -727,6 +768,41 @@
 
     <div class="caption-cue-list" id="captionCueList"></div>
   </div>
+
+  <!-- Review pane (REVIEW #21 session 2): shown after "Stop & review". Own -->
+  <!-- <video> — NOT #captionVideo, whose player is File-only and entangled -->
+  <!-- with captionEditorState. Same mode-switch convention as the caption -->
+  <!-- editor above (base display:none + .visible; setRecorderControlsVisible). -->
+  <div class="review-pane" id="reviewPane">
+    <div class="caption-editor-header">
+      <h2>Review recording</h2>
+      <button class="primary btn-back-recorder" onclick="reviewBackToRecorder()">Back to recorder</button>
+    </div>
+
+    <!-- Reused for BOTH the plain "Discard recording" confirm and the -->
+    <!-- start-over-from-the-beginning confirm; showReviewDiscardConfirm() -->
+    <!-- sets the message per entry point. -->
+    <div class="recovery-banner" id="reviewDiscardConfirm">
+      <h3>Discard this recording?</h3>
+      <p id="reviewDiscardConfirmMsg">Discard this recording? This can't be undone once you confirm.</p>
+      <div class="recovery-actions">
+        <button class="primary btn-stop" onclick="reviewDiscardConfirmed()">Discard recording</button>
+        <button class="primary btn-record" onclick="hideReviewDiscardConfirm()">Keep reviewing</button>
+      </div>
+    </div>
+
+    <div class="caption-status" id="reviewStatus"></div>
+
+    <div class="caption-video-wrap">
+      <video id="reviewVideo" controls ontimeupdate="onReviewVideoTimeUpdate()"></video>
+    </div>
+
+    <div class="caption-editor-toolbar">
+      <button class="primary btn-rerecord-here" id="btnReRecordHere" onclick="reviewCutFromHere()">Re-record from 0:00</button>
+      <button class="primary btn-save-as-is" onclick="reviewSaveAsIs()">Save as is</button>
+      <button class="primary btn-stop" onclick="requestReviewDiscard()">Discard recording</button>
+    </div>
+  </div>
 </main>
 
 <footer>
@@ -774,6 +850,9 @@ const state = {
   sessionId: null,
   chunkIndex: 0,
   priorSegments: [],   // Array of { sessionId, mimeType } from interrupted recordings
+  stopMode: 'save',    // REVIEW #21 session 2: 'save' (Stop & save, default) or 'review'
+                        // (Stop & review) — read once in finalizeRecording AFTER capture has
+                        // fully ended, then reset to 'save'. Never branches mid-recording.
 };
 
 // ============================================================
@@ -893,6 +972,61 @@ async function clearSessionCut(sessionId) {
     tx.oncomplete = () => { db.close(); resolve(); };
     tx.onerror = () => { db.close(); reject(tx.error); };
   });
+}
+
+// Read a session record without mutating it. Needed by the review pane's
+// "Undo re-record": undoing a re-cut of an already-cut segment must restore
+// the PREVIOUS cutAtByte/cutAtMs exactly, not just clear the marker, so the
+// pre-cut value has to be read before setSessionCut overwrites it.
+async function getSessionRecord(sessionId) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('sessions', 'readonly');
+    const req = tx.objectStore('sessions').get(sessionId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+    tx.oncomplete = () => db.close();
+  });
+}
+
+// REVIEW #21 session 2: soft-delete for a whole segment a cut drops entirely
+// (Rule A — a cutAtByte===0 plan, or a later segment in the chain past the
+// cut point). Same read-modify-put shape as setSessionCut/completeSession.
+// Discarded sessions are excluded from checkForRecovery's list/totals but
+// their chunks are untouched until deleteDiscardedSessions() sweeps them at
+// the next confirmed-save or explicit-discard trigger point.
+async function setSessionDiscarded(sessionId, discarded) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('sessions', 'readwrite');
+    const store = tx.objectStore('sessions');
+    const req = store.get(sessionId);
+    req.onsuccess = () => {
+      const session = req.result;
+      if (session) {
+        if (discarded) session.discarded = true;
+        else delete session.discarded;
+        store.put(session);
+      }
+    };
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+// Sweep every session flagged discarded=true. Called from the same trigger
+// points that clean up their kept siblings (every confirmed-save success
+// path and every explicit whole-recording discard) — see BUILD_LOG for the
+// full cleanup-site audit. A no-op scan when nothing is flagged.
+async function deleteDiscardedSessions() {
+  const db = await openDB();
+  const discardedIds = await new Promise((resolve, reject) => {
+    const tx = db.transaction('sessions', 'readonly');
+    const req = tx.objectStore('sessions').getAll();
+    req.onsuccess = () => { db.close(); resolve(req.result.filter(s => s.discarded).map(s => s.id)); };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
+  for (const id of discardedIds) await deleteSession(id);
 }
 
 async function getIncompleteSession() {
@@ -2297,6 +2431,15 @@ function webmRewriteCluster(buffer, cluster, timeOffset) {
   }
 }
 
+// Gap inserted at each stitch seam, in ms: one frame at 30fps. Replaces the
+// old +1000ms cluster-duration estimate, which assumed a ~1s inter-cluster
+// gap (Chrome's shape) and so overlapped by seconds on Firefox's ~7.5s
+// clusters — Firefox then refuses to play past the resulting non-monotonic
+// timeline (see BUILD_LOG "Known limitation #4"). The seam must land at the
+// previous segment's actual CONTENT END (highest block time in its last
+// cluster), not its last cluster's START.
+const SEAM_GAP_MS = 33;
+
 // Concatenate multiple WebM blobs into a single WebM blob.
 // Uses remuxing (no decode/re-encode) — fast and lossless.
 // Buffered reference implementation (STREAMING_STITCH_HANDOFF §2/§4) — stays
@@ -2332,7 +2475,18 @@ async function concatenateWebM(blobs) {
   // total duration of all preceding segments.
   let timeOffset = 0;
   for (let i = 1; i < buffers.length; i++) {
-    timeOffset += scans[i - 1].lastTimestamp + 1000; // +1000 for last cluster's ~1s duration
+    // Content-end of the previous segment: highest absolute block timestamp in
+    // its LAST cluster (buffered equivalent of scanSegmentsForStitch's
+    // lastClusterMaxBlockTime — same view-relative-to-buffer-start convention
+    // makeSeekable already uses), guarded by scans[i-1].lastTimestamp (mirrors
+    // maxClusterTs — defensive for a degenerate zero-block final cluster). This
+    // MUST equal the streamed scanner's number on identical bytes; the
+    // differential tests enforce it.
+    const prevClusters = scans[i - 1].clusters;
+    const prevContentEnd = prevClusters.length > 0
+      ? webmMaxBlockTime(new DataView(buffers[i - 1]), prevClusters[prevClusters.length - 1])
+      : 0;
+    timeOffset += Math.max(prevContentEnd, scans[i - 1].lastTimestamp) + SEAM_GAP_MS;
 
     if (scans[i].clusters.length > 0) {
       for (const cluster of scans[i].clusters) {
@@ -3012,10 +3166,12 @@ function buildStreamIndexParts(scan) {
 // would otherwise be scanned clustersOnly.
 //
 // `T` is a target time in ms on the STITCHED/global timeline. Seam offsets
-// use the exact formula scanSegmentsForStitch (3008) / concatenateWebM
-// (2255-2257) use: offset_0 = 0; offset_i = offset_{i-1} + scans[i-1].maxClusterTs
-// + 1000. Any other formula would let the preview timeline and the cut byte
-// drift apart.
+// use the exact formula scanSegmentsForStitch / concatenateWebM use:
+// offset_0 = 0; offset_i = offset_{i-1} + Math.max(scans[i-1].lastClusterMaxBlockTime,
+// scans[i-1].maxClusterTs) + SEAM_GAP_MS — the previous segment's actual
+// CONTENT END, not its last cluster's START, so Firefox's ~7.5s clusters
+// don't overlap the next segment's start. Any other formula would let the
+// preview timeline and the cut byte drift apart.
 //
 // Rule A: the cluster CONTAINING T is dropped — we never keep content past T.
 // Returns one of:
@@ -3038,8 +3194,8 @@ function buildStreamIndexParts(scan) {
 // zero-cluster NON-first scan shouldn't occur in practice (scanSegmentsForStitch
 // itself bails the whole chain on any zero-cluster segment); if it did, this
 // function degrades sanely — that segment just contributes no cut candidates
-// and its true duration is invisible to the +1000 seam math (same blind spot
-// concatenateWebM/scanSegmentsForStitch already have), rather than throwing.
+// and its true duration is invisible to the SEAM_GAP_MS seam math (same blind
+// spot concatenateWebM/scanSegmentsForStitch already have), rather than throwing.
 function computeCutPlan(scans, T) {
   if (!scans || scans.length === 0) return { kind: 'startOver', keptMs: 0 };
 
@@ -3049,7 +3205,7 @@ function computeCutPlan(scans, T) {
   const offsets = new Array(scans.length);
   offsets[0] = 0;
   for (let i = 1; i < scans.length; i++) {
-    offsets[i] = offsets[i - 1] + scans[i - 1].maxClusterTs + 1000;
+    offsets[i] = offsets[i - 1] + Math.max(scans[i - 1].lastClusterMaxBlockTime, scans[i - 1].maxClusterTs) + SEAM_GAP_MS;
   }
 
   let found = null;   // { i, k } of the LAST cluster with g <= T
@@ -3146,11 +3302,14 @@ function buildStitchPlanParts(segScans) {
 
 // Pass 1 for the multi-segment stitch: scan `segments` (in play order) and
 // hand back a merged plan. Segment 1 runs the default-mode scanner
-// (verbatim); segments 2..N run clusters-only, chained by timeOffset —
-// each accumulation step is prevScan.maxClusterTs + 1000, prevScan being the
-// PREVIOUS segment's own scan result. This is the exact formula
-// concatenateWebM uses (1738–1739) and the one streamedPlanBytes's test
-// harness helper uses — one shared accumulation, so the two never drift apart.
+// (verbatim); segments 2..N run clusters-only, chained by timeOffset — each
+// accumulation step is Math.max(prevScan.lastClusterMaxBlockTime,
+// prevScan.maxClusterTs) + SEAM_GAP_MS, prevScan being the PREVIOUS segment's
+// own scan result: the previous segment's actual CONTENT END, not its last
+// cluster's START (the old +1000ms cluster-duration estimate overlapped by
+// seconds on Firefox's ~7.5s clusters). This is the exact formula
+// concatenateWebM uses and the one streamedPlanBytes's test harness helper
+// uses — one shared accumulation, so the two never drift apart.
 // `onChunk(i, data)`, if given, fires once per chunk of segment i, right
 // before that chunk reaches its scanner — sinks use it to retain their own
 // per-chunk state (FSA needs none; the download sink retains chunk Blobs).
@@ -3166,7 +3325,7 @@ async function scanSegmentsForStitch(segments, onChunk) {
   let prevScan = null;
 
   for (let i = 0; i < segments.length; i++) {
-    if (i > 0) timeOffset += prevScan.maxClusterTs + 1000;
+    if (i > 0) timeOffset += Math.max(prevScan.lastClusterMaxBlockTime, prevScan.maxClusterTs) + SEAM_GAP_MS;
     const scanner = i === 0
       ? createWebmStreamScanner()
       : createWebmStreamScanner({ clustersOnly: true, timeOffset, videoTrack });
@@ -3186,6 +3345,58 @@ async function scanSegmentsForStitch(segments, onChunk) {
   const plan = buildStitchPlanParts(segScans);
   if (plan.bail) return { bail: plan.bail };
   return { plan, chunkCount };
+}
+
+// Above this many total bytes across the segments being previewed, the
+// review pane warns before assembling (never blocks — the assembly still
+// runs). Named so the number only lives in one place.
+const REVIEW_PREVIEW_SIZE_WARNING_BYTES = 1_200_000_000; // ~1.2 GB
+
+// Assemble the scrub preview for the review pane (REVIEW #21 session 2).
+// Factored out of any DOM so the harness can test it directly. `segments` is
+// state.priorSegments + the just-stopped session, in order. ONE chunk walk
+// per segment via forEachSessionChunk — cut markers from any EARLIER cut are
+// inherited automatically at that choke point, so a segment that was already
+// cut in a prior review cycle just yields fewer bytes here, same as every
+// other consumer. Each chunk feeds BOTH a Blob-parts array and a default-mode
+// createWebmStreamScanner; the per-segment scan results are stashed on
+// reviewState.scans for computeCutPlan ("Re-record from here" needs one
+// verbatim-cluster scan per segment, not the clustersOnly shape stitching
+// uses for segments 2..N).
+//
+// Single segment: makeSeekable(new Blob(parts)) directly. Multi-segment:
+// concatenateWebM(perSegmentBlobs) then makeSeekable — concatenateWebM is
+// save-flow-unreachable everywhere else (buffered, differential-oracle only,
+// per REVIEW #5/#10), but the review preview is a one-shot in-memory scrub
+// aid, not a save path, so this is the one place that legitimately reaches
+// it. Save flows (Save as is included) must keep going through the streamed
+// sinks, never this function's buffered blobs, for the final write.
+// makeSeekable's own un-indexed fallback (return the blob unchanged) is
+// acceptable here too — the preview just loses seeking.
+async function assembleReviewPreview(segments) {
+  const scans = [];
+  const segmentBlobs = [];
+  let scansOk = true;
+  for (const seg of segments) {
+    const parts = [];
+    const scanner = createWebmStreamScanner();
+    await forEachSessionChunk(seg.sessionId, (data) => {
+      const bytes = new Uint8Array(data);
+      parts.push(bytes);
+      scanner.push(bytes);
+    });
+    // finish() returning false means the scan bailed — result() can't be
+    // trusted, so the cut math must be disabled (reviewState.scansOk gates
+    // "Re-record from here"). The blob is still assembled: watching and
+    // Save-as-is don't need a scan.
+    if (!scanner.finish()) scansOk = false;
+    scans.push(scanner.result());
+    segmentBlobs.push(new Blob(parts));
+  }
+  reviewState.scans = scans;
+  reviewState.scansOk = scansOk;
+  const combined = segmentBlobs.length <= 1 ? (segmentBlobs[0] || new Blob([])) : await concatenateWebM(segmentBlobs);
+  return makeSeekable(combined);
 }
 
 // Fire-and-forget download (Firefox — no File System Access API). Arrival
@@ -3675,7 +3886,14 @@ async function startRecording() {
     btnRecord.style.display = 'none';
     document.getElementById('btnSelectScreen').style.display = 'none';
     document.getElementById('btnStop').style.display = '';
+    document.getElementById('btnStopReview').style.display = '';
     document.getElementById('btnPause').style.display = '';
+    // REVIEW #21 session 2: the one-click "Undo re-record" affordance is
+    // session-local to the armed idle state a cut lands in — the tail bytes
+    // it could restore stay intact, but the UI shortcut goes away the moment
+    // a new recording starts (no restore UI after recording resumes).
+    document.getElementById('btnUndoReRecord').style.display = 'none';
+    reviewState.undo = null;
     updateToggleUI();
     updateStatus('recording', 'Recording');
     startTimer();
@@ -3728,13 +3946,35 @@ async function stopRecording() {
   if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') return;
 
   document.getElementById('btnStop').disabled = true;
-  document.getElementById('btnStop').textContent = 'Saving...';
+  document.getElementById('btnStopReview').disabled = true;
+  // Which button's label changes depends on which one was clicked — a
+  // review stop must leave "Stop & save"'s own text alone.
+  if (state.stopMode === 'review') {
+    document.getElementById('btnStopReview').textContent = 'Preparing review...';
+  } else {
+    document.getElementById('btnStop').textContent = 'Saving...';
+  }
 
   // Request the final chunk, then stop fires
   state.mediaRecorder.stop();
 }
 
+// REVIEW #21 session 2: "Stop & review" — sets stopMode then reuses the SAME
+// stop path as "Stop & save" byte-for-byte (mediaRecorder.stop() -> onstop ->
+// finalizeRecording, after the last chunk write is awaited). The branch on
+// stopMode happens only inside finalizeRecording, once capture has fully
+// ended — this function never touches the recording pipeline itself.
+function stopAndReview() {
+  state.stopMode = 'review';
+  stopRecording();
+}
+
 async function finalizeRecording() {
+  // Captured and reset immediately: whichever stop button fires next
+  // defaults to 'save' again, same as before this feature existed, even if
+  // this call throws before reaching its own save branch.
+  const stopMode = state.stopMode;
+  state.stopMode = 'save';
   try {
     // Read the session's mimeType so we can rebuild the blob with the right codec.
     const db = await openDB();
@@ -3760,6 +4000,15 @@ async function finalizeRecording() {
       return;
     }
 
+    if (stopMode === 'review') {
+      // Stop & review: do NOT save, complete, or delete anything — the
+      // session stays completed:false so a crash during review still hits
+      // the recovery banner. openReviewPane assembles the scrub preview
+      // from priorSegments + the just-stopped session, in order.
+      await openReviewPane([...state.priorSegments, { sessionId: state.sessionId, mimeType: sessionMimeType }]);
+      return;
+    }
+
     if (state.priorSegments.length > 0) {
       // Multi-segment: streamed stitch of prior segments + current into one
       // file (Known Limitation #1, closed in v1.13 — this used to buffer
@@ -3770,6 +4019,7 @@ async function finalizeRecording() {
       const result = await saveFile({ kind: 'session', sessionId: state.sessionId, mimeType: sessionMimeType });
       if (result === 'saved') {
         await deleteSession(state.sessionId);
+        await deleteDiscardedSessions(); // sweep any soft-deleted siblings from an earlier review-pane cut
       } else if (result === 'downloaded') {
         offerDownloadConfirm([state.sessionId], 1);
       } else {
@@ -3802,6 +4052,12 @@ async function saveSegmentsAsParts(segments) {
     else if (r === 'downloaded') { downloadedIds.push(seg.sessionId); fileNum++; }
     else { cancelled = true; break; }
   }
+  // A part landing (saved or downloaded-pending) is a confirmed-or-pending
+  // save event for THIS chain — sweep any discarded siblings from an earlier
+  // review-pane cut regardless of how far the loop got; sessions this loop
+  // is still trying to save are untouched either way (discarded is a
+  // separate, already-decided flag).
+  await deleteDiscardedSessions();
   return { cancelled, downloadedIds };
 }
 
@@ -3845,6 +4101,7 @@ async function stitchAndSave(currentMimeType) {
         await deleteSession(seg.sessionId);
       }
       await deleteSession(state.sessionId);
+      await deleteDiscardedSessions(); // sweep any soft-deleted siblings from an earlier review-pane cut
       state.priorSegments = [];
     } else if (result === 'downloaded') {
       // Keep every session until the user confirms the download arrived.
@@ -3943,6 +4200,11 @@ function offerDownloadConfirm(sessionIds, fileCount) {
 
 async function confirmDownloadArrived() {
   for (const id of downloadPendingIds) await deleteSession(id);
+  // The download is the "confirmed save" trigger point on this path (saveFile
+  // only ever returns 'downloaded' when arrival can't be verified any other
+  // way) — sweep any discarded siblings from an earlier review-pane cut here,
+  // same as the FSA-confirmed 'saved' branches do immediately.
+  await deleteDiscardedSessions();
   downloadPendingIds = [];
   downloadPendingFiles = 0;
   state.priorSegments = [];
@@ -4004,7 +4266,10 @@ async function checkForRecovery() {
     const allSessions = await new Promise((resolve, reject) => {
       const tx = db.transaction('sessions', 'readonly');
       const req = tx.objectStore('sessions').getAll();
-      req.onsuccess = () => { db.close(); resolve(req.result.filter(s => !s.completed)); };
+      // REVIEW #21 session 2: discarded sessions (soft-deleted by a review-pane
+      // cut) never belong in the recovery banner's list or byte/chunk totals —
+      // they sit flagged until deleteDiscardedSessions() sweeps them.
+      req.onsuccess = () => { db.close(); resolve(req.result.filter(s => !s.completed && !s.discarded)); };
       req.onerror = () => { db.close(); reject(req.error); };
     });
 
@@ -4080,6 +4345,7 @@ async function recoverRecording() {
       const result = await saveFile({ kind: 'session', sessionId: segments[0].id, mimeType: segments[0].mimeType });
       if (result === 'saved') {
         await deleteSession(segments[0].id);
+        await deleteDiscardedSessions(); // sweep any soft-deleted siblings from an earlier review-pane cut
         document.getElementById('recoveryBanner').classList.remove('visible');
       } else if (result === 'downloaded') {
         offerDownloadConfirm([segments[0].id], 1);
@@ -4098,6 +4364,7 @@ async function recoverRecording() {
 
     if (result === 'saved') {
       for (const s of segments) await deleteSession(s.id);
+      await deleteDiscardedSessions(); // sweep any soft-deleted siblings from an earlier review-pane cut
       document.getElementById('recoveryBanner').classList.remove('visible');
       return;
     }
@@ -4135,6 +4402,10 @@ async function discardRecovery() {
     for (const sess of sessions) {
       await deleteSession(sess.id);
     }
+    // Discarding the whole recovery banner is an explicit whole-recording
+    // discard — sweep any discarded siblings too (they're excluded from
+    // window._recoverySessions, since checkForRecovery filters them out).
+    await deleteDiscardedSessions();
     document.getElementById('recoveryBanner').classList.remove('visible');
   } catch (err) {
     console.error('Discard failed:', err);
@@ -4233,6 +4504,9 @@ function resetUI() {
   document.getElementById('btnStop').style.display = 'none';
   document.getElementById('btnStop').disabled = false;
   document.getElementById('btnStop').textContent = 'Stop & save';
+  document.getElementById('btnStopReview').style.display = 'none';
+  document.getElementById('btnStopReview').disabled = false;
+  document.getElementById('btnStopReview').textContent = 'Stop & review';
   document.getElementById('btnPause').style.display = 'none';
   document.getElementById('btnPause').textContent = 'Pause';
   document.getElementById('btnSelectScreen').style.display = '';
@@ -4543,6 +4817,25 @@ const captionEditorState = {
   activeCueIndex: -1,      // index of the cue under the video's current playhead, or selected
   pendingDraft: null,      // draft record loaded from IndexedDB, awaiting Continue/Start-fresh
   pendingImport: null,     // parsed import result awaiting the replace-confirmation banner
+};
+
+// REVIEW #21 session 2 (precedent: pipState/captionEditorState — NOT new
+// fields on `state`). `segments` is the fixed, full list assembled when the
+// pane opened (priorSegments + the just-stopped session) — "Discard
+// recording" always nukes exactly this list, regardless of any cut made
+// during this review. `scans` is one DEFAULT-mode createWebmStreamScanner
+// result per entry in `segments`, index-aligned, produced by
+// assembleReviewPreview and consumed by computeCutPlan. A successful cut
+// closes the pane (session 2's scope never re-opens it for iterative
+// cutting), so both arrays are fixed for the lifetime of one open pane.
+const reviewState = {
+  active: false,        // is the review pane currently shown
+  segments: [],          // [{ sessionId, mimeType }], fixed at open time
+  scans: [],              // one default-mode scan result per `segments` entry, same order
+  scansOk: false,         // every segment's scan finished cleanly — gates "Re-record from here"
+  previewUrl: null,       // current #reviewVideo object URL — revoked on reassembly and on close
+  totalBytes: 0,          // summed via sessionChunkStats at open time, for the size-guard message
+  undo: null,             // last-cut undo record (see undoReRecord), or null; cleared at startRecording
 };
 
 // fileKey identity for a video, used both to look up and to store a draft.
@@ -5102,6 +5395,274 @@ function closeCaptionEditor() {
   // the hidden editor. Guarded for the test mock, which has no pause().
   const video = document.getElementById('captionVideo');
   if (video && typeof video.pause === 'function') video.pause();
+}
+
+// ============================================================
+// Review pane (REVIEW #21 session 2) — "Stop & review" flow. Own <video>
+// (NOT #captionVideo — that player is File-only and entangled with
+// captionEditorState). Same mode-switch pattern as the caption editor above:
+// setRecorderControlsVisible(false)/(true) plus base display:none + .visible.
+// ============================================================
+
+function reviewSetStatus(msg) {
+  document.getElementById('reviewStatus').textContent = msg || '';
+}
+
+// m:ss label for the "Re-record from <here>" button and the post-cut "Kept"
+// status — small and local rather than reusing parseCaptionTimestamp's
+// HH:MM:SS.mmm machinery, which is built for caption-file round-tripping,
+// not an at-a-glance duration label.
+function formatMinSec(ms) {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+async function openReviewPane(segments) {
+  reviewState.active = true;
+  setRecorderControlsVisible(false);
+  document.getElementById('reviewPane').classList.add('visible');
+  reviewSetStatus('');
+
+  // Filter out zero-chunk segments FIRST (matching stitchAndSave's existing
+  // priorsWithData filter) — segments and scans must stay index-aligned, so
+  // this has to happen before reviewState.segments is assigned and before
+  // assembleReviewPreview runs. A sub-second final take with priors present
+  // still passes finalizeRecording's guard (stats.count===0 is only checked
+  // when priorSegments is ALSO empty), so an empty final segment can reach
+  // here. Doubles as the size-guard's byte sum in the same cursor-based pass
+  // (REVIEW #5 lineage — never materializes a chunk just to count/sum).
+  const withData = [];
+  let totalBytes = 0;
+  for (const seg of segments) {
+    const stats = await sessionChunkStats(seg.sessionId);
+    if (stats.count > 0) { withData.push(seg); totalBytes += stats.bytes; }
+  }
+  if (withData.length === 0) {
+    showError('No recording data found.');
+    closeReviewPane();
+    resetUI();
+    return;
+  }
+
+  reviewState.segments = withData;
+  reviewState.totalBytes = totalBytes;
+  if (totalBytes > REVIEW_PREVIEW_SIZE_WARNING_BYTES) {
+    reviewSetStatus('This is a long recording — preparing it for review may take a moment.');
+  }
+
+  // Assembly can fail on a recording the scanner can't parse. That must
+  // degrade, never dead-end: watching, Save as is, Discard, and Back all
+  // work without a scan — only the cut math is gated (scansOk).
+  let blob = null;
+  try {
+    blob = await assembleReviewPreview(withData);
+  } catch (err) {
+    console.error('Preview assembly failed:', err);
+    reviewState.scansOk = false;
+  }
+  if (blob) {
+    if (reviewState.previewUrl) URL.revokeObjectURL(reviewState.previewUrl);
+    reviewState.previewUrl = URL.createObjectURL(blob);
+    document.getElementById('reviewVideo').src = reviewState.previewUrl;
+    reviewSetStatus(''); // preview is ready — clear any lingering size-guard message
+  }
+  document.getElementById('btnReRecordHere').disabled = !reviewState.scansOk;
+  if (!reviewState.scansOk) {
+    reviewSetStatus(blob
+      ? "Re-record from here isn't available for this recording — you can still watch it, save it as is, or go back."
+      : "Couldn't prepare the preview — you can still save the recording as is, or go back to the recorder.");
+  }
+  onReviewVideoTimeUpdate();
+}
+
+function closeReviewPane() {
+  reviewState.active = false;
+  document.getElementById('reviewPane').classList.remove('visible');
+  setRecorderControlsVisible(true);
+  hideReviewDiscardConfirm();
+  // Hiding the pane doesn't stop the <video> — the v1.18 review-defect-G
+  // lesson (see closeCaptionEditor above). Guarded for the test mock, which
+  // has no pause().
+  const video = document.getElementById('reviewVideo');
+  if (video && typeof video.pause === 'function') video.pause();
+  if (reviewState.previewUrl) {
+    URL.revokeObjectURL(reviewState.previewUrl);
+    reviewState.previewUrl = null;
+  }
+}
+
+function onReviewVideoTimeUpdate() {
+  const video = document.getElementById('reviewVideo');
+  document.getElementById('btnReRecordHere').textContent = 'Re-record from ' + formatMinSec((video.currentTime || 0) * 1000);
+}
+
+function showReviewDiscardConfirm(message) {
+  document.getElementById('reviewDiscardConfirmMsg').textContent = message;
+  document.getElementById('reviewDiscardConfirm').classList.add('visible');
+}
+
+function hideReviewDiscardConfirm() {
+  document.getElementById('reviewDiscardConfirm').classList.remove('visible');
+}
+
+function requestReviewDiscard() {
+  showReviewDiscardConfirm("Discard this recording? This can't be undone once you confirm.");
+}
+
+// Delete every session this review pane knows about (kept and discarded
+// alike — reviewState.segments is fixed at open time, so this always covers
+// the whole recording regardless of any cut made during this review) and
+// reset to a clean idle state.
+async function reviewDiscardConfirmed() {
+  hideReviewDiscardConfirm();
+  for (const seg of reviewState.segments) await deleteSession(seg.sessionId);
+  await deleteDiscardedSessions();
+  state.priorSegments = [];
+  reviewState.undo = null;
+  closeReviewPane();
+  resetUI();
+}
+
+// "Back to recorder": nothing was cut, so nothing is discarded — every
+// segment this pane opened with becomes the new priorSegments, unchanged.
+function reviewBackToRecorder() {
+  state.priorSegments = reviewState.segments.slice();
+  closeReviewPane();
+  resetUI();
+}
+
+// "Re-record from here". T is the scrub position on the STITCHED/global
+// timeline computeCutPlan expects; segIndex/cutAtByte/keptMs come straight
+// from its Rule-A math (see computeCutPlan's own doc comment for the four
+// outcome shapes this switches on).
+async function reviewCutFromHere() {
+  // scansOk gate + try/catch: a click here must NEVER die silently. Any
+  // failure leaves the pane open and says so — the recording itself is
+  // metadata-safe either way (truncation never rewrites stored chunks).
+  if (!reviewState.scansOk) {
+    reviewSetStatus("Re-record from here isn't available for this recording — you can still watch it, save it as is, or go back.");
+    return;
+  }
+  try {
+    const video = document.getElementById('reviewVideo');
+    const T = (video.currentTime || 0) * 1000;
+    const plan = computeCutPlan(reviewState.scans, T);
+
+    if (plan.kind === 'noop') {
+      reviewSetStatus("That's already the end of the recording — there's nothing after it to remove.");
+      return;
+    }
+    if (plan.kind === 'startOver') {
+      showReviewDiscardConfirm('Re-recording from the very beginning means discarding this recording. Discard it and start fresh?');
+      return;
+    }
+
+    const segments = reviewState.segments;
+    const discardedIds = [];
+    let keptSegments, cutSessionId = null, hadPrevMarker = false, prevCutAtByte = null, prevCutAtMs = null;
+
+    if (plan.cutAtByte > 0) {
+      const cutSeg = segments[plan.segIndex];
+      cutSessionId = cutSeg.sessionId;
+      // Read BEFORE overwriting — undo of a re-cut must restore this exact
+      // previous marker, not just clear it.
+      const prev = await getSessionRecord(cutSessionId);
+      hadPrevMarker = !!prev && typeof prev.cutAtByte === 'number' && isFinite(prev.cutAtByte);
+      if (hadPrevMarker) { prevCutAtByte = prev.cutAtByte; prevCutAtMs = prev.cutAtMs; }
+      await setSessionCut(cutSessionId, plan.cutAtByte, plan.keptMs);
+      for (let i = plan.segIndex + 1; i < segments.length; i++) {
+        await setSessionDiscarded(segments[i].sessionId, true);
+        discardedIds.push(segments[i].sessionId);
+      }
+      keptSegments = segments.slice(0, plan.segIndex + 1);
+    } else {
+      // cutAtByte === 0: segments[segIndex..] discarded whole, segIndex
+      // included; never becomes a stored cutAtByte marker (session 1's design
+      // note) — if segIndex itself already carried an earlier marker, it's
+      // left alone, harmless since the whole session is being discarded.
+      for (let i = plan.segIndex; i < segments.length; i++) {
+        await setSessionDiscarded(segments[i].sessionId, true);
+        discardedIds.push(segments[i].sessionId);
+      }
+      keptSegments = segments.slice(0, plan.segIndex);
+    }
+
+    reviewState.undo = {
+      cutSessionId, hadPrevMarker, prevCutAtByte, prevCutAtMs,
+      discardedSessionIds: discardedIds,
+      priorSegmentsBefore: state.priorSegments.slice(),
+    };
+    state.priorSegments = keptSegments;
+    closeReviewPane();
+    resetUI();
+    updateStatus('idle', `Kept ${formatMinSec(plan.keptMs || 0)}. Select a screen and click Record to continue from there.`);
+    document.getElementById('btnUndoReRecord').style.display = '';
+  } catch (err) {
+    console.error('Re-record cut failed:', err);
+    reviewSetStatus("Couldn't set the re-record point. Your recording is safe — keep reviewing, or use Save as is.");
+  }
+}
+
+// Full, lossless restore of what a cut just changed — the tail bytes were
+// never touched (truncation is metadata, not byte-surgery), so undo is
+// exact: a re-cut's PREVIOUS marker is restored verbatim (never cleared),
+// and only the sessions THIS cut discarded are un-discarded (sessions
+// discarded by an earlier cut stay discarded).
+async function undoReRecord() {
+  const u = reviewState.undo;
+  if (!u) return;
+  if (u.cutSessionId) {
+    if (u.hadPrevMarker) await setSessionCut(u.cutSessionId, u.prevCutAtByte, u.prevCutAtMs);
+    else await clearSessionCut(u.cutSessionId);
+  }
+  for (const id of u.discardedSessionIds) await setSessionDiscarded(id, false);
+  state.priorSegments = u.priorSegmentsBefore;
+  reviewState.undo = null;
+  document.getElementById('btnUndoReRecord').style.display = 'none';
+  resetUI();
+}
+
+// "Save as is": the SAME save path a normal Stop & save would have used from
+// this state (single segment -> saveFile's session path; multiple ->
+// saveSessionsStreamedStitch, the same primitive stitchAndSave uses).
+// reviewState.segments is exactly what a normal stop-here would have saved —
+// a successful cut always closes the pane before this can run, so there is
+// no cut to apply first.
+async function reviewSaveAsIs() {
+  const segments = reviewState.segments;
+  let result;
+  if (segments.length === 1) {
+    result = await saveFile({ kind: 'session', sessionId: segments[0].sessionId, mimeType: segments[0].mimeType });
+  } else {
+    // Mirrors stitchAndSave's own (implicit-default) naming convention explicitly.
+    result = await saveSessionsStreamedStitch(segments, `recording-${formatDateForFilename()}.webm`);
+    if (result === 'bail') {
+      closeReviewPane();
+      resetUI();
+      offerStitchFallback(segments);
+      return;
+    }
+  }
+
+  if (result === 'saved') {
+    for (const seg of segments) await deleteSession(seg.sessionId);
+    await deleteDiscardedSessions();
+    state.priorSegments = [];
+    reviewState.undo = null;
+    closeReviewPane();
+    resetUI();
+  } else if (result === 'downloaded') {
+    offerDownloadConfirm(segments.map(s => s.sessionId), 1);
+    closeReviewPane();
+    resetUI();
+  } else {
+    // Cancelled: unlike a normal Stop & save cancel, the user is still
+    // mid-review with nothing lost — stay in the pane instead of dumping
+    // them back to the recorder.
+    reviewSetStatus('Save cancelled — your recording is still here.');
+  }
 }
 
 // ============================================================

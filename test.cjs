@@ -174,7 +174,7 @@ const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!scriptMatch) { console.log('FATAL: no <script> block found in index.html'); process.exit(2); }
 let code = scriptMatch[1];
-code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT, openDB, captionEditorState, captionFileKey, captionAddCue, captionDeleteCue, captionUpdateCueTime, captionUpdateCueText, captionPreviewVTT, captionParseCaptionText, captionBuildImportMessage, captionApplyImport, captionExportFilename, captionExport, saveCaptionDraft, loadCaptionDraft, deleteCaptionDraft, captionContinueDraftUI, captionStartFreshUI, openCaptionEditor, closeCaptionEditor, handleCaptionVideoFile, renderCueList, updateActiveCueHighlight, onCaptionVideoTimeUpdate, captionCueRowEls, onCaptionVideoInputChange, onCaptionImportInputChange, onAddCaptionClick };';
+code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT, openDB, captionEditorState, captionFileKey, captionAddCue, captionDeleteCue, captionUpdateCueTime, captionUpdateCueText, captionPreviewVTT, captionParseCaptionText, captionBuildImportMessage, captionApplyImport, captionExportFilename, captionExport, saveCaptionDraft, loadCaptionDraft, deleteCaptionDraft, captionContinueDraftUI, captionStartFreshUI, openCaptionEditor, closeCaptionEditor, handleCaptionVideoFile, renderCueList, updateActiveCueHighlight, onCaptionVideoTimeUpdate, captionCueRowEls, onCaptionVideoInputChange, onCaptionImportInputChange, onAddCaptionClick, reviewState, SEAM_GAP_MS };';
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app_new.js' });
 const api = sandbox.__api;
@@ -188,6 +188,11 @@ const ORIG = {
   addChunk: sandbox.addChunk, concatenateWebM: sandbox.concatenateWebM,
   getUserMedia: sandbox.navigator.mediaDevices.getUserMedia,
   mdEnumerateDevices: sandbox.navigator.mediaDevices.enumerateDevices,
+  // REVIEW #21 session 2 (DM): saveFile/stitchAndSave get spied on to prove
+  // the 'review' stop mode never reaches the save path — same
+  // capture-and-restore shape as addChunk/concatenateWebM above, so a spy
+  // installed in one scenario can never leak into the next via resetState().
+  saveFile: sandbox.saveFile, stitchAndSave: sandbox.stitchAndSave,
 };
 sandbox.showError = (m) => { recordedErrors.push(m || ''); };
 const ORIG_updateStatus = sandbox.updateStatus;
@@ -255,10 +260,11 @@ function pickerSequence(outcomes) {
 }
 async function resetState() {
   await resetDB();
-  Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, cameraStream: null, micStream: null, heldMicStream: null, heldMicDeviceId: null, audioContext: null, compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [], lastMicLabel: null, lastCameraLabel: null });
+  Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, cameraStream: null, micStream: null, heldMicStream: null, heldMicDeviceId: null, audioContext: null, compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [], lastMicLabel: null, lastCameraLabel: null, stopMode: 'save' });
   windowMock._recoverySessions = null; windowMock._recoverySessionId = null; windowMock._recoveryMimeType = null;
   delete windowMock.showSaveFilePicker;   // absent = Firefox mode; FSA scenarios set their own picker
   sandbox.addChunk = ORIG.addChunk; sandbox.concatenateWebM = ORIG.concatenateWebM;
+  sandbox.saveFile = ORIG.saveFile; sandbox.stitchAndSave = ORIG.stitchAndSave;
   sandbox.navigator.mediaDevices.getUserMedia = ORIG.getUserMedia;
   sandbox.navigator.mediaDevices.enumerateDevices = ORIG.mdEnumerateDevices;
   sandbox.micHoldInFlight = false;
@@ -282,6 +288,14 @@ async function resetState() {
   documentMock.getElementById('captionImportInput').value = ''; documentMock.getElementById('captionImportInput').files = undefined;
   delete documentMock.getElementById('captionVideo').pause; // scenarios that install a pause() spy must not leak it
   documentMock.getElementById('captionVideo').currentTime = 0;
+  // REVIEW #21 session 2: reviewState is module-level (like captionEditorState)
+  // and persists across scenarios unless reset here.
+  Object.assign(api.reviewState, { active: false, segments: [], scans: [], scansOk: false, previewUrl: null, totalBytes: 0, undo: null });
+  documentMock.getElementById('reviewPane').classList.remove('visible');
+  documentMock.getElementById('reviewDiscardConfirm').classList.remove('visible');
+  documentMock.getElementById('reviewStatus').textContent = '';
+  delete documentMock.getElementById('reviewVideo').pause; // scenarios that install a pause() spy must not leak it
+  documentMock.getElementById('reviewVideo').currentTime = 0;
   lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0; downloadClicks = [];
   writeCalls = []; abortCalls = 0; closedFiles = 0; failWriteAfter = -1;
   statusHistory = []; objectUrlBlobs = [];
@@ -870,6 +884,38 @@ async function scenario(name, fn) {
     return Buffer.concat([header, segHdr, infoEl, tracks]);
   }
 
+  function syntheticLongClusterWebm() { // Firefox-shaped: ~7.5s-spaced clusters (session s21 seam fix)
+    // Firefox emits clusters roughly every 7.5s (vs Chrome's ~1s) and each
+    // cluster's own content runs nearly the full gap to the next one. That's
+    // exactly the shape that broke the old seam formula (prevScan.maxClusterTs
+    // + 1000): it estimated only a ~1s last-cluster duration, so the next
+    // segment's rebased clusters landed ~6.5s BEFORE the previous segment's
+    // content actually ended. 8-byte unknown-size cluster markers (Firefox's
+    // form, see syntheticFirefoxWebm) + multiple keyframe-flagged video blocks
+    // and a second track's blocks per cluster, spanning relative timestamps
+    // out to 7466ms — same shape as syntheticWebm, just stretched to Firefox's
+    // real cluster spacing so the OLD formula's overlap is reproduced exactly.
+    const header = Buffer.from([0x1A, 0x45, 0xDF, 0xA3, 0x80]);
+    const segHdr = Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    const infoEl = el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], uintBytes(1000000, 3)));
+    const tracks = el([0x16, 0x54, 0xAE, 0x6B],
+      el([0xAE], el([0xD7], [0x01]), el([0x83], [0x01])),   // video, track 1
+      el([0xAE], el([0xD7], [0x02]), el([0x83], [0x02])));  // audio, track 2
+    function longCluster(ts) {
+      return clusterUnknown(ts, [
+        simpleBlock(1, 0,    0x80, 40),  // video keyframe, cluster start
+        simpleBlock(2, 20,   0x80, 10),  // audio, near cluster start
+        simpleBlock(1, 2500, 0x00, 30),  // video, mid-cluster
+        simpleBlock(2, 5000, 0x00, 10),  // audio, later still
+        simpleBlock(1, 7466, 0x00, 30),  // video, near the real (content) end of the cluster
+      ], true);
+    }
+    const c0 = longCluster(0);
+    const c1 = longCluster(7500);
+    const c2 = longCluster(15000);
+    return Buffer.concat([header, segHdr, infoEl, tracks, c0, c1, c2]);
+  }
+
   async function seedBuffers(parts, indexes) {
     const id = await api.createSession('video/webm;codecs=vp9,opus');
     for (let i = 0; i < parts.length; i++) await api.addChunk(id, indexes ? indexes[i] : i, new Blob([parts[i]]));
@@ -915,6 +961,27 @@ async function scenario(name, fn) {
     return scanner.result();
   }
   function midTs(a, b) { return a + Math.floor((b - a) / 2); }
+  // The production seam formula (scanSegmentsForStitch / concatenateWebM /
+  // computeCutPlan all share it), derived from a scan result — never a
+  // hand-picked magic number. api.SEAM_GAP_MS is exposed because SEAM_GAP_MS
+  // is a top-level `const` in index.html and so isn't a `sandbox` property
+  // the way `function`-declared helpers are.
+  function seamOffset(scan) { return Math.max(scan.lastClusterMaxBlockTime, scan.maxClusterTs) + api.SEAM_GAP_MS; }
+  // The assertion that would have caught the Firefox seam bug: on a stitched
+  // (or any multi-cluster) WebM buffer, no cluster may start before the
+  // previous cluster's own content actually ends. Re-scans `buf` from scratch
+  // (never trusts a caller's scan) so it also catches a scan/rebuild mismatch.
+  function assertNoOverlap(buf, label) {
+    const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length); // fresh ArrayBuffer, offset 0
+    const scan = S.webmScan(ab);
+    const view = new DataView(ab);
+    for (let i = 0; i + 1 < scan.clusters.length; i++) {
+      const end = S.webmMaxBlockTime(view, scan.clusters[i]);
+      assert(scan.clusters[i + 1].timestamp >= end,
+        label + ': cluster ' + i + '->' + (i + 1) + ' timeline does not go backward (next ts ' +
+        scan.clusters[i + 1].timestamp + ' >= prev contentEnd ' + end + ')');
+    }
+  }
   // Phase 0 oracle (STREAMING_STITCH_HANDOFF §5): the REAL concatenateWebM +
   // makeSeekable, run over N segment buffers. Uses ORIG.concatenateWebM so this
   // stays the buffered reference even in scenarios that override sandbox.concatenateWebM.
@@ -935,7 +1002,7 @@ async function scenario(name, fn) {
     let prevScan = scan0;
     let offset = 0;
     for (let i = 1; i < buffers.length; i++) {
-      offset += prevScan.maxClusterTs + 1000;
+      offset += seamOffset(prevScan);
       const scanner = S.createWebmStreamScanner({ clustersOnly: true, timeOffset: offset, videoTrack });
       for (const part of splitFn(buffers[i])) scanner.push(part);
       const ok = scanner.finish();
@@ -1232,13 +1299,14 @@ async function scenario(name, fn) {
     assert(headerCount === 1, 'exactly one EBML header in stitched output (got ' + headerCount + ')');
     const view = new DataView(out.buffer, out.byteOffset, out.length);
     const rescan = S.webmScan(out.buffer.slice(out.byteOffset, out.byteOffset + out.length));
-    // segment 1 verbatim 0,1000,2000 (lastTimestamp 2000); segment 2 rebased by 2000+1000=3000
-    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,1000,2000,3000,4000,5000',
-      'segment 2 clusters rebased by segment 1 lastTimestamp+1000 (got ' + rescan.clusters.map(c => c.timestamp) + ')');
+    // segment 1 verbatim 0,1000,2000 (content end 2900); segment 2 rebased by
+    // max(2900,2000)+SEAM_GAP_MS(33)=2933 -> 2933,3933,4933
+    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,1000,2000,2933,3933,4933',
+      'segment 2 clusters rebased by segment 1 content-end+SEAM_GAP_MS (got ' + rescan.clusters.map(c => c.timestamp) + ')');
     const infoKids = childElems(view, rescan.infoDataStart, rescan.infoDataEnd);
     const dur = infoKids.find(k => k.id === 0x4489);
     const durVal = dur ? view.getFloat64(dur.dataStart, false) : -1;
-    assert(durVal > 5900 && durVal < 6000, 'Duration reflects the 2-segment total, 2933+3000 (got ' + durVal + ')');
+    assert(durVal > 5800 && durVal < 5900, 'Duration reflects the 2-segment total, 2933+2900+33=5866 (got ' + durVal + ')');
     const segData = rescan.segmentDataStart;
     const shSize = S.ebmlReadSize(view, segData + 4);
     const seeks = childElems(view, segData + 4 + shSize.length, segData + 4 + shSize.length + shSize.value);
@@ -1256,7 +1324,7 @@ async function scenario(name, fn) {
       const t = childElems(view, cp.dataStart, cp.dataEnd).find(k => k.id === 0xB3);
       return S.ebmlReadUInt(view, t.dataStart, t.dataEnd - t.dataStart);
     });
-    assert(cueTimes.join(',') === '0,2000,3000,5000', 'cues cover both segments, rebased (got ' + cueTimes + ')');
+    assert(cueTimes.join(',') === '0,2000,2933,4933', 'cues cover both segments, rebased (got ' + cueTimes + ')');
   });
 
   // AM — 3-segment mixed chain: Chrome + Firefox (8-byte marker) + Chrome
@@ -1265,9 +1333,11 @@ async function scenario(name, fn) {
     const view = new DataView(out.buffer, out.byteOffset, out.length);
     const rescan = S.webmScan(out.buffer.slice(out.byteOffset, out.byteOffset + out.length));
     assert(rescan.clusters.length === 9, '9 clusters total, 3+3+3 (got ' + rescan.clusters.length + ')');
-    // seg1 verbatim 0,1000,2000; seg2 offset = 2000+1000=3000 -> 3000,10504,18000 (firefox ts 0,7504,15000);
-    // seg3 offset = 3000 + (15000+1000) = 19000 -> 19000,20000,21000 (cumulative across BOTH gaps)
-    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,1000,2000,3000,10504,18000,19000,20000,21000',
+    // seg1 verbatim 0,1000,2000 (content end 2900); seg2 offset = max(2900,2000)+33=2933
+    // -> 2933,10437,17933 (firefox ts 0,7504,15000; its own last cluster's content end
+    // 15480); seg3 offset = 2933 + (max(15480,15000)+33=15513) = 18446 -> 18446,19446,20446
+    // (cumulative across BOTH gaps)
+    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,1000,2000,2933,10437,17933,18446,19446,20446',
       'cumulative rebasing across both segment gaps (got ' + rescan.clusters.map(c => c.timestamp) + ')');
     // The Firefox segment's clusters are rewritten (not verbatim — only segment 1 is).
     // webmRewriteCluster preserves unknown-size via the constant EBML_UNKNOWN_SIZE
@@ -1286,13 +1356,13 @@ async function scenario(name, fn) {
     const out = await stitchOracle([syntheticAudioOnlyWebm(), syntheticAudioOnlyWebm()]);
     const view = new DataView(out.buffer, out.byteOffset, out.length);
     const rescan = S.webmScan(out.buffer.slice(out.byteOffset, out.byteOffset + out.length));
-    // seg1 verbatim 0,900 (lastTimestamp 900); seg2 offset = 900+1000=1900 -> 1900,2800
-    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,900,1900,2800',
+    // seg1 verbatim 0,900 (content end 940); seg2 offset = max(940,900)+33=973 -> 973,1873
+    assert(rescan.clusters.map(c => c.timestamp).join(',') === '0,900,973,1873',
       'audio-only clusters rebased (got ' + rescan.clusters.map(c => c.timestamp) + ')');
     const infoKids = childElems(view, rescan.infoDataStart, rescan.infoDataEnd);
     const dur = infoKids.find(k => k.id === 0x4489);
     const durVal = dur ? view.getFloat64(dur.dataStart, false) : -1;
-    assert(durVal > 2830 && durVal < 2900, 'Duration reflects rebased last audio block, 2800+40+33 (got ' + durVal + ')');
+    assert(durVal > 1900 && durVal < 1990, 'Duration reflects rebased last audio block, 1873+40+33=1946 (got ' + durVal + ')');
     const segData = rescan.segmentDataStart;
     const shSize = S.ebmlReadSize(view, segData + 4);
     const seeks = childElems(view, segData + 4 + shSize.length, segData + 4 + shSize.length + shSize.value);
@@ -3055,12 +3125,12 @@ Real cue text
       assert(plan2.kind === 'noop', 'audioOnly: T past end -> noop (got ' + JSON.stringify(plan2) + ')');
     }
 
-    // ---- multi-segment (2 segments), Chrome-shaped, using the real +1000 seam ----
+    // ---- multi-segment (2 segments), Chrome-shaped, using the real seam formula ----
     {
       const buf0 = syntheticWebm(), buf1 = syntheticWebm();
       const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
       const scans = [scan0, scan1];
-      const offset1 = scan0.maxClusterTs + 1000;
+      const offset1 = seamOffset(scan0);
 
       // T mid-cluster in segment 1 (non-final) -> cut with segIndex 1 and the
       // seam-shifted cutAtByte/keptMs.
@@ -3096,8 +3166,8 @@ Real cue text
       const buf0 = syntheticWebm(), buf1 = syntheticWebm(), buf2 = syntheticWebm();
       const scan0 = scanResult(buf0), scan1 = scanResult(buf1), scan2 = scanResult(buf2);
       const scans = [scan0, scan1, scan2];
-      const offset1 = scan0.maxClusterTs + 1000;
-      const offset2 = offset1 + scan1.maxClusterTs + 1000;
+      const offset1 = seamOffset(scan0);
+      const offset2 = offset1 + seamOffset(scan1);
 
       // Cutting mid-segment-1 still reports segIndex 1 regardless of segment 2's
       // presence (segment 2 is discarded whole per the cutAtByte>0 semantics,
@@ -3107,7 +3177,7 @@ Real cue text
       assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === scan1.clusters[1].start,
         '3-seg: mid-cluster in segment 1 unaffected by trailing segment 2 (got ' + JSON.stringify(plan) + ')');
 
-      // Mid-cluster in segment 2 -> both seam offsets (+1000 twice) must land right.
+      // Mid-cluster in segment 2 -> both seam offsets (applied twice) must land right.
       T = offset2 + midTs(scan2.clusters[1].timestamp, scan2.clusters[2].timestamp);
       plan = S.computeCutPlan(scans, T);
       assert(plan.kind === 'cut' && plan.segIndex === 2 && plan.cutAtByte === scan2.clusters[1].start && plan.keptMs === offset2 + scan2.clusters[1].timestamp,
@@ -3244,7 +3314,7 @@ Real cue text
 
     // (a) cut in the LAST segment of the chain.
     {
-      const offset1 = scan0.maxClusterTs + 1000;
+      const offset1 = seamOffset(scan0);
       const T = offset1 + midTs(scan1.clusters[1].timestamp, scan1.clusters[2].timestamp);
       const plan = S.computeCutPlan([scan0, scan1], T);
       assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === scan1.clusters[1].start,
@@ -3301,6 +3371,470 @@ Real cue text
         [{ sessionId: id0, mimeType: 'video/webm' }, { sessionId: id1, mimeType: 'video/webm' }], 'x.webm');
       assert(r === 'saved' && Buffer.compare(Buffer.from(await lastWritten.pop().arrayBuffer()), want) === 0,
         'DLc: boundary-cut segment 0 as a NON-FINAL stitch segment === stitchOracle([buf0.slice(0,cut), buf1]) — no scenario-AX bail');
+    }
+  });
+
+  // ============================================================
+  // REVIEW #21 "re-record from a timestamp", session 2 — the review pane +
+  // "Re-record from here" flow, on top of session 1's metadata-cut
+  // primitive. DM pins stop-mode routing (the only new fork in the
+  // recording pipeline's finish line, and it only exists AFTER capture has
+  // fully ended). DN is the preview-assembly differential. DO is cut
+  // application + undo. DP is the discarded-sessions lifecycle. DQ is the
+  // save-as-is differential.
+  // ============================================================
+
+  // DM — stop-mode routing
+  await scenario('DM stop-mode routing: review skips the save path and opens the review pane; save is unchanged; stopMode always resets', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+
+    // ---- 'review' path: saveFile/stitchAndSave must never be called ----
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    let saveFileCalls = 0, stitchCalls = 0;
+    const savedSaveFile = sandbox.saveFile, savedStitch = sandbox.stitchAndSave;
+    sandbox.saveFile = async () => { saveFileCalls++; return 'saved'; };
+    sandbox.stitchAndSave = async () => { stitchCalls++; };
+
+    await api.startRecording();
+    let rec = state.mediaRecorder;
+    const reviewSid = state.sessionId;
+    rec.ondataavailable({ data: new Blob(['x']) });
+    await drain();
+    S.stopAndReview();
+    // Checked BEFORE draining: stopRecording()'s textContent branch runs
+    // synchronously, before mediaRecorder.stop() even fires onstop.
+    assert(documentMock.getElementById('btnStop').textContent !== 'Saving...',
+      'a review stop leaves "Stop & save"\'s own label alone (it says "Preparing review..." on btnStopReview instead)');
+    await drain();
+
+    sandbox.saveFile = savedSaveFile;
+    sandbox.stitchAndSave = savedStitch;
+
+    assert(saveFileCalls === 0 && stitchCalls === 0, 'a review stop never calls the save path');
+    assert(api.reviewState.active === true, 'the review pane opens');
+    assert(api.reviewState.segments.length === 1 && api.reviewState.segments[0].sessionId === reviewSid,
+      'the just-stopped session is the sole preview segment');
+    let sessions = await readStore('sessions');
+    let s = sessions.find(x => x.id === reviewSid);
+    assert(!!s && s.completed === false, 'the session stays completed:false — a crash mid-review still hits the recovery banner');
+    assert(state.stopMode === 'save', 'stopMode resets to save immediately after a review stop');
+    assert(documentMock.getElementById('btnStopReview').textContent === 'Stop & review',
+      'resetUI (run in finalizeRecording\'s finally, even on the review branch) restores the review button\'s own label');
+
+    S.closeReviewPane();
+    await api.deleteSession(reviewSid); // discard the reviewed (unsaved) session so the 'save' path below starts clean
+
+    // ---- 'save' path: byte-for-byte the pre-existing behavior ----
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.startRecording();
+    rec = state.mediaRecorder;
+    const saveSid = state.sessionId;
+    rec.ondataavailable({ data: new Blob(['y']) });
+    await drain();
+    S.stopRecording();
+    await drain();
+
+    assert(lastWritten.length === 1, 'a normal Stop & save still streams straight to the FSA sink, unchanged');
+    sessions = await readStore('sessions');
+    assert(sessions.find(x => x.id === saveSid) === undefined, 'the saved session is deleted, same as before this feature existed');
+    assert(api.reviewState.active === false, 'the review pane never opened for a normal save stop');
+    assert(state.stopMode === 'save', 'stopMode is still save after a normal stop');
+  });
+
+  // DN — preview assembly differential
+  await scenario('DN preview assembly differential: single segment, two segments, and a segment with an existing cut marker, all against the buffered oracle; stored scans match a direct scan of the same (post-cut) bytes', async () => {
+    function scanCore(scan) {
+      return JSON.stringify({ clusters: scan.clusters, maxClusterTs: scan.maxClusterTs, lastClusterMaxBlockTime: scan.lastClusterMaxBlockTime });
+    }
+
+    // ---- single segment ----
+    {
+      const buf = syntheticWebm();
+      const ids = await seedSegments([buf]);
+      const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+      const want = await expectedBytes(buf);
+      const got = Buffer.from(await (await S.assembleReviewPreview(segments)).arrayBuffer());
+      assert(Buffer.compare(got, want) === 0, 'single-segment preview === makeSeekable(full buffer) oracle');
+      assert(api.reviewState.scans.length === 1 && scanCore(api.reviewState.scans[0]) === scanCore(scanResult(buf)),
+        'single-segment: the stored scan matches a direct scanResult() of the same bytes');
+    }
+
+    // ---- two segments ----
+    {
+      const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+      const ids = await seedSegments([buf0, buf1]);
+      const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+      const want = await stitchOracle([buf0, buf1]);
+      const got = Buffer.from(await (await S.assembleReviewPreview(segments)).arrayBuffer());
+      assert(Buffer.compare(got, want) === 0, 'two-segment preview === concatenateWebM+makeSeekable oracle');
+      assert(api.reviewState.scans.length === 2 &&
+        scanCore(api.reviewState.scans[0]) === scanCore(scanResult(buf0)) &&
+        scanCore(api.reviewState.scans[1]) === scanCore(scanResult(buf1)),
+        'two-segment: the stored scans match a direct scanResult() of each segment\'s bytes');
+    }
+
+    // ---- a segment with an EXISTING cut marker (inherited from an earlier review cycle) ----
+    {
+      const buf = syntheticWebm();
+      const scan = scanResult(buf);
+      const cutAtByte = scan.clusters[1].start;
+      const ids = await seedSegments([buf]);
+      await S.setSessionCut(ids[0], cutAtByte, scan.clusters[1].timestamp);
+      const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+      const want = await expectedBytes(buf.slice(0, cutAtByte));
+      const got = Buffer.from(await (await S.assembleReviewPreview(segments)).arrayBuffer());
+      assert(Buffer.compare(got, want) === 0, 'a segment with an existing cut marker: the preview reflects the cut (=== oracle on the sliced buffer)');
+      assert(scanCore(api.reviewState.scans[0]) === scanCore(scanResult(buf.slice(0, cutAtByte))),
+        'cut segment: the stored scan matches a direct scanResult() of the POST-CUT bytes, not the full buffer');
+    }
+  });
+
+  // DO — cut application + undo
+  await scenario('DO cut application + undo: marker set on the right session, later segments flagged discarded, priorSegments reduced; undo restores everything exactly (including a pre-existing marker); startOver and noop change nothing without confirmation', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const ids = await seedSegments([buf0, buf1]);
+    const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }, { sessionId: ids[1], mimeType: 'video/webm' }];
+    // A recognizable pre-cut priorSegments value undo must restore EXACTLY.
+    const priorBefore = [{ sessionId: 'zzz-unrelated', mimeType: 'video/webm' }];
+    const offset1 = seamOffset(scan0);
+
+    // ---- mid-cluster cut in segment 1, then undo ----
+    state.priorSegments = priorBefore.slice();
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    const T = offset1 + midTs(scan1.clusters[1].timestamp, scan1.clusters[2].timestamp);
+    documentMock.getElementById('reviewVideo').currentTime = T / 1000;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+
+    const expectedPlan = S.computeCutPlan([scan0, scan1], T);
+    assert(expectedPlan.kind === 'cut' && expectedPlan.segIndex === 1 && expectedPlan.cutAtByte === scan1.clusters[1].start,
+      'precondition: this T cuts mid-cluster in segment 1');
+
+    await S.reviewCutFromHere();
+
+    let sessions = await readStore('sessions');
+    let s1 = sessions.find((x) => x.id === ids[1]);
+    assert(s1.cutAtByte === expectedPlan.cutAtByte && s1.cutAtMs === expectedPlan.keptMs, 'the cut marker lands on the right session (segIndex 1)');
+    assert(sessions.find((x) => x.id === ids[0]).cutAtByte === undefined, 'the earlier segment (segIndex 0) is untouched');
+    assert(s1.discarded === undefined, 'the cut segment itself is not flagged discarded');
+    assert(state.priorSegments.length === 2 && state.priorSegments[0].sessionId === ids[0] && state.priorSegments[1].sessionId === ids[1],
+      'priorSegments becomes the kept list: [segment 0, cut segment 1]');
+    assert(documentMock.getElementById('reviewPane').classList.contains('visible') === false, 'the review pane closes on a successful cut');
+    assert(documentMock.getElementById('btnUndoReRecord').style.display === '', 'the Undo re-record affordance appears');
+    assert(statusHistory.some((m) => /^Kept \d+:\d\d\. Select a screen/.test(m)), 'the post-cut status message reports the kept duration');
+
+    await S.undoReRecord();
+    sessions = await readStore('sessions');
+    const s1u = sessions.find((x) => x.id === ids[1]);
+    assert(s1u.cutAtByte === undefined && s1u.cutAtMs === undefined, 'undo clears the marker (no earlier marker existed)');
+    assert(state.priorSegments.length === 1 && state.priorSegments[0].sessionId === 'zzz-unrelated', 'undo restores priorSegments to its exact pre-cut value');
+    assert(documentMock.getElementById('btnUndoReRecord').style.display === 'none', 'the Undo button hides itself after use');
+    assert(api.reviewState.undo === null, 'the undo record is consumed');
+
+    // ---- re-cut case: segment already carries marker M1; a new, earlier cut M2 is applied; undo restores M1 exactly ----
+    const m1CutAtByte = scan1.clusters[2].start, m1CutAtMs = offset1 + scan1.clusters[2].timestamp;
+    await S.setSessionCut(ids[1], m1CutAtByte, m1CutAtMs);
+    const buf1M1 = buf1.slice(0, m1CutAtByte);           // segment 1's shape as of M1 — a real re-open would scan exactly this
+    const scan1M1 = scanResult(buf1M1);
+    assert(scan1M1.clusters.length === 2, 'precondition: M1 leaves exactly 2 clusters in segment 1');
+
+    state.priorSegments = priorBefore.slice();
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1M1];
+    api.reviewState.scansOk = true;
+    const T2 = offset1 + midTs(scan1M1.clusters[1].timestamp, scan1M1.lastClusterMaxBlockTime);
+    documentMock.getElementById('reviewVideo').currentTime = T2 / 1000;
+    const m2Plan = S.computeCutPlan([scan0, scan1M1], T2);
+    assert(m2Plan.kind === 'cut' && m2Plan.segIndex === 1 && m2Plan.cutAtByte === scan1M1.clusters[1].start,
+      'precondition: M2 drops the (post-M1) final cluster — an earlier byte than M1');
+
+    await S.reviewCutFromHere();
+    sessions = await readStore('sessions');
+    assert(sessions.find((x) => x.id === ids[1]).cutAtByte === scan1M1.clusters[1].start, 'M2 (the new, earlier cut) is the marker on disk right after the cut');
+
+    await S.undoReRecord();
+    sessions = await readStore('sessions');
+    assert(sessions.find((x) => x.id === ids[1]).cutAtByte === m1CutAtByte, 'undo restores M1 EXACTLY — not cleared — since a marker existed before this cut');
+
+    // ---- cutAtByte===0 plan: the later segment is flagged discarded whole, never a stored marker ----
+    await S.clearSessionCut(ids[1]);
+    state.priorSegments = priorBefore.slice();
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    const Tgap = midTs(scan0.lastClusterMaxBlockTime, offset1);
+    documentMock.getElementById('reviewVideo').currentTime = Tgap / 1000;
+    const gapPlan = S.computeCutPlan([scan0, scan1], Tgap);
+    assert(gapPlan.kind === 'cut' && gapPlan.cutAtByte === 0 && gapPlan.segIndex === 1, 'precondition: the seam gap discards segment 1 whole');
+
+    await S.reviewCutFromHere();
+    sessions = await readStore('sessions');
+    const s1d = sessions.find((x) => x.id === ids[1]);
+    assert(s1d.discarded === true, 'segment 1 is flagged discarded (cutAtByte===0 never becomes a stored marker)');
+    assert(s1d.cutAtByte === undefined, 'no cutAtByte marker is written for a whole-segment discard');
+    assert(state.priorSegments.length === 1 && state.priorSegments[0].sessionId === ids[0], 'priorSegments keeps only segment 0');
+
+    await S.undoReRecord();
+    sessions = await readStore('sessions');
+    assert(sessions.find((x) => x.id === ids[1]).discarded === undefined, 'undo un-discards exactly the session this cut discarded');
+    assert(state.priorSegments.length === 1 && state.priorSegments[0].sessionId === 'zzz-unrelated', 'undo restores priorSegments to its pre-cut value again');
+
+    // ---- startOver: shows the in-pane confirm, changes nothing until confirmed ----
+    state.priorSegments = priorBefore.slice();
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    documentMock.getElementById('reviewVideo').currentTime = 0;
+    assert(S.computeCutPlan([scan0, scan1], 0).kind === 'startOver', 'precondition: T=0 on a 2-segment chain is start-over');
+
+    await S.reviewCutFromHere();
+    sessions = await readStore('sessions');
+    assert(sessions.length === 2, 'startOver deletes nothing before the confirm');
+    assert(documentMock.getElementById('reviewDiscardConfirm').classList.contains('visible') === true, 'the in-pane start-over confirm is shown');
+    assert(state.priorSegments.length === 1 && state.priorSegments[0].sessionId === 'zzz-unrelated', 'priorSegments is untouched pending the confirm');
+    S.hideReviewDiscardConfirm();
+
+    // ---- noop: past the end, no state change ----
+    const noopT = offset1 + scan1.lastClusterMaxBlockTime + 1;
+    documentMock.getElementById('reviewVideo').currentTime = noopT / 1000;
+    assert(S.computeCutPlan([scan0, scan1], noopT).kind === 'noop', 'precondition: past the end is a noop');
+
+    await S.reviewCutFromHere();
+    sessions = await readStore('sessions');
+    assert(sessions.length === 2, 'noop deletes/flags nothing');
+    assert(/already the end/i.test(documentMock.getElementById('reviewStatus').textContent), 'a gentle "nothing after it to remove" status message is shown');
+  });
+
+  // DP — discarded-session lifecycle
+  await scenario('DP discarded-session lifecycle: excluded from checkForRecovery, swept by deleteDiscardedSessions, and cleaned up by both a real confirmed-save path and an explicit discard path', async () => {
+    // ---- checkForRecovery excludes discarded sessions from the list AND totals ----
+    const keptId = await seed(3);
+    const discardedId = await seed(5);
+    await S.setSessionDiscarded(discardedId, true);
+    await S.checkForRecovery();
+    await drain();
+    assert(windowMock._recoverySessions.length === 1 && windowMock._recoverySessions[0].id === keptId,
+      'checkForRecovery lists only the non-discarded session');
+    const info = documentMock.getElementById('recoveryInfo').textContent;
+    assert(/Found 3 chunks/.test(info), 'the totals count only the kept session\'s chunks (got: ' + info + ')');
+
+    // ---- deleteDiscardedSessions removes exactly the flagged ones ----
+    await S.deleteDiscardedSessions();
+    let sessions = await readStore('sessions');
+    assert(sessions.length === 1 && sessions[0].id === keptId, 'deleteDiscardedSessions removed exactly the discarded session, leaving the kept one');
+    await api.deleteSession(keptId); // isolate the remaining sub-scenarios below
+
+    // ---- a real confirmed-save path (finalizeRecording, single segment) sweeps a discarded sibling ----
+    state.sessionId = await seed(2);
+    const siblingId = await seed(1);
+    await S.setSessionDiscarded(siblingId, true);
+    state.priorSegments = [];
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.finalizeRecording();
+    await drain();
+    sessions = await readStore('sessions');
+    assert(sessions.find((s) => s.id === siblingId) === undefined, 'a normal confirmed save sweeps the discarded sibling too');
+    assert(sessions.find((s) => s.id === state.sessionId) === undefined, 'the saved session itself is deleted, as before');
+
+    // ---- an explicit discard (discardRecovery) sweeps discarded siblings too ----
+    const bannerId = await seed(2);
+    const siblingId2 = await seed(1);
+    await S.setSessionDiscarded(siblingId2, true);
+    windowMock._recoverySessions = [{ id: bannerId, mimeType: 'video/webm' }];
+    await S.discardRecovery();
+    sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'discardRecovery deletes the banner-listed session AND sweeps the discarded sibling');
+  });
+
+  // DQ — save-as-is differential
+  await scenario('DQ save-as-is differential: two segments with a cut marker on the last one through the REAL stitched save === stitchOracle of the sliced buffers; a single segment === the buffered oracle; a cancelled save preserves every session', async () => {
+    // ---- two segments, cut marker on the last one ----
+    {
+      const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+      const scan1 = scanResult(buf1);
+      const cutAtByte = scan1.clusters[1].start;
+      const ids = await seedSegments([buf0, buf1]);
+      await S.setSessionCut(ids[1], cutAtByte, scan1.clusters[1].timestamp);
+      api.reviewState.segments = [{ sessionId: ids[0], mimeType: 'video/webm' }, { sessionId: ids[1], mimeType: 'video/webm' }];
+
+      const want = await stitchOracle([buf0, buf1.slice(0, cutAtByte)]);
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      await S.reviewSaveAsIs();
+      await drain();
+      assert(lastWritten.length === 1 && Buffer.compare(Buffer.from(await lastWritten.pop().arrayBuffer()), want) === 0,
+        'Save as is (2 segments, cut on the last) === stitchOracle([buf0, buf1.slice(0,cut)])');
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 0, 'both sessions are deleted after a confirmed save-as-is');
+    }
+
+    // ---- single segment ----
+    {
+      const buf = syntheticWebm();
+      const ids = await seedSegments([buf]);
+      api.reviewState.segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+      const want = await expectedBytes(buf);
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      await S.reviewSaveAsIs();
+      await drain();
+      assert(lastWritten.length === 1 && Buffer.compare(Buffer.from(await lastWritten.pop().arrayBuffer()), want) === 0,
+        'Save as is (single segment) === makeSeekable(full buffer) oracle');
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 0, 'the session is deleted after a confirmed save-as-is');
+    }
+
+    // ---- cancel stays in the pane (the user is mid-review, nothing was lost) ----
+    {
+      const buf = syntheticWebm();
+      const ids = await seedSegments([buf]);
+      api.reviewState.segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+      api.reviewState.active = true;
+      documentMock.getElementById('reviewPane').classList.add('visible');
+      windowMock.showSaveFilePicker = pickerSequence(['abort']);
+      await S.reviewSaveAsIs();
+      await drain();
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 1 && sessions[0].id === ids[0], 'cancelling save-as-is preserves the session, same as a normal Stop & save cancel');
+      assert(api.reviewState.active === true && documentMock.getElementById('reviewPane').classList.contains('visible') === true,
+        'the review pane stays open — unlike a normal cancel, the user is still mid-review with nothing lost');
+      assert(documentMock.getElementById('reviewStatus').textContent === 'Save cancelled — your recording is still here.',
+        'the cancel copy is shown in the review pane\'s own status line, not the recorder-level error banner');
+    }
+  });
+
+  // DR — review-pane failure hardening (post-v1.20 Firefox report): a click
+  // on "Re-record from here" must never die silently. A bailed scan disables
+  // the button with a plain message; an unexpected throw is caught, says so,
+  // and leaves the pane open with nothing changed.
+  await scenario('DR review-pane failure hardening: bailed scan disables the cut with a message; an unexpected error is caught, surfaced, and changes nothing', async () => {
+    // ---- (a) a segment the scanner bails on -> degraded review, cut gated ----
+    {
+      const ids = await seedSegments([syntheticWebm(), syntheticPoisonWebm()]);
+      const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+      await S.openReviewPane(segments);
+      assert(api.reviewState.scansOk === false, 'a bailed segment scan flags scansOk=false');
+      assert(documentMock.getElementById('btnReRecordHere').disabled === true, 'Re-record from here is disabled, not left as a dead click');
+      assert(/isn't available|Couldn't prepare/.test(documentMock.getElementById('reviewStatus').textContent),
+        'a plain-language message explains the limitation');
+      documentMock.getElementById('reviewVideo').currentTime = 1.5;
+      await S.reviewCutFromHere();
+      const sessions = await readStore('sessions');
+      assert(sessions.every((s) => s.cutAtByte === undefined && s.discarded === undefined),
+        'the gated cut writes no marker and discards nothing');
+      assert(api.reviewState.active === true, 'the pane stays open in degraded mode');
+      S.closeReviewPane();
+      for (const id of ids) await api.deleteSession(id);
+    }
+
+    // ---- (b) an unexpected throw inside the cut -> caught, surfaced, nothing changed ----
+    {
+      const buf = syntheticWebm();
+      const ids = await seedSegments([buf]);
+      const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+      await S.openReviewPane(segments);
+      assert(api.reviewState.scansOk === true, 'precondition: a clean scan enables the cut');
+      const origPlan = sandbox.computeCutPlan;
+      sandbox.computeCutPlan = () => { throw new Error('synthetic failure'); };
+      documentMock.getElementById('reviewVideo').currentTime = 1.5;
+      let escaped = false;
+      try { await S.reviewCutFromHere(); } catch (e) { escaped = true; }
+      sandbox.computeCutPlan = origPlan;
+      assert(escaped === false, 'the error never escapes the click handler');
+      assert(/Couldn't set the re-record point/.test(documentMock.getElementById('reviewStatus').textContent),
+        'the failure is surfaced in the pane, never silent');
+      assert(api.reviewState.active === true && documentMock.getElementById('reviewPane').classList.contains('visible') === true,
+        'the pane stays open after a caught failure');
+      const sessions = await readStore('sessions');
+      assert(sessions.every((s) => s.cutAtByte === undefined && s.discarded === undefined),
+        'nothing was cut or discarded by the failed click');
+      assert(api.reviewState.undo === null, 'no undo record is created by a failed cut');
+    }
+  });
+
+  // DS — Firefox long-cluster seam fix (session s21). The seam offset must use
+  // the previous segment's actual CONTENT END (highest block time in its last
+  // cluster), not its last cluster's START + a flat ~1s guess. syntheticLongClusterWebm()
+  // reproduces Firefox's ~7.5s cluster spacing, where the old formula
+  // (maxClusterTs + 1000) put the next segment's first rebased cluster
+  // seconds BEFORE the previous segment's content actually ended — Firefox
+  // then refuses to decode past the non-monotonic timeline (BUILD_LOG "Known
+  // limitation #4").
+  await scenario('DS Firefox long-cluster seam fix: streamed stitch === oracle, no cluster overlap, computeCutPlan offsets are content-end-based, and a cut-then-stitch chain holds both properties', async () => {
+    const thirds = (b) => splitAt(b, [Math.floor(b.length / 3), Math.floor(2 * b.length / 3)]);
+
+    // ---- (a) two-segment stitch of long-cluster fixtures: REAL streamed sink === stitchOracle ----
+    {
+      const buf0 = syntheticLongClusterWebm(), buf1 = syntheticLongClusterWebm();
+      const want = await stitchOracle([buf0, buf1]);
+      const id0 = await seedBuffers(thirds(buf0)), id1 = await seedBuffers(thirds(buf1));
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      const r = await S.saveSessionsStreamedStitch(
+        [{ sessionId: id0, mimeType: 'video/webm' }, { sessionId: id1, mimeType: 'video/webm' }], 'x.webm');
+      assert(r === 'saved', 'DSa precondition: stitched save succeeded (got ' + r + ')');
+      const got = Buffer.from(await lastWritten.pop().arrayBuffer());
+      assert(Buffer.compare(got, want) === 0,
+        'DSa: long-cluster streamed stitch === stitchOracle (' + got.length + ' vs ' + want.length + ' bytes)');
+
+      // ---- (b) NO-OVERLAP: the assertion that would have caught the Firefox bug ----
+      assertNoOverlap(got, 'DSb long-cluster stitched output');
+      // Also pin it on a stitch of the ORIGINAL ~1s-cluster fixtures — the shape
+      // the old +1000 guess happened to roughly fit, so the fix must not have
+      // broken it.
+      const chromeStitched = await stitchOracle([syntheticWebm(), syntheticWebm()]);
+      assertNoOverlap(chromeStitched, 'DSb Chrome-shaped (~1s cluster) stitched output');
+    }
+
+    // ---- (c) computeCutPlan on a 2-segment long-cluster chain: offsets/keptMs
+    // reflect content-end + SEAM_GAP_MS, derived from the fixture's own scan ----
+    {
+      const buf0 = syntheticLongClusterWebm(), buf1 = syntheticLongClusterWebm();
+      const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+      const offset1 = seamOffset(scan0);
+
+      // Mid-cluster in segment 1 (non-final) -> cut with segIndex 1 and the
+      // content-end-shifted cutAtByte/keptMs.
+      let T = offset1 + midTs(scan1.clusters[1].timestamp, scan1.clusters[2].timestamp);
+      let plan = S.computeCutPlan([scan0, scan1], T);
+      assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === scan1.clusters[1].start &&
+        plan.keptMs === offset1 + scan1.clusters[1].timestamp,
+        'DSc: mid-cluster in segment 1, content-end-based offset (got ' + JSON.stringify(plan) + ')');
+
+      // T in the (now SEAM_GAP_MS-narrow, not ~6.5s-wide) seam gap between
+      // segment 0's real end and segment 1's first cluster -> discard segment 1
+      // whole; segment 0 kept as-is.
+      T = midTs(scan0.lastClusterMaxBlockTime, offset1);
+      plan = S.computeCutPlan([scan0, scan1], T);
+      assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === 0 &&
+        plan.keptMs === scan0.lastClusterMaxBlockTime,
+        'DSc: T in the SEAM_GAP_MS-wide seam gap -> {segIndex:1, cutAtByte:0} (got ' + JSON.stringify(plan) + ')');
+    }
+
+    // ---- (d) cut-then-stitch end-to-end on long-cluster fixtures: cut segment 0
+    // mid-chain (a cluster-boundary cut, via setSessionCut), stitch with a second
+    // segment, assert byte-equality with the oracle AND the no-overlap property ----
+    {
+      const buf0 = syntheticLongClusterWebm(), buf1 = syntheticLongClusterWebm();
+      const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+
+      // A boundary cut in segment 0 (leaves cluster 0 complete, drops clusters 1-2).
+      const T = midTs(scan0.clusters[1].timestamp, scan0.clusters[2].timestamp);
+      const plan = S.computeCutPlan([scan0, scan1], T);
+      assert(plan.kind === 'cut' && plan.segIndex === 0 && plan.cutAtByte === scan0.clusters[1].start,
+        'DSd precondition: plan cuts segment 0 at a cluster boundary (got ' + JSON.stringify(plan) + ')');
+
+      const want = await stitchOracle([buf0.slice(0, plan.cutAtByte), buf1]);
+      const id0 = await seedBuffers(thirds(buf0)), id1 = await seedBuffers(thirds(buf1));
+      await S.setSessionCut(id0, plan.cutAtByte, plan.keptMs);
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      const r = await S.saveSessionsStreamedStitch(
+        [{ sessionId: id0, mimeType: 'video/webm' }, { sessionId: id1, mimeType: 'video/webm' }], 'x.webm');
+      assert(r === 'saved', 'DSd precondition: cut-then-stitch save succeeded (got ' + r + ')');
+      const got = Buffer.from(await lastWritten.pop().arrayBuffer());
+      assert(Buffer.compare(got, want) === 0,
+        'DSd: cut-then-stitch (long-cluster) === stitchOracle([buf0.slice(0,cut), buf1]) (' + got.length + ' vs ' + want.length + ' bytes)');
+      assertNoOverlap(got, 'DSd cut-then-stitch output');
     }
   });
 
