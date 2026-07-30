@@ -1,112 +1,126 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-07-29 (post-v1.16). An Aegis session also has
-the fuller `project_screen_recorder.md` project memory — read that too if available.
+Close-out snapshot, 2026-07-29 (post-v1.18). Supersedes the post-v1.16 snapshot.
 
 ## Where things stand
 
-- **v1.15 and v1.16 are owner-accepted (both browsers, 2026-07-29) but may not be
-  committed yet** — check `git status` first; if dirty, the suggested commit
-  messages are in their BUILD_LOG entries. v1.14 (`4cfdf4c`) was the last push.
-- **v1.15** — camera-side honest labels + mic toggle defaults OFF. The v1.14 mic
-  machinery generalized: shared `applyDeviceDefaultText(type)`, camera surfaces
-  the granted video track's own label ("Camera: <label>") via
-  `state.lastCameraLabel`, separate `camEnumAnonymized` verdict set/cleared in
-  `captureCamera` (which now awaits its internal enumerate). Mic defaults OFF at
-  load, matching the webcam. Closes REVIEW.md #16.
-- **v1.16** — the mic hold. Toggle-ON acquires AND HOLDS the mic stream
-  (`acquireMicHold` / `state.heldMicStream` / `state.heldMicDeviceId`), mirroring
-  the webcam preview; `captureMic` reuses the live, selection-matching hold at
-  record with ZERO getUserMedia calls, so Record starts instantly and prompt-free
-  — the permission pop-up moved to toggle-ON, where in file:// Chrome it doubles
-  as the device picker. Recording stop preserves the hold while the toggle is on
-  (`releaseMicRecordingRef`, which also promotes a mid-recording fallback stream
-  into the new hold); denial reverts the toggle with failure-matched copy;
-  `primeMicLabels` and the passive prime are GONE; `micEnumAnonymized` now
-  governs only the dropdown's Default-slot text. Mic goes hot at toggle-ON
-  (browser indicator pre-recording) — by design, matches the camera. Closes
-  REVIEW.md #17.
-- Harness: 86 scenarios / 472 assertions (v1.15 added BL–BR, v1.16 added BS–CD
-  and deliberately rewrote ten v1.14-era scenarios that encoded prime-then-stop).
-  `node test.cjs` prints the assertion total, not a scenario count — see Gotchas.
-- Recording pipeline (~1s-max-loss guarantee) and v1.11/v1.13 streamed save
-  flows untouched by both versions; v1.16's closest approach is
-  `releaseMicRecordingRef` in `cleanupStreams`, which is stream teardown only.
-- Standing preference (in Aegis memory too): run DidaRec work as orchestrator +
-  Sonnet 5 subagents (`Agent` tool, `model: "sonnet"`) — Fable plans/reviews/
-  presents, Sonnet drafts/explores/tests in a scratch copy. The File Edit Rule
-  still applies at the orchestrator level. This session ran that way for both
-  versions; orchestrator review caught two real defects in the v1.16 draft (a
-  stale-selection race around the grant `await`, and permission-blaming copy on
-  device failures) — the review pass earns its keep.
+- **v1.17 (caption foundation) and v1.18 (caption editor UI) are shipped, pushed,
+  and past the owner's initial acceptance pass** (2026-07-29). Commits `b956040`
+  (v1.17), `33d8425` (v1.18), `f231287` (acceptance docs). Check `git status`
+  first: the REVIEW.md edits recording the #18 keep-decision and the new #21
+  queue item may still be uncommitted (suggested message:
+  `docs: caption editor kept; queue #21 re-record-from-timestamp as next up`).
+- **v1.17** — pure caption logic in `index.html` ("Caption logic (v1.17)"
+  section): `parseCaptionTimestamp`/`formatCaptionTimestamp`, `parseVTT`/
+  `parseSRT` (best-effort, `skipped` counts, prologue + cue-settings preserved
+  verbatim for lossless round-trip), `detectCaptionFormat`, `serializeVTT`/
+  `serializeSRT`. Closes nothing in REVIEW; opens item #18's foundation.
+- **v1.18** — the open-a-file caption editor: mode switch (`openCaptionEditor`/
+  `closeCaptionEditor`, hides recorder UI), open/drag-drop a .webm into the
+  app's FIRST real playback `<video controls>` (`#captionVideo`), VTT/SRT
+  import, sorted cue-list editing (end>start validated), live `<track>` preview
+  (`track.track.mode`, NOT the element's — that was review defect C), IndexedDB
+  draft autosave (`DB_VERSION` 2, new `captions` store keyed by
+  `name|size|lastModified`, guarded upgrade), export .vtt/.srt through the
+  saveFile FSA/download fork with sidecar naming. Recording pipeline and
+  streamed save flows untouched; `deleteSession` untouched (drafts key on file
+  identity, not sessions).
+- **Harness: 115 scenarios / 649 assertions** (`node test.cjs`; scenario
+  prefixes now end at DH). Orchestrator review caught 3 defects in the v1.17
+  draft and 8 in the v1.18 draft before ship — the review pass is load-bearing,
+  keep it (BUILD_LOG entries have the details).
 
-## Permanent platform knowledge (read before touching mic/camera/save code)
+## Decisions made this session (owner, 2026-07-29)
 
-- **file://-served Chrome cannot list mic OR camera device names in-app, ever.**
-  Confirmed Chrome 150, 2026-07-28: `enumerateDevices()` returns blank deviceId
-  AND label at every stage, even during a live granted stream — file:// origins
-  never persist a `getUserMedia` grant. The per-kind verdict flags
-  (`micEnumAnonymized`, `camEnumAnonymized` in localStorage) record this so the
-  dropdowns explain themselves; since v1.16 they gate NO prompting behavior,
-  only the Default-slot text. The granted track's own `.label` still works and
-  is surfaced ("Microphone: <device>" / "Camera: <device>"). Serving over
-  http(s) restores persisted grants and full named dropdowns.
-- **file:// Chrome NOW EXPOSES `showSaveFilePicker` (owner console check
-  2026-07-29; earlier builds lacked FSA on file://).** Saves in Chrome therefore
-  take the FSA picker path — write confirmed by the API, `'saved'` result — and
-  the gray `#downloadConfirm` bar does NOT appear, by design; that bar only
-  backs the unverifiable anchor-download path (still Firefox's route). This was
-  reported as a missing banner during v1.16 acceptance and diagnosed as a Chrome
-  auto-update, not an app change (differential harness repro showed v1.15/v1.16
-  byte-identical through the whole stop-and-save flow). Don't chase a missing
-  Chrome save-bar as a regression — check `'showSaveFilePicker' in window` first.
-  Corollary: Chrome's per-recording record-start pop-ups are also gone now —
-  the toggle-ON grant is held and reused across recordings (v1.16).
-- **A Bluetooth headset's hands-free profile masquerades as "interference."**
-  8–16 kHz telephony-band audio from `Headset (… Hands-Free AG Audio)` was the
-  original v1.13-era "interference/no-voice" bug. If it's ever heard again,
-  check which physical device the granted track's label names before assuming a
-  capture regression.
+- **Caption editor STAYS.** From-scratch authoring was judged cumbersome; the
+  primary workflow is reframed as **import-and-correct** (auto-generate a .vtt
+  elsewhere — including browser-local ASR that never uploads the video — then
+  fix errors against playback in DidaRec and export the sidecar). Validated by
+  the owner with a simulated-ASR test file (import → fix six seeded homophone
+  errors → export). The zero-install/no-upload correction niche plus its role
+  in #21 justified keeping it.
+- **v1.19 (authoring polish: shortcuts, cue chaining, split/merge) is queued
+  but NOT next.** Only revisit if from-scratch authoring becomes a real story.
+- **#21 is next: re-record from a timestamp** (see below).
+- **#19 (user docs + README refresh) and #20 (final-build full regression)**
+  are queued for when the feature set stabilizes. README is actively stale
+  (still says Chrome-only/FSA-required; Firefox has been primary since v1.9).
+
+## Next session: #21 — re-record from a timestamp (design brief first)
+
+Owner's ask: pause/stop a recording, review it, pick a timestamp, re-record
+from that point without losing the whole effort. REVIEW.md #21 has the full
+scoping. Start with a design brief session (recon → design → owner sign-off),
+NOT code. Key pointers:
+
+- Every hard piece exists: the v1.13 streamed index scanner (cluster
+  timestamps + byte offsets) makes truncation a tail-cut at the last cluster
+  boundary <= T (tail cuts have no keyframe problem); Continue Recording is
+  the append-new-segment-and-stitch flow; the v1.18 editor's player is the
+  review/scrub surface.
+- Constraints already agreed with the owner: ~1s cut precision (cluster
+  granularity); reviewing the unsaved recording assembles it in memory
+  (Blob + `makeSeekable` for scrubbing) with a documented ceiling —
+  MediaSource streaming is the eventual fix; the seam behaves like today's
+  crash-stitch seams.
+- Open design question for the brief: soft-delete the discarded tail until
+  final save (recoverable takes — also the doorway to multi-take support).
+- The truncation primitive must trim a chunk mid-ArrayBuffer (cluster
+  boundaries don't align with chunk boundaries). Differential harness tests
+  on synthetic WebM are mandatory. This is EBML byte-surgery: Fable designs
+  and reviews closely, Sonnet executes (standing arrangement).
+- The LIVE recording pipeline stays untouched — truncation operates on stored
+  chunks while the recorder is stopped.
+
+## Permanent platform knowledge (unchanged from last snapshot — still true)
+
+- **file://-served Chrome cannot list mic OR camera device names in-app.**
+  Verdict flags `micEnumAnonymized`/`camEnumAnonymized` in localStorage gate
+  only the dropdowns' Default-slot text. Granted track labels still work.
+- **The owner's Chrome exposes `showSaveFilePicker` on file://** (since a
+  ~2026-07-29 Chrome update) — saves take the FSA path, no gray download bar,
+  by design. Don't chase a missing save-bar as a regression; check
+  `'showSaveFilePicker' in window` first.
+- **A Bluetooth headset's hands-free profile masquerades as "interference"**
+  (8–16 kHz telephony audio). Check the granted track's label before assuming
+  a capture regression.
 
 ## Read first
 
-- `BUILD_LOG.md` — architecture + full version history (through v1.16, including
-  the FSA field note).
-- `REVIEW.md` — the build queue and what's fixed (through #17).
-- `test.cjs` — Node harness (86 scenarios / 472 assertions). `npm i fake-indexeddb`
-  then `node test.cjs`. Extend it; don't bypass it.
+- `BUILD_LOG.md` — architecture + version history through v1.18 (the v1.18
+  entry documents all 8 review-caught defects); Testing section holds every
+  manual acceptance list (that's also the #20 master checklist).
+- `REVIEW.md` — queue: #21 (next), #19/#20 (at stabilization), v1.19 (parked).
+- `test.cjs` — `npm i fake-indexeddb`, `node test.cjs`, expect 649 assertions.
 
 ## Ground rules (unchanged)
 
-Zero dependencies, single `index.html`, no build step. WebM / streamable only. Don't
-touch the recording pipeline (~1s-max-loss crash guarantee) or the v1.11/v1.13
-streamed save flows. Firefox is the primary browser — test there, not just Chrome.
-Faculty audience: messages suggest an action, never a stack trace. Show Blue every
-proposed change in full and wait for approval before writing any file. End with a
-working page; bump the version in `BUILD_LOG.md` and update `REVIEW.md` when done.
+Zero dependencies, single `index.html`, ONE `<script>` block (test.cjs
+regex-extracts it — a second block breaks the harness). WebM/streamable only.
+Don't touch the recording pipeline (~1s-max-loss guarantee) or the v1.11/v1.13
+streamed save flows. Firefox is primary — test there, not just Chrome. Faculty
+audience: messages suggest an action, never a stack trace. File Edit Rule:
+show Blue every proposed change in full and wait for approval before writing
+project files (agents draft in scratch, orchestrator reviews and presents).
+End with a working page; bump BUILD_LOG and update REVIEW when done.
 
-## Open queue (priority order)
+## Gotchas (learned the hard way; new ones marked ●)
 
-1. **Tier 1: caption editor with VTT/SRT import/export** (highest-value open item —
-   ADA Title II; prior-art recon: borrow laubonghaudoi/subtitle-editor, MIT).
-   Deserves its own brief and likely multiple sessions.
-2. Chapter-marker hotkeys, sidecar export convention (Tier 1 remainder).
-
-## Gotchas (learned the hard way)
-
-- Don't run index-touching git (`status`/`add`/`commit`) from a restricted sandbox —
-  stale `.git/index.lock` blocks later git; read-only checks there, real git in a
-  normal shell. (Blue's machine once had a stale `.git/HEAD.lock` from an
-  interrupted git — same cure: `rm` it.)
+- Don't run index-touching git from a restricted sandbox — stale
+  `.git/index.lock`. Read-only checks there, real git in a normal shell.
+- The assertion total from `node test.cjs` is ground truth; count
+  `await scenario(` calls for the scenario number. Prefixes end at DH.
+- ● New caption functions must be added to test.cjs's `__api` exposure line
+  (~line 177) to be testable; the vm sandbox also exposes top-level functions
+  as `sandbox.<name>`.
+- ● `resetState()` in test.cjs must reset any new module-level state (it now
+  clears `captionEditorState`, `captionCueRowEls`, banners, file inputs) —
+  module-level objects leak across scenarios otherwise.
+- ● PowerShell `Measure-Object -Line` skips blank lines — use
+  `(Get-Content f).Count` for real line counts (a false red flag cost time).
+- ● Grep display can mangle leading `//` into `\` — check raw bytes before
+  declaring corruption (a false alarm this session).
+- The harness proves logic; only a browser proves pixels/audio/permissions —
+  v1.18's `TextTrack.mode` fix is manual-only verifiable (BUILD_LOG Testing
+  list, item 3).
 - Staging can serve a stale copy — confirm with a fresh shell read.
-- `.gitignore` covers `node_modules/`, `_to_delete/`, `*.webm`, `*_HANDOFF.md`,
-  `*_completion_report.md`.
-- Scenario-count bookkeeping drifts — the assertion total from `node test.cjs` is
-  ground truth; count `await scenario(` calls if you need the scenario number.
-- The harness proves logic; only a browser proves pixels/audio/permissions — and
-  (new this session) the owner's environment can change UNDER you: a Chrome
-  auto-update flipped save-path behavior mid-project. When "it changed and we
-  didn't touch it," a differential harness repro (same flow, both versions) plus
-  a one-line owner console check settles it cheaply. `repro_banner.cjs` in this
-  session's scratch was the pattern: 2×2 (version × save-mode) over the exact
-  reported flow.

@@ -289,10 +289,14 @@ pre-existing assertions unchanged.
 **Still open (v1.19 remainder, unchanged scope from the feature map):**
 keyboard shortcuts, split/merge cues, and chapter-marker hotkeys. v1.18
 itself passed the owner's initial acceptance pass (2026-07-29); the full
-regression re-run is deferred to the final-build pass (#20). Whether v1.19
-happens at all is under evaluation — the editor's primary case has been
-reframed as import-and-correct (owner discussion 2026-07-29), and the
-scrap/freeze/polish decision follows the owner's caption-workflow experiment.
+regression re-run is deferred to the final-build pass (#20).
+
+**Owner decision (2026-07-29): the caption editor STAYS.** The scrap/freeze
+question was evaluated (from-scratch authoring is cumbersome; the primary
+workflow is reframed as import-and-correct) and resolved KEEP — partly
+because the editor's video-playback/scrub surface is half the UI for the
+newly prioritized re-record-from-timestamp feature (#21). The v1.19
+authoring polish remains queued but is no longer next; #21 is.
 
 ## User documentation (queued 2026-07-29)
 
@@ -319,6 +323,35 @@ the user-facing documentation. Two deliverables:
 
 Not started — deliberately last in the queue so it documents the final shape
 instead of chasing a moving one.
+
+### 21. Re-record from a timestamp ("take-based recording") — owner-prioritized (2026-07-29), NEXT UP
+Owner's ask: pause/stop a recording, review it, pick a timestamp, and
+re-record from that point — correcting a big mistake without losing the
+whole effort. This is the Tier 2 "take-based recording" the feature map
+already called half-built, now concretely scoped. Every hard piece exists:
+the v1.13 streamed index scanner locates cluster timestamps/byte offsets
+(truncation = tail-cut at the last cluster boundary <= T; tail cuts have no
+keyframe problem), Continue Recording provides the append-new-segment-and-
+stitch-at-save flow, and the v1.18 editor's video player provides the
+review/scrub/pick-a-timestamp surface.
+
+Honest constraints, agreed with the owner up front: cut precision ~1s
+(cluster granularity, not frame-exact — frame-exact would need decode/
+re-encode, out of scope); reviewing the unsaved recording assembles it in
+memory (Blob + makeSeekable for scrubbing) — fine for typical soon-after-
+the-mistake use, documented ceiling for very long recordings, MediaSource
+streaming playback is the eventual fix; the re-record seam behaves like
+today's crash-stitch seams (possible brief black frame, known limitation
+#5's territory). Design decision for the brief: keep the discarded tail
+recoverable until final save (soft-delete), which is also the doorway to
+full multi-take support.
+
+EBML byte-surgery on stored recordings — Fable designs and reviews closely,
+Sonnet executes (per the standing streaming-stitch-class note). Estimated
+three sessions: (1) truncation primitive + differential harness tests on
+synthetic WebM; (2) review-player + "Re-record from here" flow; (3)
+integration + acceptance. The LIVE recording pipeline stays untouched —
+truncation operates on stored chunks while the recorder is stopped.
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature
