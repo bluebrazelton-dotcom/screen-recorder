@@ -1075,6 +1075,76 @@ flow against v1.15 and v1.16 showed the two versions byte-identical on every
 observable in both save modes. Don't chase a missing Chrome save-bar as a
 regression — check FSA availability first.
 
+### v1.17 — Caption editor foundation: VTT/SRT parsing, formatting, and serialization (2026-07-29)
+
+**Commit:** `caption editor foundation: pure VTT/SRT parse/format/serialize logic, no UI yet`
+
+Begins Tier 1's highest-value open item (ADA Title II accessibility) per
+NEXT_SESSION.md's open queue. This version is FOUNDATION ONLY — pure caption logic
+and tests, no DOM, no IndexedDB changes, no UI, and no changes to any existing
+function or the recording pipeline. The editor UI (the open-a-file editor model)
+lands in v1.18.
+
+**What was built** (new "Caption logic (v1.17)" section, `index.html`):
+
+1. **`parseCaptionTimestamp(str)` / `formatCaptionTimestamp(seconds, sep)`** —
+   timestamp parsing tolerant of HH:MM:SS.mmm, any number of hour digits (VTT's
+   large hour counts and hand-authored SRT's unpadded `1:23:45,678` both work),
+   MM:SS.mmm (VTT's hours-optional form), and either `.` or `,` as the decimal
+   separator. Formatting always emits hours (2-digit minimum, more digits past
+   99h), clamps negatives to 0, and rounds via a single integer millisecond total
+   to avoid the carry bug where 1.9995s naively formats as 00:00:01.1000 instead
+   of rolling over to 00:00:02.000.
+2. **`parseVTT(text)` / `parseSRT(text)`** — block-based parsers, hardened against
+   prior-art recon of laubonghaudoi/subtitle-editor and plussub/srt-vtt-parser
+   (both MIT): BOM/CRLF/CR normalized first; a bad cue (wrong arrow, unparseable
+   timestamp, end<=start, missing timing line, empty text) increments `skipped`
+   and parsing continues rather than aborting the file. VTT keeps cue-settings
+   tails verbatim (`settings` field) for lossless round-trip — both surveyed
+   prior-art parsers discard them, so this is a deliberate improvement. VTT
+   prologue (NOTE/STYLE/REGION before the first cue) is captured verbatim for
+   round-trip; the same block types between cues are dropped silently. SRT's
+   index line is never kept as `id` (ids regenerate on export).
+3. **`detectCaptionFormat(text, filename)`** — content sniff first (WEBVTT header,
+   SRT-shaped first block), filename extension fallback, defaults to `'vtt'`.
+4. **`serializeVTT({ cues, prologue })` / `serializeSRT({ cues })`** — VTT
+   preserves ids/settings/prologue; SRT renumbers sequentially from 1 regardless
+   of any original index values. Both emit exactly one trailing newline. Cues
+   serialize in array order — sorting is the editor's job, not the serializer's.
+
+**Verification:** harness now 98 scenarios / 566 assertions (new CE–CP). Covers:
+timestamp parse/format edge cases including 0, >1h, >=100h, ms-rounding carry, and
+negative clamp (CE); VTT round-trip preserving prologue (NOTE+STYLE), cue ids, and
+settings verbatim (CF); SRT round-trip renumbering regardless of original indices
+(CG); SRT→VTT cross-format conversion (CH); BOM+CRLF/CR normalization (CI); a
+missing WEBVTT header parsed best-effort without counting as a skip (CJ);
+hours-optional and comma-decimal timestamps tolerated inside VTT (CK); one mixed
+VTT fixture (modeled on prior-art's invalid-sample.vtt) proving wrong-arrow,
+end-before-start, missing-timing-line, and empty-text cues are each skipped while
+good cues still parse (CL); `detectCaptionFormat`'s content-sniff/filename/default
+priority order (CM); tags and voice-spans passing through parse→serialize→reparse
+untouched in both formats (CN); multi-line WEBVTT header blocks (YouTube-style
+`Kind:`/`Language:` metadata) dropped whole instead of miscounted as skipped cues
+(CO); whitespace-only separator lines (a stray space/tab on an otherwise-blank
+line, common in Windows-authored files) still splitting blocks in both formats
+(CP). All 86 pre-existing scenarios pass unchanged.
+
+**Orchestrator review caught three tolerance gaps in the first draft** — multi-line
+WEBVTT header blocks miscounted as malformed cues, whitespace-only separator lines
+not splitting blocks, and one-digit hours rejected — each fixed and locked in by
+CO, CP, and a CE assertion respectively. One known limitation is documented in a
+code comment instead of fixed: a non-conformant file with NO blank line between
+the WEBVTT header and the first cue still mis-parses (deliberately out of scope).
+
+**Bug found and fixed during test-writing:** the initial `parseVTT`/`parseSRT` draft
+left a stray empty string as a cue's trailing text line whenever a block ended in a
+single trailing newline (the normal end-of-file case) — a two-line cue would parse
+with an extra blank line appended to its text. Fixed by trimming trailing empty
+lines from `textLines` before the empty-text-cue skip check, in both parsers.
+
+**No UI, no DOM, no IndexedDB, no state object changes, no recording-pipeline
+changes.** The editor surface (open a .vtt/.srt file, edit cues, export) is v1.18.
+
 ---
 
 ## Known limitations

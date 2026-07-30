@@ -243,6 +243,32 @@ Chrome's gray download-confirm bar missing after Stop & save — resolved as
 platform, not app: their Chrome now exposes FSA on file:// (see BUILD_LOG v1.16
 field note), so saves take the verified picker path that never needed the bar.
 
+## Caption editor: Tier 1 accessibility work begins (2026-07-29)
+
+### 18. Caption editor with VTT/SRT import/export — Tier 1, highest-value open item — IN PROGRESS, foundation shipped v1.17
+Highest-value open item per the Tier 1 feature map above (ADA Title II deadlines).
+Scoped across at least two versions to keep each one reviewable: v1.17 ships the
+foundation layer only (parser/serializer/timestamp utils + tests — zero UI, zero
+DOM, zero changes to the recording pipeline or any existing function); the editor
+surface itself — approved plan is the open-a-file editor model (open a .vtt/.srt
+file, edit cues against the recording, export) rather than an inline overlay —
+lands in v1.18.
+
+**v1.17 foundation:** `parseCaptionTimestamp`/`formatCaptionTimestamp` (HH:MM:SS.mmm
+and MM:SS.mmm, `.`/`,` separators, correct ms-rounding carry); `parseVTT`/`parseSRT`
+(BOM/CRLF-tolerant, one bad cue never aborts the file — `skipped` counts malformed
+blocks; VTT keeps cue-settings verbatim where the surveyed prior art discards them;
+VTT prologue NOTE/STYLE/REGION preserved for round-trip); `detectCaptionFormat`;
+`serializeVTT`/`serializeSRT` (SRT renumbers on export, ids never reused). Harness
+98 scenarios / 566 assertions (new CE–CP), all pre-existing scenarios pass
+unchanged. Orchestrator review caught three tolerance gaps in the first draft
+(multi-line WEBVTT header blocks, whitespace-only separator lines, one-digit
+hours) — fixed and test-locked.
+
+**Still open:** the actual editor UI (v1.18) — file open/import, cue list/timeline
+editing, export — plus chapter-marker hotkeys and the sidecar export convention
+(Tier 1 remainder, unchanged from the feature map above).
+
 ---
 
 ## Feature map vs. the research-derived plan

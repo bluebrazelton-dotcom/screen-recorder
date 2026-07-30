@@ -3939,6 +3939,219 @@ function updateTimerDisplay() {
 }
 
 // ============================================================
+// Caption logic (v1.17)
+// ============================================================
+// Foundation layer for the caption editor (ADA Title II): pure parsing,
+// formatting, and serialization for WebVTT and SRT. No DOM, no state, no
+// side effects — the editor UI that calls into this lands in v1.18. One bad
+// cue must never abort a file: malformed blocks are counted in `skipped`
+// and parsing continues.
+
+// Parse a single VTT/SRT timestamp into float seconds, or null if it isn't
+// one. Accepts HH:MM:SS.mmm, H+:MM:SS.mmm (any number of hour digits, so VTT's
+// large hour counts AND hand-authored SRT's unpadded single-digit hours like
+// "1:23:45,678" both work), MM:SS.mmm (VTT's hours-optional form), and either
+// '.' or ',' as the decimal separator (SRT uses comma; some tools mix them).
+// The hour group's greediness is resolved by backtracking: for a one-colon
+// string like "01:02.500" the hour branch can't complete (no second colon
+// left to satisfy MM:SS), so the engine backs off to the hours-absent
+// MM:SS.mmm interpretation instead.
+function parseCaptionTimestamp(str) {
+  if (typeof str !== 'string') return null;
+  const m = /^(?:(\d+):)?([0-5]?\d):([0-5]?\d)[.,](\d{1,3})$/.exec(str.trim());
+  if (!m) return null;
+  const hours = m[1] ? parseInt(m[1], 10) : 0;
+  const minutes = parseInt(m[2], 10);
+  const seconds = parseInt(m[3], 10);
+  const ms = parseInt(m[4].padEnd(3, '0'), 10);
+  return hours * 3600 + minutes * 60 + seconds + ms / 1000;
+}
+
+// Format float seconds back into HH:MM:SS<sep>mmm. Hours are always shown
+// (2-digit minimum, more digits past 99h59m59s), sep is '.' for VTT or ','
+// for SRT, negatives clamp to 0. Rounds to the nearest millisecond via a
+// single integer totalMs — computing hh/mm/ss/ms independently off the raw
+// float causes carry bugs (e.g. 1.9995s naively formats as 00:00:01.1000
+// instead of rolling over to 00:00:02.000).
+function formatCaptionTimestamp(seconds, sep) {
+  sep = sep === ',' ? ',' : '.';
+  let s = Number(seconds);
+  if (!isFinite(s) || s < 0) s = 0;
+  const totalMs = Math.round(s * 1000);
+  const ms = totalMs % 1000;
+  const totalSec = Math.floor(totalMs / 1000);
+  const secs = totalSec % 60;
+  const totalMin = Math.floor(totalSec / 60);
+  const mins = totalMin % 60;
+  const hours = Math.floor(totalMin / 60);
+  return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}${sep}${String(ms).padStart(3, '0')}`;
+}
+
+// Parse a VTT/SRT cue timing line ("<ts> --> <ts>[ settings...]") into
+// { start, end, settings }, or null if the arrow, either timestamp, or the
+// overall shape is invalid. The wrong arrow ("->") never matches '-->' and
+// naturally falls through to null. Settings (VTT cue-settings tail) are
+// returned verbatim; SRT callers ignore them.
+function parseCueTimingLine(line) {
+  const parts = line.split('-->');
+  if (parts.length !== 2) return null;
+  const left = parts[0].trim();
+  const rightRaw = parts[1].trim();
+  const m = /^(\S+)(?:\s+(.*))?$/.exec(rightRaw);
+  if (!m) return null;
+  const start = parseCaptionTimestamp(left);
+  const end = parseCaptionTimestamp(m[1]);
+  if (start === null || end === null) return null;
+  return { start, end, settings: m[2] || '' };
+}
+
+// Parse WebVTT text into { cues, prologue, skipped }. Cues:
+// { id, start, end, text, settings } — settings is the cue-settings tail
+// verbatim (prior-art parsers we surveyed, laubonghaudoi/subtitle-editor and
+// plussub/srt-vtt-parser, both discard it; we round-trip it instead).
+// prologue captures any NOTE/STYLE/REGION blocks that appear before the
+// first cue, verbatim, for lossless round-trip; the same block types
+// between cues are silently dropped (acceptable — they don't affect
+// playback). skipped counts cue blocks that couldn't be parsed (wrong
+// arrow, bad timestamp, end<=start, missing timing line, or no text) —
+// one bad cue never aborts the rest of the file.
+function parseVTT(text) {
+  const cues = [];
+  let skipped = 0;
+  const prologueParts = [];
+  if (typeof text !== 'string') return { cues, prologue: '', skipped };
+  const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  // Split on blank-ish separator lines, not just a bare "\n\n" -- real-world files
+  // (especially Windows-authored SRT/VTT) sometimes leave a stray space or tab on
+  // an otherwise-blank line between blocks. \s* also collapses a run of several
+  // such lines into a single separator.
+  const blocks = normalized.split(/\n\s*\n/);
+  let start = 0;
+  // The header line can be followed by metadata lines (YouTube-style
+  // "WEBVTT\nKind: captions\nLanguage: en") with no blank line before the first
+  // metadata line -- only before the first CUE. Since blocks are split on blank
+  // lines, that whole header+metadata run is one block; accepting \n right after
+  // WEBVTT (in addition to space/tab/end-of-string) drops the whole thing, not
+  // just a bare "WEBVTT" line.
+  // Known limitation (not worth the complexity here): a non-conformant file with
+  // NO blank line between the header and the first cue will still mis-parse,
+  // since the header and first cue would land in the same block.
+  if (blocks.length && /^WEBVTT( |\t|\n|$)/.test(blocks[0])) start = 1;
+  let seenCueBlock = false;
+  for (let i = start; i < blocks.length; i++) {
+    const block = blocks[i];
+    if (!block || !block.trim()) continue;
+    const lines = block.split('\n');
+    if (/^(NOTE|STYLE|REGION)(\s|$)/.test(lines[0])) {
+      if (!seenCueBlock) prologueParts.push(block);
+      continue; // between-cue NOTE/STYLE/REGION blocks are dropped, not counted as skipped
+    }
+    seenCueBlock = true;
+    let cueLines = lines;
+    let id = null;
+    // A leading non-timing line followed by a valid timing line is a cue id.
+    if (cueLines.length >= 2 && !cueLines[0].includes('-->') && parseCueTimingLine(cueLines[1])) {
+      id = cueLines[0].trim();
+      cueLines = cueLines.slice(1);
+    }
+    if (!cueLines.length || !cueLines[0].includes('-->')) { skipped++; continue; }
+    const timing = parseCueTimingLine(cueLines[0]);
+    if (!timing || !(timing.end > timing.start)) { skipped++; continue; }
+    const textLines = cueLines.slice(1);
+    while (textLines.length && textLines[textLines.length - 1] === '') textLines.pop(); // trailing blank from EOF's single \n, not real cue content
+    if (!textLines.length) { skipped++; continue; }
+    cues.push({ id, start: timing.start, end: timing.end, text: textLines.join('\n'), settings: timing.settings });
+  }
+  return { cues, prologue: prologueParts.join('\n\n'), skipped };
+}
+
+// Parse SRT text into { cues, prologue: '', skipped }. Same cue shape as
+// parseVTT for a uniform editor model, but id is always null (SRT's index
+// numbers regenerate on export, per spec) and settings is always '' (SRT
+// has no cue-settings concept). The leading index line is tolerated if
+// missing. Same skip-and-continue tolerance as parseVTT.
+function parseSRT(text) {
+  const cues = [];
+  let skipped = 0;
+  if (typeof text !== 'string') return { cues, prologue: '', skipped };
+  const normalized = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  // See parseVTT's matching comment: blank-ish (whitespace-only) separator
+  // lines, not just a bare "\n\n", are tolerated here too.
+  const blocks = normalized.split(/\n\s*\n/);
+  for (const block of blocks) {
+    if (!block || !block.trim()) continue;
+    let lines = block.split('\n');
+    if (/^\d+$/.test(lines[0].trim())) lines = lines.slice(1);
+    if (!lines.length || !lines[0].includes('-->')) { skipped++; continue; }
+    const timing = parseCueTimingLine(lines[0]);
+    if (!timing || !(timing.end > timing.start)) { skipped++; continue; }
+    const textLines = lines.slice(1);
+    while (textLines.length && textLines[textLines.length - 1] === '') textLines.pop(); // trailing blank from EOF's single \n, not real cue content
+    if (!textLines.length) { skipped++; continue; }
+    cues.push({ id: null, start: timing.start, end: timing.end, text: textLines.join('\n'), settings: '' });
+  }
+  return { cues, prologue: '', skipped };
+}
+
+// Guess a caption file's format from its content first (WEBVTT header, or an
+// SRT-shaped first block), falling back to the filename extension, then
+// defaulting to 'vtt'.
+function detectCaptionFormat(text, filename) {
+  if (typeof text === 'string') {
+    const t = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+    if (/^WEBVTT(\s|$)/.test(t)) return 'vtt';
+    const firstBlock = (t.split(/\n{2,}/)[0] || '').split('\n').filter(l => l.trim() !== '');
+    if (firstBlock.length) {
+      if (/^\d+$/.test(firstBlock[0].trim()) && firstBlock[1] && firstBlock[1].includes('-->')) return 'srt';
+      if (firstBlock[0].includes('-->') && /,\d{1,3}(\s|$)/.test(firstBlock[0])) return 'srt';
+    }
+  }
+  if (typeof filename === 'string') {
+    const m = /\.([a-z0-9]+)$/i.exec(filename.trim());
+    if (m) {
+      const ext = m[1].toLowerCase();
+      if (ext === 'srt') return 'srt';
+      if (ext === 'vtt') return 'vtt';
+    }
+  }
+  return 'vtt';
+}
+
+// Serialize { cues, prologue } back into a WebVTT string. Cues serialize in
+// array order (sorting is the editor's job, not the serializer's).
+function serializeVTT(data) {
+  data = data || {};
+  const cues = Array.isArray(data.cues) ? data.cues : [];
+  const prologue = typeof data.prologue === 'string' ? data.prologue : '';
+  let out = 'WEBVTT\n\n';
+  if (prologue.trim()) out += prologue.replace(/\n+$/, '') + '\n\n';
+  for (const cue of cues) {
+    let block = '';
+    if (cue.id) block += cue.id + '\n';
+    block += formatCaptionTimestamp(cue.start, '.') + ' --> ' + formatCaptionTimestamp(cue.end, '.');
+    if (cue.settings) block += ' ' + cue.settings;
+    block += '\n' + (cue.text || '');
+    out += block + '\n\n';
+  }
+  return out.replace(/\n+$/, '\n');
+}
+
+// Serialize { cues } back into an SRT string with sequential 1-based
+// renumbering (ids are never reused — SRT indices are positional, not
+// identity). Tags/voice-spans in cue text are left untouched.
+function serializeSRT(data) {
+  data = data || {};
+  const cues = Array.isArray(data.cues) ? data.cues : [];
+  let out = '';
+  cues.forEach((cue, i) => {
+    out += String(i + 1) + '\n';
+    out += formatCaptionTimestamp(cue.start, ',') + ' --> ' + formatCaptionTimestamp(cue.end, ',') + '\n';
+    out += (cue.text || '') + '\n\n';
+  });
+  return out.replace(/\n+$/, '\n');
+}
+
+// ============================================================
 // Init
 // ============================================================
 window.addEventListener('load', () => {

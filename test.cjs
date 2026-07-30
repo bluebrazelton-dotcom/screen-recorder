@@ -174,7 +174,7 @@ const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!scriptMatch) { console.log('FATAL: no <script> block found in index.html'); process.exit(2); }
 let code = scriptMatch[1];
-code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock };';
+code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT };';
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app_new.js' });
 const api = sandbox.__api;
@@ -2406,6 +2406,255 @@ async function scenario(name, fn) {
     assert(state.heldMicStream === null, 'no hold exists after the failure');
     assert(recordedErrors.some(m => /connected|in use by another app/i.test(m)), 'the message points at the device, not permission (got: ' + JSON.stringify(recordedErrors) + ')');
     assert(!recordedErrors.some(m => /declined/i.test(m)), 'the denial copy is not shown for a non-denial failure');
+  });
+
+  // ==================== Caption logic (v1.17) ====================
+  // Pure parsing/formatting/serialization for the caption-editor foundation.
+  // No DOM, no state — these all go through `api.*` directly, no resetState
+  // dependency at all, but the harness still calls it for consistency.
+
+  await scenario('CE parseCaptionTimestamp/formatCaptionTimestamp round-trip and edge cases', async () => {
+    assert(api.parseCaptionTimestamp('00:00:00.000') === 0, 'zero parses to 0');
+    assert(Math.abs(api.parseCaptionTimestamp('01:02:03.456') - (3600 + 120 + 3 + 0.456)) < 1e-9, '>1h timestamp parses correctly');
+    assert(Math.abs(api.parseCaptionTimestamp('123:45:12.345') - (123 * 3600 + 45 * 60 + 12 + 0.345)) < 1e-9, '3-digit hours parse (large VTT hour counts)');
+    assert(api.parseCaptionTimestamp('1:02:03,456') === 3723.456, 'unpadded single-digit hour (hand-authored SRT) parses, not just 2+ digit hours');
+    assert(api.parseCaptionTimestamp('00:00:01,500') === 1.5, 'comma decimal separator tolerated (SRT style)');
+    assert(api.parseCaptionTimestamp('01:02.500') === 62.5, 'MM:SS.mmm hours-optional VTT form parses');
+    assert(api.parseCaptionTimestamp('not a timestamp') === null, 'garbage returns null instead of throwing');
+    assert(api.parseCaptionTimestamp('12:99:00.000') === null, 'out-of-range minutes rejected');
+    assert(api.parseCaptionTimestamp('') === null, 'empty string returns null');
+    assert(api.parseCaptionTimestamp(null) === null, 'non-string input returns null, never throws');
+
+    assert(api.formatCaptionTimestamp(0) === '00:00:00.000', 'zero formats with dot separator by default');
+    assert(api.formatCaptionTimestamp(3723.456) === '01:02:03.456', '>1h formats correctly');
+    assert(api.formatCaptionTimestamp(360000) === '100:00:00.000', '>=100h emits extra hour digits instead of truncating');
+    assert(api.formatCaptionTimestamp(1.9995) === '00:00:02.000', 'ms rounding carries into seconds (never 00:00:01.1000)');
+    assert(api.formatCaptionTimestamp(-5) === '00:00:00.000', 'negative seconds clamp to 0');
+    assert(api.formatCaptionTimestamp(5, ',') === '00:00:05,000', 'comma separator produces SRT-style output');
+    assert(api.formatCaptionTimestamp(1.5, ',') === '00:00:01,500', 'comma separator with fractional seconds');
+  });
+
+  const CF_VTT = `WEBVTT
+
+NOTE
+This is a note before styles
+
+STYLE
+::cue { color: yellow; }
+
+1
+00:00:01.000 --> 00:00:04.000 align:start line:0
+<v Roger>Hello world
+
+cue-2
+00:00:05.500 --> 00:00:07.250
+Second <i>line</i> of text
+with a wrapped second row
+`;
+
+  await scenario('CF VTT round-trip preserves prologue (NOTE+STYLE), cue ids, and settings verbatim', async () => {
+    const parsed = api.parseVTT(CF_VTT);
+    assert(parsed.skipped === 0, 'no cues skipped (got ' + parsed.skipped + ')');
+    assert(parsed.cues.length === 2, 'both cues parsed (got ' + parsed.cues.length + ')');
+    assert(parsed.cues[0].id === '1', 'first cue id preserved (got ' + JSON.stringify(parsed.cues[0].id) + ')');
+    assert(parsed.cues[0].settings === 'align:start line:0', 'cue-settings tail preserved verbatim (got ' + JSON.stringify(parsed.cues[0].settings) + ')');
+    assert(parsed.cues[0].text === '<v Roger>Hello world', 'voice span passed through untouched');
+    assert(Math.abs(parsed.cues[0].start - 1) < 1e-9 && Math.abs(parsed.cues[0].end - 4) < 1e-9, 'first cue timings parsed');
+    assert(parsed.cues[1].id === 'cue-2', 'second cue id preserved');
+    assert(parsed.cues[1].settings === '', 'second cue has no settings tail');
+    assert(parsed.cues[1].text === 'Second <i>line</i> of text\nwith a wrapped second row', 'multi-line cue text joined with \\n, no stray trailing blank line (got ' + JSON.stringify(parsed.cues[1].text) + ')');
+    assert(parsed.prologue.indexOf('NOTE') !== -1 && parsed.prologue.indexOf('STYLE') !== -1 && parsed.prologue.indexOf('::cue { color: yellow; }') !== -1, 'prologue captures NOTE and STYLE blocks verbatim (got ' + JSON.stringify(parsed.prologue) + ')');
+
+    const serialized = api.serializeVTT(parsed);
+    assert(serialized.indexOf('WEBVTT\n\n') === 0, 'serialized output opens with the WEBVTT header');
+    assert(!/\n\n\n/.test(serialized), 'no triple-newline artifacts between blocks');
+    assert(!serialized.endsWith('\n\n'), 'exactly one trailing newline');
+
+    const reparsed = api.parseVTT(serialized);
+    assert(reparsed.skipped === 0, 'round-trip: no cues skipped on reparse');
+    assert(reparsed.cues.length === 2, 'round-trip: both cues survive');
+    assert(reparsed.prologue === parsed.prologue, 'round-trip: prologue is byte-identical');
+    assert(reparsed.cues[0].id === '1' && reparsed.cues[0].settings === 'align:start line:0', 'round-trip: id and settings survive');
+    assert(reparsed.cues[1].text === parsed.cues[1].text, 'round-trip: multi-line text survives');
+  });
+
+  const CG_SRT = `5
+00:00:01,000 --> 00:00:02,500
+Hello there
+
+9
+00:00:03,000 --> 00:00:04,000
+Second line
+`;
+
+  await scenario('CG SRT round-trip renumbers sequentially from 1, ignoring the original index values', async () => {
+    const parsed = api.parseSRT(CG_SRT);
+    assert(parsed.skipped === 0, 'both cues parsed');
+    assert(parsed.cues.length === 2, 'two cues');
+    assert(parsed.cues[0].id === null && parsed.cues[1].id === null, 'SRT index is not kept as cue.id');
+    assert(parsed.prologue === '', 'SRT has no prologue concept');
+    assert(Math.abs(parsed.cues[0].start - 1) < 1e-9 && Math.abs(parsed.cues[0].end - 2.5) < 1e-9, 'first cue timing (comma decimals) parsed');
+    assert(parsed.cues[0].text === 'Hello there', 'first cue text');
+    assert(parsed.cues[1].text === 'Second line', 'second cue text, no stray trailing blank line (got ' + JSON.stringify(parsed.cues[1].text) + ')');
+
+    const serialized = api.serializeSRT(parsed);
+    assert(!serialized.endsWith('\n\n'), 'exactly one trailing newline');
+    const blocks = serialized.replace(/\n+$/, '').split(/\n\n/);
+    assert(blocks.length === 2, 'two SRT blocks serialized');
+    assert(blocks[0].split('\n')[0] === '1', 'first block renumbered to 1 (original index was 5, got ' + blocks[0].split('\n')[0] + ')');
+    assert(blocks[1].split('\n')[0] === '2', 'second block renumbered to 2 (original index was 9, got ' + blocks[1].split('\n')[0] + ')');
+    assert(/00:00:01,000 --> 00:00:02,500/.test(blocks[0]), 'comma-decimal timing serialized');
+
+    const reparsed = api.parseSRT(serialized);
+    assert(reparsed.cues.length === 2 && reparsed.skipped === 0, 'round-trip: both cues survive');
+    assert(reparsed.cues[0].text === parsed.cues[0].text && reparsed.cues[1].text === parsed.cues[1].text, 'round-trip: text unchanged');
+    assert(reparsed.cues[0].id === null, 'round-trip: ids stay null (SRT never carries an id)');
+  });
+
+  const CH_SRT = `1
+00:00:01,000 --> 00:00:03,000
+Cross format <b>text</b>
+`;
+
+  await scenario('CH SRT parses then serializes as VTT (cross-format conversion)', async () => {
+    const parsed = api.parseSRT(CH_SRT);
+    assert(parsed.cues.length === 1 && parsed.skipped === 0, 'one cue parsed from SRT');
+    const vtt = api.serializeVTT(parsed);
+    assert(vtt.indexOf('WEBVTT') === 0, 'output starts with a WEBVTT header');
+    assert(vtt.indexOf('00:00:01.000 --> 00:00:03.000') !== -1, 'timings converted to dot-decimal VTT style (got ' + vtt + ')');
+    assert(vtt.indexOf('Cross format <b>text</b>') !== -1, 'text and tags carried through untouched');
+    assert(vtt.indexOf(',') === -1, 'no comma decimals leak into VTT output');
+
+    const reparsed = api.parseVTT(vtt);
+    assert(reparsed.cues.length === 1 && reparsed.skipped === 0, 'converted VTT reparses cleanly');
+    assert(Math.abs(reparsed.cues[0].start - 1) < 1e-9 && Math.abs(reparsed.cues[0].end - 3) < 1e-9, 'timings preserved across the conversion');
+  });
+
+  await scenario('CI strips a leading BOM and normalizes CRLF/CR line endings before parsing', async () => {
+    const withBomCrlf = '\uFEFF' + 'WEBVTT\r\n\r\n00:00:01.000 --> 00:00:02.000\r\nHello\r\n';
+    const parsed = api.parseVTT(withBomCrlf);
+    assert(parsed.skipped === 0, 'no skipped cues despite BOM+CRLF (got skipped=' + parsed.skipped + ')');
+    assert(parsed.cues.length === 1, 'one cue parsed');
+    assert(parsed.cues[0].text === 'Hello', 'text has no leftover \\r characters (got ' + JSON.stringify(parsed.cues[0].text) + ')');
+    assert(Math.abs(parsed.cues[0].start - 1) < 1e-9 && Math.abs(parsed.cues[0].end - 2) < 1e-9, 'timings parsed correctly through CRLF');
+
+    const bareCR = 'WEBVTT\r\r00:00:05.000 --> 00:00:06.000\rWorld\r';
+    const parsed2 = api.parseVTT(bareCR);
+    assert(parsed2.skipped === 0 && parsed2.cues.length === 1, 'lone CR (old Mac line endings) is also normalized');
+    assert(parsed2.cues[0].text === 'World', 'text is clean after CR-only normalization (got ' + JSON.stringify(parsed2.cues[0].text) + ')');
+  });
+
+  await scenario('CJ a missing WEBVTT header still parses best-effort, and the missing header itself is never counted as skipped', async () => {
+    const noHeader = `00:00:01.000 --> 00:00:02.000
+No header here
+`;
+    const parsed = api.parseVTT(noHeader);
+    assert(parsed.skipped === 0, 'missing header is not itself a skip (got ' + parsed.skipped + ')');
+    assert(parsed.cues.length === 1, 'cue still parsed without a WEBVTT header');
+    assert(parsed.cues[0].text === 'No header here', 'cue text intact');
+  });
+
+  await scenario('CK VTT tolerates hours-optional timestamps and comma decimals inside the same cue', async () => {
+    const mixed = `WEBVTT
+
+01:02.500 --> 01:05,750
+Hours-optional and comma-decimal mixed
+`;
+    const parsed = api.parseVTT(mixed);
+    assert(parsed.skipped === 0, 'no cues skipped (got ' + parsed.skipped + ')');
+    assert(parsed.cues.length === 1, 'one cue parsed');
+    assert(Math.abs(parsed.cues[0].start - 62.5) < 1e-9, 'hours-optional MM:SS.mmm start parses (got ' + parsed.cues[0].start + ')');
+    assert(Math.abs(parsed.cues[0].end - 65.75) < 1e-9, 'comma-decimal end timestamp tolerated inside a VTT file (got ' + parsed.cues[0].end + ')');
+  });
+
+  const CL_VTT = `WEBVTT
+
+1
+00:00:01.000 --> 00:00:02.000
+Good cue one
+
+2
+00:00:05.000 -> 00:00:06.000
+Wrong arrow, should be skipped
+
+3
+00:00:10.000 --> 00:00:09.000
+End before start, should be skipped
+
+Not a timing line at all, no arrow
+
+00:00:20.000 --> 00:00:21.000
+
+5
+00:00:25.000 --> 00:00:26.000
+Good cue two
+`;
+
+  await scenario('CL one mixed VTT file tolerates wrong-arrow, end-before-start, missing-timing-line, and empty-text cues while good cues still parse (modeled on prior-art invalid-sample.vtt)', async () => {
+    const parsed = api.parseVTT(CL_VTT);
+    assert(parsed.skipped === 4, 'exactly 4 malformed cue blocks skipped (got ' + parsed.skipped + ')');
+    assert(parsed.cues.length === 2, 'the 2 well-formed cues still parse (got ' + parsed.cues.length + ')');
+    assert(parsed.cues[0].id === '1' && parsed.cues[0].text === 'Good cue one', 'first good cue intact');
+    assert(parsed.cues[1].id === '5' && parsed.cues[1].text === 'Good cue two', 'second good cue intact — parsing continued past every malformed block');
+  });
+
+  await scenario('CM detectCaptionFormat sniffs content first, falls back to the filename extension, and defaults to vtt', async () => {
+    assert(api.detectCaptionFormat('WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi\n', 'whatever.srt') === 'vtt', 'a WEBVTT header wins over a misleading .srt filename');
+    assert(api.detectCaptionFormat('1\n00:00:01,000 --> 00:00:02,000\nHi\n', 'whatever.vtt') === 'srt', 'SRT-shaped content wins over a misleading .vtt filename');
+    assert(api.detectCaptionFormat('garbage text with no clear shape', 'captions.srt') === 'srt', 'falls back to the filename extension when content sniffing is inconclusive');
+    assert(api.detectCaptionFormat('garbage text with no clear shape', 'captions.vtt') === 'vtt', 'filename fallback also recognizes .vtt');
+    assert(api.detectCaptionFormat('garbage text with no clear shape', 'captions.txt') === 'vtt', 'an unrecognized extension defaults to vtt');
+    assert(api.detectCaptionFormat('garbage text with no clear shape', undefined) === 'vtt', 'no filename at all defaults to vtt');
+    assert(api.detectCaptionFormat('', '') === 'vtt', 'empty inputs default to vtt without throwing');
+  });
+
+  await scenario('CN tags and voice-spans pass through parse, serialize, and reparse untouched in both formats', async () => {
+    const expectedText = "<v Prof. Lee>Welcome, <i>everyone</i>. Let's begin — 50% > 25%.";
+    const taggedVTT = `WEBVTT
+
+00:00:01.000 --> 00:00:02.000
+${expectedText}
+`;
+    const parsed = api.parseVTT(taggedVTT);
+    assert(parsed.cues.length === 1 && parsed.skipped === 0, 'cue parsed');
+    assert(parsed.cues[0].text === expectedText, 'tags/voice-span text is byte-identical after parsing (got ' + JSON.stringify(parsed.cues[0].text) + ')');
+
+    const serialized = api.serializeVTT(parsed);
+    const reparsed = api.parseVTT(serialized);
+    assert(reparsed.cues[0].text === expectedText, 'tags/voice-span text survives a full VTT round-trip');
+
+    // SRT has no tag semantics of its own — the same text passes through as opaque content.
+    const srtOut = api.serializeSRT(parsed);
+    const srtParsed = api.parseSRT(srtOut);
+    assert(srtParsed.cues[0].text === expectedText, 'tags/voice-span text survives serialization to SRT and back');
+  });
+
+  await scenario('CO a multi-line WEBVTT header block (YouTube-style Kind:/Language: metadata) is dropped whole, not mis-parsed as a cue', async () => {
+    const withMetaHeader = `WEBVTT
+Kind: captions
+Language: en
+
+00:00:01.000 --> 00:00:02.000
+Real cue text
+`;
+    const parsed = api.parseVTT(withMetaHeader);
+    assert(parsed.skipped === 0, 'the multi-line header block is not counted as a skipped cue (got skipped=' + parsed.skipped + ')');
+    assert(parsed.cues.length === 1, 'exactly the one real cue parses (got ' + parsed.cues.length + ')');
+    assert(parsed.cues[0].text === 'Real cue text', 'cue text is untouched by the header metadata');
+    assert(parsed.prologue === '', 'the header itself is not captured as prologue (only NOTE/STYLE/REGION are)');
+  });
+
+  await scenario('CP whitespace-only separator lines (a stray space/tab on an otherwise-blank line) still split blocks in both SRT and VTT', async () => {
+    const srtWithBlankishSeparator = '1\n00:00:01,000 --> 00:00:02,000\nFirst\n \n2\n00:00:03,000 --> 00:00:04,000\nSecond\n';
+    const srtParsed = api.parseSRT(srtWithBlankishSeparator);
+    assert(srtParsed.skipped === 0, 'no cues skipped across the whitespace-only separator (got skipped=' + srtParsed.skipped + ')');
+    assert(srtParsed.cues.length === 2, 'both SRT cues parse despite the "\\n \\n" separator (got ' + srtParsed.cues.length + ')');
+    assert(srtParsed.cues[0].text === 'First' && srtParsed.cues[1].text === 'Second', 'cue text on each side of the blank-ish line is correct');
+
+    const vttWithBlankishSeparator = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nFirst\n\t\n00:00:03.000 --> 00:00:04.000\nSecond\n';
+    const vttParsed = api.parseVTT(vttWithBlankishSeparator);
+    assert(vttParsed.skipped === 0, 'no VTT cues skipped across a tab-only separator line (got skipped=' + vttParsed.skipped + ')');
+    assert(vttParsed.cues.length === 2, 'both VTT cues parse despite the "\\n\\t\\n" separator (got ' + vttParsed.cues.length + ')');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');
