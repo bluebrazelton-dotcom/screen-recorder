@@ -1359,6 +1359,72 @@ Testing section below are the master checklist for that pass.
 
 ---
 
+### v1.19 — Re-record from a timestamp (#21), session 1 of 3: truncation primitive + differential tests (2026-07-30)
+
+**Commit:** `#21 session 1: metadata cut primitive (computeCutPlan + choke-point enforcement) + DI-DL differential tests`
+
+First of #21's three sessions (design signed off 2026-07-30 — see REVIEW.md
+#21's Design block). No UI this session; pure plumbing + tests. Truncation
+is METADATA, not byte-surgery: stored chunks are never rewritten.
+
+**What was built:**
+
+1. **`setSessionCut(sessionId, cutAtByte, cutAtMs)` / `clearSessionCut(sessionId)`**
+   — marker helpers on the session record, same read-modify-put shape as
+   `completeSession`. The sessions store is schema-less per-record, so no
+   DB version bump. `clearSessionCut` is the future "Undo re-record": the
+   tail bytes were never touched, so undo is a full, lossless restore.
+2. **Cut enforcement in `forEachSessionChunk`** — one `sessions` get before
+   the walk; a valid `cutAtByte` truncates the walk at that absolute byte
+   offset (pass-through below it, a TRUNCATED ArrayBuffer COPY at the
+   straddling chunk, nothing at/after it). This is the single choke point
+   every consumer shares (scan pass, save sinks, stitch, recovery, the
+   session-2 preview), so they all inherit the cut identically. With no
+   marker the yielded data/index sequence is byte-identical to before.
+3. **`computeCutPlan(scans, T)`** — pure cut-point math (Rule A: the
+   cluster CONTAINING T is dropped; we never keep content past T), using
+   the stitcher's exact `maxClusterTs + 1000` seam formula so preview
+   timeline and cut byte can't drift. Returns `startOver` / `noop` /
+   `{ kind:'cut', segIndex, cutAtByte, keptMs }`, with `cutAtByte === 0`
+   meaning "discard that segment and everything after it whole" (the
+   seam-gap and first-cluster cases).
+
+**Judgment calls:**
+
+1. **The marker guard requires `typeof cutAtByte === 'number'`** —
+   review-caught defect in the draft: `isFinite(null)` is `true`, so a
+   corrupt null marker would have read as "cut at byte 0" and produced an
+   EMPTY save. A non-number marker must mean "no cut", never "cut all".
+   Pinned by DJ's null-marker assertions. (Orchestrator review pass: 1
+   defect caught this session.)
+2. **The no-marker path is behaviorally, not textually, identical** — one
+   extra short-lived readonly `sessions` get per `forEachSessionChunk`
+   call is unavoidable (there is no way to know a marker is absent without
+   reading the record). Verified against the full pre-existing baseline.
+3. **`cutAtByte === 0` never becomes a stored marker** — plan semantics
+   route whole-segment discards to the (session 2) discard flow instead;
+   the enforcement still handles a stored 0 sanely (yields nothing).
+
+**Tests:** four new scenarios — DI (`computeCutPlan` unit coverage: mid-
+cluster, exact-boundary, start-over, seam-gap, past-end, 2- and 3-segment
+chains, Chrome/Firefox/audio-only fixtures), DJ (choke-point enforcement
+across split strategies incl. a split exactly at the cut byte; undo
+round-trip; null-marker hardening), DK (end-to-end differential: cut saves
+through the REAL FSA + download sinks must byte-equal
+`makeSeekable(buffer.slice(0, cutAtByte))`), DL (stitched-chain
+differential: cut in last segment, cut segment standalone, and a
+boundary-cut segment as a NON-FINAL stitch segment — pinning that a
+boundary cut never triggers the scenario-AX bail). Harness: **119
+scenarios / 722 assertions** (was 115/649), zero regressions.
+
+**No changes to** the live recording pipeline, the v1.11/v1.13 streamed
+save flows' logic, `sessionChunkStats` (its byte overstatement for cut
+sessions is documented-accepted), or any UI. (Version note: "v1.19" was
+provisionally attached to the parked caption-authoring-polish item; that
+item is unversioned until built.)
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.
@@ -1407,12 +1473,12 @@ Testing section below are the master checklist for that pass.
 
 ```
 screen-recorder/
-├── index.html      # The entire app (HTML + CSS + JS, ~3700 lines)
+├── index.html      # The entire app (HTML + CSS + JS, ~5100 lines)
 ├── README.md       # Project description and usage
 ├── LICENSE         # MIT License
 ├── BUILD_LOG.md    # This file
 ├── REVIEW.md       # Fable 5 code review — tracked items + build queue
-└── test.cjs        # Node harness (67 scenarios / 392 assertions; npm i fake-indexeddb)
+└── test.cjs        # Node harness (119 scenarios / 722 assertions; npm i fake-indexeddb)
 ```
 
 ---

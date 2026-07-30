@@ -903,6 +903,18 @@ async function scenario(name, fn) {
   async function expectedBytes(buf) {
     return Buffer.from(await (await S.makeSeekable(new Blob([buf]))).arrayBuffer());
   }
+  // REVIEW #21 helpers — computeCutPlan's contract needs a DEFAULT-mode
+  // scanner `.result()` (whole-buffer push, matching a real single-shot pass
+  // over a fixture) and a way to derive a T that lands strictly inside a
+  // cluster's span (not on its boundary) from the fixture's own timestamps,
+  // never a hand-picked magic number.
+  function scanResult(buf) {
+    const scanner = S.createWebmStreamScanner();
+    scanner.push(buf);   // fixtures are already Buffers (Uint8Array subclass) — matches streamedPlanBytes' pattern
+    scanner.finish();
+    return scanner.result();
+  }
+  function midTs(a, b) { return a + Math.floor((b - a) / 2); }
   // Phase 0 oracle (STREAMING_STITCH_HANDOFF §5): the REAL concatenateWebM +
   // makeSeekable, run over N segment buffers. Uses ORIG.concatenateWebM so this
   // stays the buffered reference even in scenarios that override sandbox.concatenateWebM.
@@ -2978,6 +2990,318 @@ Real cue text
     await api.onCaptionImportInputChange({ target: importInput });
     assert(ec.cues.length === 0, 'Import captions does nothing with no video open');
     assert(documentMock.getElementById('captionStatus').textContent === 'Open your video first — captions are saved with it.', 'the same gentle message is shown for the import path');
+  });
+
+  // ============================================================
+  // REVIEW #21 "re-record from a timestamp", session 1 — truncation is
+  // METADATA (a cutAtByte marker), enforced inside forEachSessionChunk.
+  // computeCutPlan is the pure cut-point math; DI covers it in isolation.
+  // DJ pins the choke-point enforcement. DK/DL are the differential star:
+  // a cut session's real save output must byte-equal the buffered oracle
+  // applied to the truncated buffer, single-segment and stitched alike.
+  // ============================================================
+
+  // DI — computeCutPlan unit coverage (pure; no IndexedDB at all)
+  await scenario('DI computeCutPlan: single- and multi-segment edge coverage', async () => {
+    // ---- single-segment: Chrome-shaped and Firefox-shaped fixtures ----
+    for (const [fname, buf] of [['chrome', syntheticWebm()], ['firefox', syntheticFirefoxWebm()]]) {
+      const scan = scanResult(buf);
+      const c = scan.clusters;
+      assert(c.length === 3, fname + ': fixture precondition, 3 clusters (got ' + c.length + ')');
+
+      // T mid-cluster (cluster 1, non-final) drops it: cut at its start, keptMs = its start ts.
+      let T = midTs(c[1].timestamp, c[2].timestamp);
+      let plan = S.computeCutPlan([scan], T);
+      assert(plan.kind === 'cut' && plan.segIndex === 0 && plan.cutAtByte === c[1].start && plan.keptMs === c[1].timestamp,
+        fname + ': mid-cluster T drops cluster 1 (got ' + JSON.stringify(plan) + ')');
+
+      // T exactly at a cluster's start ts -> that cluster is dropped (cluster 2 here).
+      T = c[2].timestamp;
+      plan = S.computeCutPlan([scan], T);
+      assert(plan.kind === 'cut' && plan.segIndex === 0 && plan.cutAtByte === c[2].start && plan.keptMs === c[2].timestamp,
+        fname + ': T === cluster start drops that cluster (got ' + JSON.stringify(plan) + ')');
+
+      // T = 0 -> startOver (never a zero-cluster cut).
+      plan = S.computeCutPlan([scan], 0);
+      assert(plan.kind === 'startOver' && plan.keptMs === 0, fname + ': T=0 -> startOver (got ' + JSON.stringify(plan) + ')');
+
+      // T inside cluster 0 (before cluster 1 starts) -> also startOver.
+      T = midTs(c[0].timestamp, c[1].timestamp);
+      plan = S.computeCutPlan([scan], T);
+      assert(plan.kind === 'startOver' && plan.keptMs === 0, fname + ': T inside cluster 0 -> startOver (got ' + JSON.stringify(plan) + ')');
+
+      // T past the end (beyond lastClusterMaxBlockTime) -> noop.
+      T = scan.lastClusterMaxBlockTime + 1;
+      plan = S.computeCutPlan([scan], T);
+      assert(plan.kind === 'noop' && plan.keptMs === scan.lastClusterMaxBlockTime,
+        fname + ': T past end -> noop (got ' + JSON.stringify(plan) + ')');
+    }
+
+    // ---- single-segment: audio-only (no keyframes — irrelevant to Rule A,
+    // which only ever looks at cluster start/timestamp) ----
+    {
+      const scan = scanResult(syntheticAudioOnlyWebm());
+      const c = scan.clusters;
+      assert(c.length === 2, 'audioOnly: fixture precondition, 2 clusters (got ' + c.length + ')');
+      // Only 2 clusters, so the sole cut candidate mid-a-cluster case that
+      // doesn't collapse into startOver is mid the FINAL cluster (short of
+      // its real end) — still exercises the general drop-cluster-c path and
+      // proves the seam/past-end check does NOT fire when T stays inside it.
+      const T = midTs(c[1].timestamp, scan.lastClusterMaxBlockTime);
+      const plan = S.computeCutPlan([scan], T);
+      assert(plan.kind === 'cut' && plan.segIndex === 0 && plan.cutAtByte === c[1].start && plan.keptMs === c[1].timestamp,
+        'audioOnly: mid-final-cluster T drops it (got ' + JSON.stringify(plan) + ')');
+      const plan2 = S.computeCutPlan([scan], scan.lastClusterMaxBlockTime + 1);
+      assert(plan2.kind === 'noop', 'audioOnly: T past end -> noop (got ' + JSON.stringify(plan2) + ')');
+    }
+
+    // ---- multi-segment (2 segments), Chrome-shaped, using the real +1000 seam ----
+    {
+      const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+      const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+      const scans = [scan0, scan1];
+      const offset1 = scan0.maxClusterTs + 1000;
+
+      // T mid-cluster in segment 1 (non-final) -> cut with segIndex 1 and the
+      // seam-shifted cutAtByte/keptMs.
+      let T = offset1 + midTs(scan1.clusters[1].timestamp, scan1.clusters[2].timestamp);
+      let plan = S.computeCutPlan(scans, T);
+      assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === scan1.clusters[1].start && plan.keptMs === offset1 + scan1.clusters[1].timestamp,
+        '2-seg: mid-cluster in segment 1 (got ' + JSON.stringify(plan) + ')');
+
+      // T in the seam gap (between segment 0's real end and segment 1's
+      // first cluster) -> discard segment 1 whole; segment 0 kept as-is.
+      T = midTs(scan0.lastClusterMaxBlockTime, offset1);
+      plan = S.computeCutPlan(scans, T);
+      assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === 0 && plan.keptMs === scan0.lastClusterMaxBlockTime,
+        '2-seg: T in the seam gap -> {segIndex:1, cutAtByte:0} (got ' + JSON.stringify(plan) + ')');
+
+      // T inside segment 1's first cluster -> same outcome as the seam gap
+      // (segment 1 discarded whole), reached via the k===0 branch instead.
+      T = offset1 + midTs(scan1.clusters[0].timestamp, scan1.clusters[1].timestamp);
+      plan = S.computeCutPlan(scans, T);
+      assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === 0 && plan.keptMs === scan0.lastClusterMaxBlockTime,
+        '2-seg: T inside segment 1 first cluster -> {segIndex:1, cutAtByte:0} (got ' + JSON.stringify(plan) + ')');
+
+      // T past the end of the last segment -> noop.
+      T = offset1 + scan1.lastClusterMaxBlockTime + 1;
+      plan = S.computeCutPlan(scans, T);
+      assert(plan.kind === 'noop' && plan.keptMs === offset1 + scan1.lastClusterMaxBlockTime,
+        '2-seg: T past end of last segment -> noop (got ' + JSON.stringify(plan) + ')');
+    }
+
+    // ---- multi-segment (3 segments) — proves segIndex/offsets keep working
+    // with a trailing segment beyond the one being cut ----
+    {
+      const buf0 = syntheticWebm(), buf1 = syntheticWebm(), buf2 = syntheticWebm();
+      const scan0 = scanResult(buf0), scan1 = scanResult(buf1), scan2 = scanResult(buf2);
+      const scans = [scan0, scan1, scan2];
+      const offset1 = scan0.maxClusterTs + 1000;
+      const offset2 = offset1 + scan1.maxClusterTs + 1000;
+
+      // Cutting mid-segment-1 still reports segIndex 1 regardless of segment 2's
+      // presence (segment 2 is discarded whole per the cutAtByte>0 semantics,
+      // which computeCutPlan itself doesn't need to say anything more about).
+      let T = offset1 + midTs(scan1.clusters[1].timestamp, scan1.clusters[2].timestamp);
+      let plan = S.computeCutPlan(scans, T);
+      assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === scan1.clusters[1].start,
+        '3-seg: mid-cluster in segment 1 unaffected by trailing segment 2 (got ' + JSON.stringify(plan) + ')');
+
+      // Mid-cluster in segment 2 -> both seam offsets (+1000 twice) must land right.
+      T = offset2 + midTs(scan2.clusters[1].timestamp, scan2.clusters[2].timestamp);
+      plan = S.computeCutPlan(scans, T);
+      assert(plan.kind === 'cut' && plan.segIndex === 2 && plan.cutAtByte === scan2.clusters[1].start && plan.keptMs === offset2 + scan2.clusters[1].timestamp,
+        '3-seg: mid-cluster in segment 2, double seam offset (got ' + JSON.stringify(plan) + ')');
+
+      // T past the end of the LAST (3rd) segment -> noop.
+      T = offset2 + scan2.lastClusterMaxBlockTime + 1;
+      plan = S.computeCutPlan(scans, T);
+      assert(plan.kind === 'noop' && plan.keptMs === offset2 + scan2.lastClusterMaxBlockTime,
+        '3-seg: T past end of segment 2 -> noop (got ' + JSON.stringify(plan) + ')');
+    }
+
+    // ---- defensive: empty scans array -> startOver, never a crash ----
+    {
+      const plan = S.computeCutPlan([], 1000);
+      assert(plan.kind === 'startOver' && plan.keptMs === 0, 'empty scans array -> startOver (got ' + JSON.stringify(plan) + ')');
+    }
+  });
+
+  // DJ — forEachSessionChunk cut enforcement at the choke point itself
+  await scenario('DJ forEachSessionChunk enforces cutAtByte: pass-through below, truncated-copy at the straddle, nothing after', async () => {
+    async function walk(sessionId) {
+      const parts = [];
+      await S.forEachSessionChunk(sessionId, (data) => { parts.push(Buffer.from(data)); });
+      return Buffer.concat(parts);
+    }
+    function chunkOffsets(parts) {
+      const offs = [0];
+      for (const p of parts) offs.push(offs[offs.length - 1] + p.length);
+      return offs;
+    }
+
+    const buf = syntheticWebm();
+    const total = buf.length;
+    const cids = clusterIdOffsets(buf);
+    const strategies = [
+      ['thirds', splitAt(buf, [Math.floor(total / 3), Math.floor(2 * total / 3)])],
+      ['everyByte', splitEveryByte(buf)],                    // small fixture — every chunk is 1 byte
+      ['splitAtCutByte', splitAt(buf, [cids[1]])],            // a split placed EXACTLY at a candidate cut byte
+    ];
+
+    for (const [sname, parts] of strategies) {
+      const offs = chunkOffsets(parts);
+
+      // No marker at all -> byte-identical to the full buffer (the untouched path).
+      let id = await seedBuffers(parts);
+      let got = await walk(id);
+      assert(Buffer.compare(got, buf) === 0, sname + ': no marker => byte-identical to the full buffer');
+
+      const midChunkIdx = parts.findIndex(p => p.length > 1);
+      const cutValues = [['zero', 0]];
+      if (midChunkIdx >= 0) cutValues.push(['midChunk', offs[midChunkIdx] + Math.floor(parts[midChunkIdx].length / 2)]);
+      cutValues.push(['chunkBoundary', offs[1]], ['exactTotal', total], ['pastTotal', total + 500]);
+
+      for (const [cname, cutAtByte] of cutValues) {
+        id = await seedBuffers(parts);
+        await S.setSessionCut(id, cutAtByte, 0);
+        got = await walk(id);
+        const effLimit = Math.min(cutAtByte, total);
+        const want = buf.slice(0, effLimit);
+        assert(Buffer.compare(got, want) === 0,
+          sname + '/' + cname + ': cutAtByte=' + cutAtByte + ' => buffer.slice(0,' + effLimit + ') (got ' + got.length + ' vs want ' + want.length + ' bytes)');
+      }
+
+      // Undo: setSessionCut -> clearSessionCut -> a full walk returns the full buffer again.
+      id = await seedBuffers(parts);
+      await S.setSessionCut(id, Math.floor(total / 2), 0);
+      await S.clearSessionCut(id);
+      got = await walk(id);
+      assert(Buffer.compare(got, buf) === 0, sname + ': clearSessionCut undoes the marker (full buffer restored)');
+
+      // Corrupt-marker hardening: a null cutAtByte must mean "no cut", never
+      // "cut everything" (isFinite(null) is true — the typeof guard catches it).
+      id = await seedBuffers(parts);
+      await S.setSessionCut(id, null, null);
+      got = await walk(id);
+      assert(Buffer.compare(got, buf) === 0, sname + ': null marker is ignored (full buffer, not an empty save)');
+    }
+  });
+
+  // DK — end-to-end single-segment differential: the load-bearing assertion.
+  // A cut session saved through the REAL sinks (FSA + download) must
+  // byte-equal makeSeekable(buffer.slice(0, cutAtByte)) — the same oracle
+  // shape as scenario U, just applied to the truncated buffer.
+  await scenario('DK end-to-end single-segment cut differential (FSA + download vs oracle)', async () => {
+    const fixtures = [
+      ['chrome', syntheticWebm()],
+      ['firefox', syntheticFirefoxWebm()],
+      ['audioOnly', syntheticAudioOnlyWebm()],
+    ];
+    for (const [fname, buf] of fixtures) {
+      const cids = clusterIdOffsets(buf);
+      const splitStrategies = [
+        ['thirds', splitAt(buf, [Math.floor(buf.length / 3), Math.floor(2 * buf.length / 3)])],
+        ['midClusterId', splitAt(buf, cids.map(o => o + 2))],
+      ];
+      if (buf.length < 1000) splitStrategies.push(['everyByte', splitEveryByte(buf)]);
+
+      const scan = scanResult(buf);
+      const c = scan.clusters;
+      // Prefer a non-final cluster (proves the ordinary mid-chain drop); the
+      // audio-only fixture only has 2 clusters, so its only option short of
+      // startOver is dropping the final one — still a genuine Rule-A cut.
+      const cutIdx = c.length >= 3 ? 1 : c.length - 1;
+      const nextTs = cutIdx + 1 < c.length ? c[cutIdx + 1].timestamp : scan.lastClusterMaxBlockTime;
+      const T = midTs(c[cutIdx].timestamp, nextTs);   // lands mid-cluster, not on its boundary
+      const plan = S.computeCutPlan([scan], T);
+      assert(plan.kind === 'cut' && plan.segIndex === 0 && plan.cutAtByte === c[cutIdx].start,
+        fname + ': precondition, plan cuts within this segment (got ' + JSON.stringify(plan) + ')');
+
+      const want = await expectedBytes(buf.slice(0, plan.cutAtByte));
+
+      for (const [sname, parts] of splitStrategies) {
+        const idA = await seedBuffers(parts);
+        await S.setSessionCut(idA, plan.cutAtByte, plan.keptMs);
+        const fsa = await runStreamedFSA(idA);
+        assert(fsa.r === 'saved' && Buffer.compare(fsa.bytes, want) === 0,
+          fname + '/' + sname + ': FSA cut save === oracle (' + fsa.bytes.length + ' vs ' + want.length + ' bytes)');
+
+        const idB = await seedBuffers(parts);
+        await S.setSessionCut(idB, plan.cutAtByte, plan.keptMs);
+        const dl = await runStreamedDownload(idB);
+        assert(dl.r === 'downloaded' && Buffer.compare(dl.bytes, want) === 0,
+          fname + '/' + sname + ': download cut save === oracle (' + dl.bytes.length + ' vs ' + want.length + ' bytes)');
+      }
+    }
+  });
+
+  // DL — stitched-chain differential with cuts (2-segment chains)
+  await scenario('DL stitched-chain differential: cut in the last segment, cut in the first segment, and a boundary cut as a non-final stitch segment', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const thirds = (b) => splitAt(b, [Math.floor(b.length / 3), Math.floor(2 * b.length / 3)]);
+
+    // (a) cut in the LAST segment of the chain.
+    {
+      const offset1 = scan0.maxClusterTs + 1000;
+      const T = offset1 + midTs(scan1.clusters[1].timestamp, scan1.clusters[2].timestamp);
+      const plan = S.computeCutPlan([scan0, scan1], T);
+      assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte === scan1.clusters[1].start,
+        'DLa precondition: plan cuts segment 1 (got ' + JSON.stringify(plan) + ')');
+
+      const want = await stitchOracle([buf0, buf1.slice(0, plan.cutAtByte)]);
+
+      const idFsa0 = await seedBuffers(thirds(buf0)), idFsa1 = await seedBuffers(thirds(buf1));
+      await S.setSessionCut(idFsa1, plan.cutAtByte, plan.keptMs);
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      const rFsa = await S.saveSessionsStreamedStitch(
+        [{ sessionId: idFsa0, mimeType: 'video/webm' }, { sessionId: idFsa1, mimeType: 'video/webm' }], 'x.webm');
+      assert(rFsa === 'saved' && Buffer.compare(Buffer.from(await lastWritten.pop().arrayBuffer()), want) === 0,
+        'DLa: FSA stitched-cut save === stitchOracle([buf0, buf1.slice(0,cut)])');
+
+      const idDl0 = await seedBuffers(thirds(buf0)), idDl1 = await seedBuffers(thirds(buf1));
+      await S.setSessionCut(idDl1, plan.cutAtByte, plan.keptMs);
+      delete windowMock.showSaveFilePicker;
+      const rDl = await S.saveSessionsStreamedStitch(
+        [{ sessionId: idDl0, mimeType: 'video/webm' }, { sessionId: idDl1, mimeType: 'video/webm' }], 'x.webm');
+      assert(rDl === 'downloaded' && Buffer.compare(Buffer.from(await objectUrlBlobs[objectUrlBlobs.length - 1].arrayBuffer()), want) === 0,
+        'DLa: download stitched-cut save === stitchOracle([buf0, buf1.slice(0,cut)])');
+    }
+
+    // (b) cut in the FIRST segment: per the design's consumer semantics a
+    // segIndex:0 cut discards every LATER segment whole, so the surviving
+    // recording is just the cut segment 0 — saved standalone, not stitched.
+    // Emulated per the session brief: only segment 0 is actually saved.
+    let planB;
+    {
+      const T = midTs(scan0.clusters[1].timestamp, scan0.clusters[2].timestamp);
+      planB = S.computeCutPlan([scan0, scan1], T);
+      assert(planB.kind === 'cut' && planB.segIndex === 0 && planB.cutAtByte === scan0.clusters[1].start,
+        'DLb precondition: plan cuts segment 0 (got ' + JSON.stringify(planB) + ')');
+
+      const want = await expectedBytes(buf0.slice(0, planB.cutAtByte));
+      const id0 = await seedBuffers(thirds(buf0));
+      await S.setSessionCut(id0, planB.cutAtByte, planB.keptMs);
+      const fsa = await runStreamedFSA(id0);
+      assert(fsa.r === 'saved' && Buffer.compare(fsa.bytes, want) === 0,
+        'DLb: standalone cut save of segment 0 === expectedBytes(buf0.slice(0,cut))');
+    }
+
+    // (c) the SAME segment-0 boundary cut, now as the non-final segment of a
+    // real stitch (segment 1 whole) — pins that a boundary cut leaves a
+    // COMPLETE final cluster in segment 0, so the streamed stitch's pass 1
+    // never hits the scenario-AX incomplete-known-size-cluster bail.
+    {
+      const want = await stitchOracle([buf0.slice(0, planB.cutAtByte), buf1]);
+      const id0 = await seedBuffers(thirds(buf0)), id1 = await seedBuffers(thirds(buf1));
+      await S.setSessionCut(id0, planB.cutAtByte, planB.keptMs);
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      const r = await S.saveSessionsStreamedStitch(
+        [{ sessionId: id0, mimeType: 'video/webm' }, { sessionId: id1, mimeType: 'video/webm' }], 'x.webm');
+      assert(r === 'saved' && Buffer.compare(Buffer.from(await lastWritten.pop().arrayBuffer()), want) === 0,
+        'DLc: boundary-cut segment 0 as a NON-FINAL stitch segment === stitchOracle([buf0.slice(0,cut), buf1]) — no scenario-AX bail');
+    }
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

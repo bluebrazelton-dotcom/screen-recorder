@@ -849,6 +849,52 @@ async function completeSession(sessionId) {
   });
 }
 
+// REVIEW #21 ("re-record from a timestamp"): truncation is metadata, not
+// byte-surgery. `cutAtByte`/`cutAtMs` on the session record mark where
+// forEachSessionChunk should stop yielding bytes — stored chunks are never
+// rewritten. Same read-modify-put shape as completeSession; the sessions
+// store is schema-less per-record, so no DB version bump is needed.
+async function setSessionCut(sessionId, cutAtByte, cutAtMs) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('sessions', 'readwrite');
+    const store = tx.objectStore('sessions');
+    const req = store.get(sessionId);
+    req.onsuccess = () => {
+      const session = req.result;
+      if (session) {
+        session.cutAtByte = cutAtByte;
+        session.cutAtMs = cutAtMs;
+        store.put(session);
+      }
+    };
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+// Undo a cut (the "Undo re-record" affordance): drop the marker fields so
+// forEachSessionChunk's no-marker path takes over again. The tail bytes were
+// never touched, so this is a full, lossless restore.
+async function clearSessionCut(sessionId) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('sessions', 'readwrite');
+    const store = tx.objectStore('sessions');
+    const req = store.get(sessionId);
+    req.onsuccess = () => {
+      const session = req.result;
+      if (session) {
+        delete session.cutAtByte;
+        delete session.cutAtMs;
+        store.put(session);
+      }
+    };
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
 async function getIncompleteSession() {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -893,11 +939,40 @@ async function sessionChunkStats(sessionId) {
 // auto-commit whenever the event loop turns on external work (like an FSA
 // write), so a cursor can't survive pass 2 — per-chunk pulls keyed after the
 // last index can. Tolerates index gaps (streams what's there).
+//
+// REVIEW #21 cut enforcement: one `sessions` get before the walk starts. A
+// finite, non-negative `cutAtByte` on the session record truncates the walk
+// at that absolute byte offset into the concatenated chunk stream — chunks
+// entirely below it pass through UNCHANGED, the chunk straddling it is
+// handed to `fn` as a TRUNCATED ArrayBuffer COPY (never mutates the stored
+// chunk), and nothing at/after it is yielded. This is the single choke point
+// every consumer (scan pass, save sinks, stitch, recovery, future preview)
+// shares, so they all inherit the cut identically. No marker (the
+// overwhelmingly common case) leaves `limit` at Infinity, so both
+// comparisons below are always false and `data` is always the original
+// record — the ORIGINAL behavior, unreached and untouched.
 async function forEachSessionChunk(sessionId, fn) {
   const db = await openDB();
   try {
+    let limit = Infinity;
+    const session = await new Promise((resolve, reject) => {
+      const tx = db.transaction('sessions', 'readonly');
+      const req = tx.objectStore('sessions').get(sessionId);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    // typeof guard is load-bearing: isFinite(null) is true, so a corrupt
+    // null/string marker would otherwise read as cutAtByte 0 — an EMPTY save.
+    // A marker that isn't a real number must mean "no cut", never "cut all".
+    if (session && typeof session.cutAtByte === 'number' &&
+        isFinite(session.cutAtByte) && session.cutAtByte >= 0) {
+      limit = session.cutAtByte;
+    }
+
     let lastIndex = -1;
+    let chunkStart = 0;
     for (;;) {
+      if (chunkStart >= limit) return;   // at/past the cut — stop (covers cutAtByte === 0 too)
       const rec = await new Promise((resolve, reject) => {
         const tx = db.transaction('chunks', 'readonly');
         const range = IDBKeyRange.bound([sessionId, lastIndex], [sessionId, Infinity], true, false);
@@ -913,7 +988,10 @@ async function forEachSessionChunk(sessionId, fn) {
       });
       if (!rec) return;
       lastIndex = rec.index;
-      await fn(rec.data, rec.index);
+      const chunkEnd = chunkStart + rec.data.byteLength;
+      const data = chunkEnd > limit ? rec.data.slice(0, limit - chunkStart) : rec.data;
+      await fn(data, rec.index);
+      chunkStart = chunkEnd;
     }
   } finally {
     db.close();
@@ -2920,6 +2998,89 @@ function buildStreamIndexParts(scan) {
     ranges: scan.clusters.map(c => ({ start: c.start, end: c.end })),
     cues,
   };
+}
+
+// Cut-point math for "re-record from a timestamp" (REVIEW #21, session 1).
+// Pure function — no IndexedDB, no side effects; the caller is responsible
+// for turning the result into a `setSessionCut` call (and marking later
+// segments discarded). `scans` is one DEFAULT-mode createWebmStreamScanner()
+// `.result()` per segment, in playback order — NOT the clustersOnly-mode
+// shape segments 2..N normally get for stitching (buildStitchPlanParts'
+// segScans[i>0].scan); cut planning always needs every segment's own
+// verbatim { start, end, timestamp } clusters, so callers must run each
+// segment through the default-mode scanner for this, even segments that
+// would otherwise be scanned clustersOnly.
+//
+// `T` is a target time in ms on the STITCHED/global timeline. Seam offsets
+// use the exact formula scanSegmentsForStitch (3008) / concatenateWebM
+// (2255-2257) use: offset_0 = 0; offset_i = offset_{i-1} + scans[i-1].maxClusterTs
+// + 1000. Any other formula would let the preview timeline and the cut byte
+// drift apart.
+//
+// Rule A: the cluster CONTAINING T is dropped — we never keep content past T.
+// Returns one of:
+//   { kind: 'startOver', keptMs: 0 }
+//     T is before every cluster in the chain (or there are none at all).
+//     Nothing survives; offer start-over, never a zero-cluster cut.
+//   { kind: 'noop', keptMs }
+//     T is at/past the real end of the last segment. Nothing changes.
+//   { kind: 'cut', segIndex, cutAtByte, keptMs }
+//     cutAtByte > 0: setSessionCut(cutAtByte) on segments[segIndex]'s session;
+//       segments[segIndex+1..] are discarded whole. Earlier segments untouched.
+//     cutAtByte === 0: segments[segIndex..] are discarded whole (segIndex
+//       itself included). Segments before segIndex are untouched.
+// `keptMs` is the resulting duration on the global timeline (UI/undo
+// bookkeeping only — not consumed by cut enforcement itself).
+//
+// Defensive: an empty `scans` array, or scans[0] with zero clusters, can
+// legitimately happen (a bailed/corrupt first segment) and fall out of the
+// same "no candidate cluster found" path as normal -> startOver. A
+// zero-cluster NON-first scan shouldn't occur in practice (scanSegmentsForStitch
+// itself bails the whole chain on any zero-cluster segment); if it did, this
+// function degrades sanely — that segment just contributes no cut candidates
+// and its true duration is invisible to the +1000 seam math (same blind spot
+// concatenateWebM/scanSegmentsForStitch already have), rather than throwing.
+function computeCutPlan(scans, T) {
+  if (!scans || scans.length === 0) return { kind: 'startOver', keptMs: 0 };
+
+  // Flatten to global order: segments are already in playback order and each
+  // segment's own clusters are timestamp-ordered, so appending segment by
+  // segment preserves global order (offsets only grow between segments).
+  const offsets = new Array(scans.length);
+  offsets[0] = 0;
+  for (let i = 1; i < scans.length; i++) {
+    offsets[i] = offsets[i - 1] + scans[i - 1].maxClusterTs + 1000;
+  }
+
+  let found = null;   // { i, k } of the LAST cluster with g <= T
+  for (let i = 0; i < scans.length; i++) {
+    const cl = scans[i].clusters;
+    for (let k = 0; k < cl.length; k++) {
+      const g = offsets[i] + cl[k].timestamp;
+      if (g <= T) found = { i, k };
+      else break;   // this segment's later clusters only grow from here
+    }
+  }
+  if (!found) return { kind: 'startOver', keptMs: 0 };
+  const { i, k } = found;
+  const cl = scans[i].clusters;
+
+  // SEAM-GAP / PAST-END: c is the final cluster of its segment AND T reaches
+  // past that segment's real content (either the seam gap before the next
+  // segment's first cluster, or genuinely past the whole chain's end).
+  if (k === cl.length - 1 && T > offsets[i] + scans[i].lastClusterMaxBlockTime) {
+    const keptMs = offsets[i] + scans[i].lastClusterMaxBlockTime;
+    if (i + 1 < scans.length) return { kind: 'cut', segIndex: i + 1, cutAtByte: 0, keptMs };
+    return { kind: 'noop', keptMs };
+  }
+
+  // Otherwise drop cluster c and everything after it.
+  if (k === 0) {
+    if (i === 0) return { kind: 'startOver', keptMs: 0 };
+    const keptMs = offsets[i - 1] + scans[i - 1].lastClusterMaxBlockTime;
+    return { kind: 'cut', segIndex: i, cutAtByte: 0, keptMs };
+  }
+  return { kind: 'cut', segIndex: i, cutAtByte: cl[k].start, keptMs: offsets[i] + cl[k].timestamp };
 }
 
 // Merged multi-segment stitch plan. segScans[0] is a DEFAULT-mode scan result

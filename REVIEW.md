@@ -353,6 +353,58 @@ synthetic WebM; (2) review-player + "Re-record from here" flow; (3)
 integration + acceptance. The LIVE recording pipeline stays untouched —
 truncation operates on stored chunks while the recorder is stopped.
 
+**Design (signed off 2026-07-30) — truncation is metadata, not byte-surgery.**
+Recon showed the pass-2 save sinks already slice chunks mid-ArrayBuffer at
+plan-range boundaries, and every chunk consumer flows through
+`forEachSessionChunk`. So the cut is a `cutAtByte` marker on the session
+record (the sessions store is schema-less per-record; no DB upgrade),
+enforced inside `forEachSessionChunk` — scan pass, save sinks, stitch,
+recovery, and preview all inherit the cut at that single choke point, and
+stored chunks are never rewritten. Soft-delete falls out of the design: the
+tail bytes are untouched until the session is deleted at final save, and
+undo = delete the marker. Later segments dropped by a cut get
+`discarded: true` (whole-session soft-delete, cleaned up at the same
+trigger points as their siblings). Cut-point math is a pure function
+`computeCutPlan(segmentScans, T) -> { segIndex, cutAtByte, keptMs }` using
+the stitcher's `maxClusterTs + 1000` seam formula, so the preview timeline
+and the cut byte derive from the same math and cannot drift.
+
+**UI (signed off):** a new "Stop & review" button beside "Stop & save"
+(the existing save path stays untouched); a dedicated slim review pane
+built on the v1.18 mode-switch pattern with its own `<video>` (NOT
+`#captionVideo` — the caption editor's player is File-only and entangled
+with captionEditorState); preview assembly = chunks -> Blob
+(`concatenateWebM` if multi-segment) -> `makeSeekable`, with a size-guard
+message for very long recordings; buttons: Re-record from here (T) /
+Save as is / Discard recording / Back to recorder. After a cut, the app
+returns to the existing Continue-Recording armed state with an "Undo
+re-record" affordance shown until the next recording starts (tail bytes
+still survive to final save; no restore UI after recording resumes).
+
+**Edges:** T before the first cluster -> offer start-over, never a
+zero-cluster cut; T at/past the end -> no-op with a message; a boundary
+cut in a non-final chain segment leaves a COMPLETE final cluster (the
+scenario-AX bail concerns incomplete known-size clusters and is not
+triggered); recovery-banner byte stats may overstate for cut sessions
+(markers not read by sessionChunkStats — cosmetic, accepted).
+
+**Tests (session 1 is mostly this):** differential — saving a cut session
+must byte-equal the buffered oracle (`slice(0, cutAtByte)` ->
+`makeSeekable`; cut chains vs `concatenateWebM` of sliced buffers) across
+all synthetic fixtures (Chrome-shaped, Firefox 8-byte markers, audio-only)
+× the existing chunk-split strategies, plus `computeCutPlan` unit coverage
+of every edge above. Session split unchanged: (1) cut plan + choke-point
+enforcement + differential tests; (2) review pane + flow; (3) integration
++ acceptance, Firefox first.
+
+**Session 1 SHIPPED (2026-07-30, v1.19):** `computeCutPlan` + choke-point
+enforcement in `forEachSessionChunk` + `setSessionCut`/`clearSessionCut` +
+differential scenarios DI–DL landed; harness at 119 scenarios / 722
+assertions. Orchestrator review caught 1 draft defect (an `isFinite(null)`
+marker guard that would have turned a corrupt null marker into an empty
+save — now typeof-guarded and test-pinned). Remaining: session 2 (review
+pane + "Re-record from here" flow), session 3 (integration + acceptance).
+
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature
 end-to-end, not just the newest version's additions. The master checklist is
