@@ -1145,6 +1145,212 @@ lines from `textLines` before the empty-text-cue skip check, in both parsers.
 **No UI, no DOM, no IndexedDB, no state object changes, no recording-pipeline
 changes.** The editor surface (open a .vtt/.srt file, edit cues, export) is v1.18.
 
+### v1.18 — Caption editor surface: open-a-file editing UI over the v1.17 caption logic (2026-07-29)
+
+**Commit:** `caption editor UI: open a .webm, edit cues against playback, export a .vtt/.srt sidecar`
+
+Builds the editor UI (the open-a-file editor model) on top of v1.17's pure
+`parseVTT`/`parseSRT`/`serializeVTT`/`serializeSRT`/`parseCaptionTimestamp`/
+`formatCaptionTimestamp`/`parseCueTimingLine`/`detectCaptionFormat` — none of
+that section was reimplemented or modified. Deliberately deferred to v1.19
+(not built here): keyboard shortcuts, split/merge cues, chapter markers.
+
+**What was built:**
+
+1. **Mode switching.** A new "Caption editor" button in the recorder controls
+   (`#btnCaptionEditor`, neutral-styled like Stop/Discard) calls
+   `openCaptionEditor()`, which is refused with faculty-toned copy
+   ("Finish or stop the current recording before opening the caption editor.")
+   while `state.recording` is true — the button itself is NOT visually
+   disabled during recording (see Judgment calls below). Otherwise it hides
+   the recorder's preview/status/controls (plain `style.display` toggles, the
+   same convention `resetUI()` already uses for individual buttons) and shows
+   `#captionEditor` via the existing banner convention (base `display:none` +
+   `.visible`). "Back to recorder" reverses both. Neither direction touches
+   `state`, held streams, or the recovery/download-confirm banners.
+2. **Module-level `captionEditorState`** (precedent: `pipState`, NOT new
+   fields on `state`): `cues`, `prologue`, `videoInfo` (`{name, size,
+   lastModified, objectUrl}`), `fileKey`, `dirty`, `activeCueIndex`,
+   `pendingDraft`, `pendingImport`.
+3. **Opening files.** "Open video" (hidden `<input accept=".webm">` + styled
+   button) and drag-and-drop onto the editor pane both route through
+   `handleCaptionVideoFile(file)`: revokes the previous object URL, creates a
+   new one into the app's first real `<video controls preload="metadata">`
+   element (the existing `screenVideo`/`cameraVideo` are live-stream sinks
+   only — untouched), computes `fileKey`, and checks IndexedDB for a
+   matching draft. "Import captions" (hidden `<input accept=".vtt,.srt">`)
+   reads the file's text and routes it through `detectCaptionFormat` +
+   `parseVTT`/`parseSRT` via `captionParseCaptionText`.
+4. **Cue list editing.** Cue rows (start/end time text inputs, a multi-line
+   textarea, a delete button) are rendered by `renderCueList()`, which
+   contains no editing logic itself — every mutation goes through small
+   testable functions that update `captionEditorState` and return
+   success/failure: `captionAddCue(currentTime)` (2s default duration,
+   placeholder text, keeps `cues` sorted by start), `captionDeleteCue(index)`,
+   `captionUpdateCueTime(index, which, str)` (parses via
+   `parseCaptionTimestamp`; an unparseable string is rejected without
+   mutating the cue — the caller reverts the input and shows the returned
+   plain-language message; a valid edit re-sorts and returns the cue's new
+   index so the caller keeps it selected), `captionUpdateCueText(index,
+   text)`. Row click seeks to `cue.start + 0.001` (the same landing-inside-
+   the-cue epsilon trick used elsewhere in caption tooling) without
+   autoplaying. `timeupdate` highlights the active cue and only re-renders
+   (and thus only scrolls) when the active cue actually changes.
+5. **Live caption preview.** `captionPreviewVTT()` is a pure function —
+   `serializeVTT({ cues, prologue })` — asserted directly in tests. A single
+   `<track kind="captions" default>` child of the video is kept in sync by
+   `scheduleCaptionPreviewUpdate()` (debounced ~300ms), which serializes,
+   builds a `Blob('text/vtt')` URL, swaps `track.src`, revokes the old URL,
+   and sets `track.mode = 'showing'`.
+6. **Draft persistence.** `DB_VERSION` bumped to 2; `openDB()`'s
+   `onupgradeneeded` now also creates a `'captions'` object store
+   (`keyPath: 'fileKey'`), guarded by `objectStoreNames.contains` exactly
+   like the existing `sessions`/`chunks` guards, so the upgrade runs cleanly
+   on top of an existing v1 database — `sessions`/`chunks` and `deleteSession`
+   are otherwise untouched. `saveCaptionDraft()`/`loadCaptionDraft(fileKey)`/
+   `deleteCaptionDraft(fileKey)` are the async primitives; edits schedule
+   `scheduleCaptionAutosave()` (debounced ~1s). Opening a video whose
+   `fileKey` has a stored draft shows an in-app banner (house
+   `.recovery-banner` style, reused as-is) — "Continue editing them" /
+   "Start fresh" — never a blocking `confirm()`. Importing over a non-empty
+   cue list shows the same style of in-editor confirmation before replacing.
+7. **Export.** "Save captions (.vtt)" (primary) + a secondary ".srt" button
+   call `captionExport(format)`, which serializes via `serializeVTT`/
+   `serializeSRT` and saves through the SAME fork `saveFile()` uses:
+   `showSaveFilePicker` (with `suggestedName` and proper
+   `{description, accept}` types) when available, else `startDownload(blob,
+   name)` reused as-is. `suggestedName` is `captionExportFilename(videoName,
+   ext)` — the opened video's filename with its extension replaced
+   (`lecture.webm` → `lecture.vtt`/`lecture.srt`). Picker cancel
+   (`AbortError`) is not an error: a quiet status note, draft untouched.
+   A successful FSA save clears `dirty` and says so; the download fallback
+   uses the existing honest "Downloaded — check your Downloads folder"
+   copy from `startDownload()` and does NOT clear `dirty` (unverified).
+   **Export never deletes the IndexedDB draft, on either path** — cheap
+   insurance in case the exported file is lost or the user wants to keep
+   editing.
+
+**Deliberate decisions worth flagging:**
+
+- **No `beforeunload` changes.** The IndexedDB draft is the safety net for
+  the caption editor, same philosophy as the recording pipeline's crash
+  recovery — a debounced autosave, not a page-leave warning.
+- **Export keeps the draft.** Exporting a file and discarding the working
+  draft are two different acts of trust; only "Start fresh" (an explicit,
+  named action) deletes a draft.
+
+**Verification:** harness now 108 scenarios / 618 assertions (new CQ–CZ), all
+566 pre-existing assertions unchanged. Covers: the v1→v2 DB upgrade adding
+`'captions'` while a seeded v1-era `sessions`/`chunks` database survives
+untouched (CQ); add/delete/text-edit cue logic including sorted insertion and
+an out-of-range delete being rejected without mutating the list (CR);
+time-edit re-sort keeping the edited cue's new index findable, and an
+unparseable time being rejected without mutating the cue (CS);
+`saveCaptionDraft`/`loadCaptionDraft` round-tripping a full record including a
+miss resolving `null` (CT); `deleteCaptionDraft` (the "Start fresh" action)
+actually removing a stored draft (CU); a partial import (`skipped>0`)
+producing the plain-language "N couldn't be read and were left out" message,
+with no caveat sentence when nothing was skipped (CV); export filename
+extension replacement, including a no-extension fallback (CW); a cancelled
+export picker returning `'cancelled'`, never touching `showError`, posting a
+quiet status note, and leaving the stored draft intact (CX); the recording
+guard refusing editor entry with a plain-language, non-technical message and
+leaving the editor pane hidden (CY); and `captionPreviewVTT()` asserted
+byte-for-byte equal to `serializeVTT({cues, prologue})` (CZ). Cue-mutating UI
+wrapper functions (`onAddCaptionClick`, the per-row `onchange`/`onclick`
+handlers, `captionApplyImport`, `captionContinueDraftUI`) are exercised only
+indirectly — tests call the pure/async primitives underneath them directly,
+which also sidesteps scheduling any real `setTimeout` during the run (see
+Judgment calls).
+
+**Orchestrator review caught eight defects in the first draft** (headliners
+first): `onCaptionVideoTimeUpdate()` was calling the full `renderCueList()`
+on every playhead tick — since textareas only commit on blur, a user typing
+a caption while the video played lost their uncommitted text AND input focus
+every time the active cue changed, destroying the app's core
+transcribe-while-playing workflow; `captionUpdateCueTime` had no end>start
+validation, so it accepted an edit that leaves a cue with `end <= start` —
+`serializeVTT` would then emit a cue that `parseVTT` itself skips on
+reimport and that `<track>` silently ignores; and `updateCaptionPreviewTrackNow`
+set `track.mode` on the `<track>` element itself, which is a meaningless
+no-op — the real on/off switch lives on `track.track` (the `TextTrack`
+object), so captions were never actually guaranteed to render regardless of
+what the code believed it had done. Five more, all fixed and test-locked
+except where noted: the Firefox/download export path gave zero
+caption-specific feedback (reused `startDownload`'s generic recording-save
+copy only); opening a video with a saved draft skipped
+`renderCueList()`/`scheduleCaptionPreviewUpdate()` on the draft-found branch,
+leaving a PREVIOUS video's stale rows visible behind the restore banner;
+neither file input reset its `.value` after a pick, so re-selecting the same
+file (e.g. reimporting after Start Fresh) silently did nothing; "Back to
+recorder" left the video playing (with audio) behind the hidden pane; and
+adding a cue or importing captions before any video was open created
+orphaned cues with no `fileKey` to autosave under, silently destined to be
+wiped by the next video open. All eight are fixed below; new coverage is
+DA–DH (DC intentionally skipped — the `TextTrack.mode` fix has no harness
+observable, per its own code comment; it's a manual acceptance-pass item).
+Harness now **115 scenarios / 649 assertions**, all 618 prior assertions
+unchanged.
+
+**Judgment calls / deviations, flagged explicitly:**
+
+1. **"Disabled/refused" implemented as refused-only, not visually disabled.**
+   The spec's ground rules explicitly forbid touching the recording
+   pipeline; `startRecording()`/`stopRecording()` are where a `disabled`
+   toggle for `#btnCaptionEditor` would naturally be wired (alongside the
+   existing `btnSelectScreen`/`btnRecord` disables). Editing those functions
+   — even by one line — was judged higher-risk than the visual-polish
+   benefit, given they're explicitly protected. `openCaptionEditor()` refuses
+   with a clear message instead; the button stays clickable but inert during
+   recording. Flagging for a follow-up if Blue wants the visual disable too.
+2. **Debounced autosave/preview scheduling is only wired into the UI-facing
+   wrapper functions, not the pure logic functions.** `captionAddCue`,
+   `captionDeleteCue`, `captionUpdateCueTime`, and `captionUpdateCueText`
+   never schedule timers themselves — only `onAddCaptionClick`, the
+   `renderCueList()` row handlers, `captionApplyImport`, and
+   `captionContinueDraftUI`/`captionStartFreshUI` do. This was a deliberate
+   design choice (not just a testing convenience) to keep the "small,
+   testable functions" genuinely side-effect-free per spec, and it
+   incidentally means the test suite never leaves a real 300ms/1s
+   `setTimeout` pending when the process exits.
+3. **SRT export MIME type** used `application/x-subrip` (no IANA-registered
+   type exists for `.srt`) — cosmetic; browsers don't act on it for file
+   downloads/FSA writes.
+4. **Added three `id` attributes to existing recorder markup**
+   (`#previewContainer`, `#statusBar`, `#controlsBar` on the preview
+   container, status bar, and controls divs) purely so
+   `setRecorderControlsVisible()` can toggle them — no existing CSS/JS
+   referenced those divs by class selector, confirmed by grep before adding.
+5. **No manual-test-covered feature was skipped** relative to the spec, but
+   video `loadedmetadata` duration reading was intentionally left with no
+   dedicated status-line display — the native `<video controls>` element
+   already surfaces duration, so a redundant status line was scope creep.
+6. **Active-cue highlighting now needs a row registry.** Splitting
+   `renderCueList()` (structural rebuilds) from `updateActiveCueHighlight()`
+   (class-toggle only) required tracking the last-built row elements
+   somewhere `updateActiveCueHighlight()` can reach without asking the DOM to
+   enumerate its own children (the harness's element mock doesn't support
+   that, and a real browser doesn't need to either). Added a module-level
+   `captionCueRowEls` array, indexed identically to `captionEditorState.cues`,
+   rebuilt (in place — `.length = 0` then repopulated, never reassigned) at
+   the top of every `renderCueList()` call. It lives next to `renderCueList`
+   rather than inside `captionEditorState` because it's a DOM-projection
+   cache, not editor state — nothing about the caption data itself is stored
+   there.
+7. **The end>start validation added for fix B treats "equal" as invalid too**
+   (`start < end` strictly, not `<=`), matching `parseVTT`'s own
+   `end > timing.start` check in the v1.17 section — a zero-duration cue
+   would be silently unplayable and is rejected the same way an unparseable
+   timestamp is.
+8. **The video-first guard (fix H) checks `captionEditorState.videoInfo`,
+   not `captionEditorState.fileKey`.** They're set together in
+   `handleCaptionVideoFile`, but gating on `videoInfo` reads more clearly at
+   the call site ("is a video open") than gating on the derived key.
+
+**No changes to the recording pipeline, the v1.11/v1.13 streamed save flows,
+or the `sessions`/`chunks` IndexedDB stores.** The v1.17 caption-logic
+section is untouched byte-for-byte.
+
 ---
 
 ## Known limitations
@@ -1186,6 +1392,7 @@ changes.** The editor surface (open a .vtt/.srt file, edit cues, export) is v1.1
 - **mediabunny integration** — replace MediaRecorder with WebCodecs + mediabunny for MP4 output and streaming-to-disk (Cues/seeking no longer needs it — done zero-dependency in v1.8)
 - **Trimming** — basic start/end trim before saving
 - **Two-step tool** — separate lightweight video editor page for stitching, trimming, and cleanup (keeps the recorder simple)
+- **User documentation** — README refresh (stale since v1.9's Firefox-first pass) + a faculty-facing usage guide; queued last so it documents the final feature set (REVIEW.md #19)
 - ~~**Project name**~~ — ✓ Named **DidaRec** (part of DidaWorks) in v1.5
 
 ---
@@ -1299,6 +1506,85 @@ screen-recorder/
    produce a playable file
 5. Repeat with a normal save; click "It's there — all set" — the session resolves
    (no banner on reload)
+
+**Manual acceptance test (caption editor, v1.18 — the harness can't touch a real
+DOM/video element; run in both Firefox (primary) and Chrome (secondary)):**
+
+1. **Open video.** Click "Caption editor" while idle (not recording) →
+   recorder controls hide, editor pane shows. Click "Open video", pick a
+   `.webm` recorded earlier by this app → video loads with native controls,
+   duration shown by the browser's own video chrome.
+2. **Drag-and-drop.** Drag a `.webm` file from the OS file manager onto the
+   editor pane (not through the file picker) → same result as #1.
+3. **Add + edit a cue.** Play the video briefly, pause, click "Add caption"
+   → a new row appears in the list, selected, with placeholder text; type
+   real caption text and tab/click away (onchange commits) → the caption
+   visibly appears on the video during that time range (live preview via the
+   `<track>` element), confirming captions render live while editing, not
+   just on export. **This is the only way to confirm the `track.track.mode`
+   fix (review defect C) actually works** — the harness has no `TextTrack`
+   object to assert against, so if captions don't visibly render here, that
+   fix regressed.
+3b. **Type while playing (regression check for review defect A).** Start
+   playback, click "Add caption" partway through, and type a multi-word
+   caption WITHOUT clicking away — keep typing as the video crosses into the
+   NEXT cue's time range. Confirm: the row highlight moves to the new active
+   cue, but the textarea you're still typing in keeps your uncommitted text
+   and focus (does not blur, clear, or get replaced). This is the core
+   transcribe-while-playing workflow.
+3c. **Same-file re-pick (regression check for review defect F).** Import a
+   caption file, then "Start fresh," then use "Import captions" again and
+   pick the SAME file from the OS picker → it imports again (the button
+   isn't dead). Repeat for "Open video" with the same `.webm` twice in a row.
+4. **Seek-on-row-click.** Add 2–3 more cues at different times. Click a
+   cue row (not its inputs) → video seeks to just inside that cue's start
+   without starting playback.
+5. **Time-edit validation.** Edit a cue's start time to something clearly
+   invalid (e.g. "banana") → input reverts, a brief message appears,
+   nothing else changes. Edit it to a valid time earlier than the previous
+   cue → the row visibly reorders in the list. Edit a cue's end time to
+   before its start → refused with the "end time needs to come after the
+   start time" message, cue unchanged.
+6. **Playback highlight.** Play the video through several cues → the
+   currently-playing cue's row highlights, and the list scrolls to keep it
+   in view, without janking on every video frame.
+7. **Draft restore after reload.** Add/edit a few cues, wait ~1–2 seconds
+   (autosave debounce), then reload the whole page and re-open the SAME
+   video file → the "Saved caption edits found" banner appears; click
+   "Continue editing them" → the edits are back exactly as left. Repeat,
+   but click "Start fresh" instead → cues come back empty and reloading
+   again shows no banner (draft was actually deleted).
+8. **Import captions.** With a non-empty cue list, click "Import captions"
+   and pick a `.vtt` or `.srt` file → a replace-confirmation banner appears
+   (not a browser `confirm()` popup); confirming replaces the list and shows
+   the "Imported N captions..." status line (with the partial-import caveat
+   if the sample file has a deliberately malformed cue).
+9. **Export naming + save.** Click "Save captions (.vtt)" on a video named
+   e.g. `lecture-2026-07-29.webm` → the save dialog (Chrome/Edge) or download
+   (Firefox) suggests/produces `lecture-2026-07-29.vtt`. Repeat with the
+   ".srt" button → `lecture-2026-07-29.srt`. Open the saved file in a text
+   editor to confirm it's well-formed WebVTT/SRT matching what was edited.
+10. **Export cancel.** Click "Save captions (.vtt)" and cancel the save
+    dialog (Chrome/Edge only) → no error banner, a quiet "cancelled" status
+    note, and the draft is still restorable via #7's flow afterward.
+11. **Recording guard.** Start a recording, then click "Caption editor" →
+    refused with a plain-language message; the recorder UI is undisturbed
+    and the recording keeps running.
+12. **Back to recorder.** From the editor, click "Back to recorder" mid-edit
+    → recorder controls reappear exactly as left (no stream/state
+    disruption); a pending recovery banner (if one was showing before
+    entering the editor) is still showing.
+13. **Back to recorder during playback (regression check for review defect
+    G).** Start the video playing, then click "Back to recorder" → the
+    video's audio stops immediately (it's paused, not just hidden).
+14. **Video-first guard (regression check for review defect H).** Open the
+    caption editor fresh (no video opened yet) and click "Add caption" or
+    "Import captions" → both refuse with "Open your video first — captions
+    are saved with it." and create no cues.
+15. **Draft banner doesn't leak stale rows (regression check for review
+    defect E).** Open video A, add a couple of cues, then open video B which
+    has its own saved draft from a prior session → the draft-restore banner
+    for B appears with NO leftover rows from A visible behind it.
 
 ---
 

@@ -174,7 +174,7 @@ const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!scriptMatch) { console.log('FATAL: no <script> block found in index.html'); process.exit(2); }
 let code = scriptMatch[1];
-code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT };';
+code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT, openDB, captionEditorState, captionFileKey, captionAddCue, captionDeleteCue, captionUpdateCueTime, captionUpdateCueText, captionPreviewVTT, captionParseCaptionText, captionBuildImportMessage, captionApplyImport, captionExportFilename, captionExport, saveCaptionDraft, loadCaptionDraft, deleteCaptionDraft, captionContinueDraftUI, captionStartFreshUI, openCaptionEditor, closeCaptionEditor, handleCaptionVideoFile, renderCueList, updateActiveCueHighlight, onCaptionVideoTimeUpdate, captionCueRowEls, onCaptionVideoInputChange, onCaptionImportInputChange, onAddCaptionClick };';
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app_new.js' });
 const api = sandbox.__api;
@@ -218,6 +218,17 @@ async function seed(nChunks, mime) {
   for (let i = 0; i < nChunks; i++) await api.addChunk(id, i, new Blob(['x']));
   return id;
 }
+// A File-like object for caption-editor tests (open-video / import-captions
+// inputs): a real Blob (Node's Blob already implements .text()) with the
+// name/lastModified fields a browser File adds. Duck-typed rather than
+// Node's real File class — the caption editor code only ever reads
+// .name/.size/.lastModified/.text(), so this is enough and keeps the mock dumb.
+function makeFile(name, content, lastModified) {
+  const blob = new Blob([content], { type: '' });
+  blob.name = name;
+  blob.lastModified = lastModified || 1700000000000;
+  return blob;
+}
 // The FSA mock models FILES, not write() calls: each writable collects its
 // parts and pushes ONE combined Blob to lastWritten when close() resolves — so
 // "lastWritten.length" means "files written" whether a save streamed in many
@@ -258,6 +269,19 @@ async function resetState() {
   documentMock.getElementById('recoveryBanner').classList.remove('visible');
   documentMock.getElementById('stitchFallback').classList.remove('visible');
   documentMock.hidden = false;
+  // v1.18: captionEditorState is module-level (like pipState) and persists
+  // across scenarios unless reset here — cues/videoInfo/fileKey from one
+  // scenario must never leak into the next.
+  Object.assign(api.captionEditorState, { active: false, cues: [], prologue: '', videoInfo: null, fileKey: null, dirty: false, activeCueIndex: -1, pendingDraft: null, pendingImport: null });
+  documentMock.getElementById('captionEditor').classList.remove('visible');
+  documentMock.getElementById('captionDraftBanner').classList.remove('visible');
+  documentMock.getElementById('captionImportConfirmBanner').classList.remove('visible');
+  api.captionCueRowEls.length = 0; // same array object across scenarios (see renderCueList's in-place clear)
+  documentMock.getElementById('captionStatus').textContent = '';
+  documentMock.getElementById('captionVideoInput').value = ''; documentMock.getElementById('captionVideoInput').files = undefined;
+  documentMock.getElementById('captionImportInput').value = ''; documentMock.getElementById('captionImportInput').files = undefined;
+  delete documentMock.getElementById('captionVideo').pause; // scenarios that install a pause() spy must not leak it
+  documentMock.getElementById('captionVideo').currentTime = 0;
   lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0; downloadClicks = [];
   writeCalls = []; abortCalls = 0; closedFiles = 0; failWriteAfter = -1;
   statusHistory = []; objectUrlBlobs = [];
@@ -2655,6 +2679,305 @@ Real cue text
     const vttParsed = api.parseVTT(vttWithBlankishSeparator);
     assert(vttParsed.skipped === 0, 'no VTT cues skipped across a tab-only separator line (got skipped=' + vttParsed.skipped + ')');
     assert(vttParsed.cues.length === 2, 'both VTT cues parse despite the "\\n\\t\\n" separator (got ' + vttParsed.cues.length + ')');
+  });
+
+  await scenario('CQ opening the DB (v2) upgrades a v1 database in place, adding the captions store without touching existing sessions/chunks data', async () => {
+    // Manually create a v1-shaped database (sessions + chunks only, no
+    // captions store), seeded with data, bypassing api.openDB — which now
+    // always requests the current DB_VERSION (2). This models an owner
+    // upgrading from a pre-v1.18 build with real recordings already stored.
+    await new Promise((resolve, reject) => {
+      const req = gidb.open('screen-recorder-db', 1);
+      req.onupgradeneeded = (e) => {
+        const db = e.target.result;
+        db.createObjectStore('sessions', { keyPath: 'id' });
+        const s = db.createObjectStore('chunks', { keyPath: ['sessionId', 'index'] });
+        s.createIndex('bySession', 'sessionId', { unique: false });
+      };
+      req.onsuccess = () => {
+        const db = req.result;
+        const tx = db.transaction(['sessions', 'chunks'], 'readwrite');
+        tx.objectStore('sessions').put({ id: 'seed-session', mimeType: 'video/webm', startTime: 1, completed: false });
+        tx.objectStore('chunks').put({ sessionId: 'seed-session', index: 0, data: new Blob(['x']) });
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => { db.close(); reject(tx.error); };
+      };
+      req.onerror = () => reject(req.error);
+    });
+
+    // Now open with the app's real openDB() (DB_VERSION=2) — must upgrade in
+    // place: add 'captions', leave the v1-era stores and their data alone.
+    const db = await api.openDB();
+    assert(db.objectStoreNames.contains('sessions'), 'sessions store still present after the v1->v2 upgrade');
+    assert(db.objectStoreNames.contains('chunks'), 'chunks store still present after the v1->v2 upgrade');
+    assert(db.objectStoreNames.contains('captions'), 'captions store created by the v1->v2 upgrade');
+    db.close();
+
+    const sessions = await readStore('sessions');
+    const chunks = await readStore('chunks');
+    assert(sessions.length === 1 && sessions[0].id === 'seed-session', 'the v1-era session survives the upgrade untouched');
+    assert(chunks.length === 1 && chunks[0].sessionId === 'seed-session', 'the v1-era chunk survives the upgrade untouched');
+  });
+
+  await scenario('CR captionAddCue/captionDeleteCue/captionUpdateCueText: add keeps cues sorted by start, delete rejects an out-of-range index, text edits mark the editor dirty', async () => {
+    const ec = api.captionEditorState;
+    assert(ec.cues.length === 0, 'cues start empty (reset between scenarios)');
+
+    const r1 = api.captionAddCue(5);
+    assert(r1.ok === true && r1.index === 0, 'first cue added at index 0');
+    assert(ec.cues[0].start === 5 && ec.cues[0].end === 7, 'default 2s duration from the given currentTime');
+    assert(ec.cues[0].text === 'New caption', 'placeholder text set for immediate typing');
+    assert(ec.dirty === true, 'adding a cue marks the editor dirty');
+
+    const r2 = api.captionAddCue(1);
+    assert(r2.ok === true && r2.index === 0, 'a cue added earlier than an existing one lands at index 0 after sorting');
+    assert(ec.cues.map(c => c.start).join(',') === '1,5', 'cues stay sorted by start after insertion');
+
+    const textRes = api.captionUpdateCueText(1, 'Hello, faculty.');
+    assert(textRes.ok === true && ec.cues[1].text === 'Hello, faculty.', "captionUpdateCueText replaces a cue's text in place");
+    assert(ec.dirty === true, 'a text edit also marks the editor dirty');
+
+    const delOOR = api.captionDeleteCue(9);
+    assert(delOOR.ok === false && ec.cues.length === 2, 'deleting an out-of-range index is rejected without mutating the list');
+
+    const delOk = api.captionDeleteCue(0);
+    assert(delOk.ok === true && ec.cues.length === 1 && ec.cues[0].start === 5, 'deleting index 0 removes the earlier cue, leaving the later one');
+  });
+
+  await scenario("CS captionUpdateCueTime re-sorts by start after a valid edit (keeping the edited cue findable) and rejects an unparseable time without mutating the cue", async () => {
+    const ec = api.captionEditorState;
+    ec.cues = [
+      { id: null, start: 1, end: 9, text: 'A', settings: '' },
+      { id: null, start: 5, end: 6, text: 'B', settings: '' },
+    ];
+
+    const res = api.captionUpdateCueTime(0, 'start', '00:00:07.000');
+    assert(res.ok === true, 'a well-formed timestamp is accepted');
+    assert(ec.cues[0].text === 'B' && ec.cues[1].text === 'A', 'cues re-sort by start after the edit (B:5 now before A:7)');
+    assert(res.index === 1, "the function returns the edited cue's new index so the caller can keep it selected");
+    assert(ec.cues[1].start === 7, "the edited cue's start actually changed to the parsed value");
+    assert(ec.dirty === true, 'a time edit marks the editor dirty');
+
+    const bad = api.captionUpdateCueTime(1, 'end', 'not-a-time');
+    assert(bad.ok === false && bad.reason === 'invalid', 'an unparseable time string is rejected');
+    assert(ec.cues[1].end === 9, "the cue's end time is untouched by the rejected edit (revert-by-not-mutating)");
+    assert(typeof bad.message === 'string' && bad.message.length > 0, 'a plain-language message is returned for the caller to show');
+  });
+
+  await scenario('CT saveCaptionDraft writes the expected record to IndexedDB, and loadCaptionDraft round-trips it back', async () => {
+    const ec = api.captionEditorState;
+    ec.videoInfo = { name: 'lecture.webm', size: 12345, lastModified: 1690000000000, objectUrl: 'blob:mock' };
+    ec.fileKey = api.captionFileKey(ec.videoInfo);
+    ec.cues = [{ id: null, start: 0, end: 2, text: 'Welcome', settings: '' }];
+    ec.prologue = 'NOTE from the professor';
+
+    const saved = await api.saveCaptionDraft();
+    assert(saved && saved.fileKey === ec.fileKey, 'saveCaptionDraft returns the record it wrote, keyed by fileKey');
+    assert(typeof saved.updatedAt === 'number', 'the record carries a timestamp');
+
+    const loaded = await api.loadCaptionDraft(ec.fileKey);
+    assert(loaded && loaded.fileKey === ec.fileKey, 'loadCaptionDraft finds the saved draft by fileKey');
+    assert(loaded.cues.length === 1 && loaded.cues[0].text === 'Welcome', 'cues round-trip through the draft store');
+    assert(loaded.prologue === 'NOTE from the professor', 'prologue round-trips through the draft store');
+
+    const missing = await api.loadCaptionDraft('no-such-file|0|0');
+    assert(missing === null, 'a fileKey with no saved draft resolves null, not undefined or a thrown error');
+  });
+
+  await scenario('CU deleteCaptionDraft (the "Start fresh" action) removes a previously saved draft', async () => {
+    const ec = api.captionEditorState;
+    ec.videoInfo = { name: 'lecture2.webm', size: 999, lastModified: 42, objectUrl: 'blob:mock' };
+    ec.fileKey = api.captionFileKey(ec.videoInfo);
+    ec.cues = [{ id: null, start: 0, end: 1, text: 'x', settings: '' }];
+    await api.saveCaptionDraft();
+    assert((await api.loadCaptionDraft(ec.fileKey)) !== null, 'draft exists before Start fresh is chosen');
+
+    await api.deleteCaptionDraft(ec.fileKey);
+    assert((await api.loadCaptionDraft(ec.fileKey)) === null, 'Start fresh deletes the stored draft outright, not just hides the banner');
+  });
+
+  await scenario('CV importing captions with unreadable cues surfaces a plain-language partial-import message', async () => {
+    const vttWithOneBadCue = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nGood cue\n\n00:00:05.000 -> 00:00:06.000\nBad arrow, skipped\n';
+    const parsed = api.captionParseCaptionText(vttWithOneBadCue, 'lecture.vtt');
+    assert(parsed.format === 'vtt', 'format detected from content/filename via detectCaptionFormat');
+    assert(parsed.cues.length === 1 && parsed.skipped === 1, 'one cue parses, one is skipped (wrong arrow) via the existing parseVTT tolerance');
+
+    const msg = api.captionBuildImportMessage(parsed.cues.length, parsed.skipped);
+    assert(/^Imported 1 caption\./.test(msg), 'message states how many imported, in plain language');
+    assert(/1 couldn.t be read and was left out/.test(msg), 'message states how many were skipped, in plain language (no "parse error"/"skipped" jargon)');
+
+    const cleanMsg = api.captionBuildImportMessage(3, 0);
+    assert(cleanMsg === 'Imported 3 captions.', 'no caveat sentence at all when nothing was skipped');
+  });
+
+  await scenario("CW export filenames replace the opened video's extension with .vtt/.srt (the sidecar naming convention)", async () => {
+    assert(api.captionExportFilename('lecture.webm', 'vtt') === 'lecture.vtt', '.webm becomes .vtt');
+    assert(api.captionExportFilename('lecture.webm', 'srt') === 'lecture.srt', '.webm becomes .srt');
+    assert(api.captionExportFilename('My Recording.WEBM', 'vtt') === 'My Recording.vtt', 'whatever the actual extension is gets replaced, case included');
+    assert(api.captionExportFilename('no-extension', 'vtt') === 'no-extension.vtt', 'a name with no extension just gets the caption extension appended');
+  });
+
+  await scenario('CX export picker-cancel (AbortError) is not an error: quiet status note, draft untouched, no error banner', async () => {
+    const ec = api.captionEditorState;
+    ec.videoInfo = { name: 'lecture.webm', size: 1, lastModified: 1, objectUrl: 'blob:mock' };
+    ec.fileKey = api.captionFileKey(ec.videoInfo);
+    ec.cues = [{ id: null, start: 0, end: 1, text: 'x', settings: '' }];
+    await api.saveCaptionDraft();
+
+    windowMock.showSaveFilePicker = pickerSequence(['abort']);
+    const result = await api.captionExport('vtt');
+    assert(result === 'cancelled', 'captionExport reports the cancellation to its caller');
+    assert(recordedErrors.length === 0, 'a cancelled picker never goes through showError');
+    assert(statusHistory.some(m => /cancelled/i.test(m)), 'a quiet status note is posted instead of an error');
+
+    const stillThere = await api.loadCaptionDraft(ec.fileKey);
+    assert(stillThere !== null, 'the IndexedDB draft is untouched by a cancelled export');
+  });
+
+  await scenario('CY opening the caption editor while state.recording is true is refused with faculty-toned copy, and the editor pane stays hidden', async () => {
+    state.recording = true;
+    api.openCaptionEditor();
+    assert(api.captionEditorState.active === false, 'the editor does not become active while a recording is in progress');
+    assert(documentMock.getElementById('captionEditor').classList.contains('visible') === false, 'the editor pane is not shown');
+    assert(recordedErrors.length === 1, 'exactly one message shown for the refused click');
+    assert(!/stack|undefined|NaN|\berror\b:/i.test(recordedErrors[0]), 'the message is plain language, not a technical error/stack trace');
+    assert(/recording/i.test(recordedErrors[0]), 'the message explains the refusal is because a recording is in progress');
+  });
+
+  await scenario('CZ captionPreviewVTT (the live-preview source) is exactly serializeVTT of the current cues/prologue — assert the string, not the DOM', async () => {
+    const ec = api.captionEditorState;
+    ec.cues = [
+      { id: null, start: 1, end: 2, text: 'Hello', settings: '' },
+      { id: null, start: 3, end: 4, text: 'World', settings: '' },
+    ];
+    ec.prologue = 'NOTE test';
+    const expected = api.serializeVTT({ cues: ec.cues, prologue: ec.prologue });
+    assert(api.captionPreviewVTT() === expected, 'captionPreviewVTT matches serializeVTT({ cues, prologue }) exactly — no separate reimplementation');
+    assert(/^WEBVTT/.test(expected) && expected.includes('Hello') && expected.includes('World'), 'sanity: the serialized output actually contains both cues');
+  });
+
+  await scenario('DA video timeupdate highlights the active cue WITHOUT rebuilding rows (a full re-render mid-typing would destroy an uncommitted edit and steal focus)', async () => {
+    const ec = api.captionEditorState;
+    ec.cues = [
+      { id: null, start: 0, end: 2, text: 'A', settings: '' },
+      { id: null, start: 2, end: 4, text: 'B', settings: '' },
+    ];
+    api.renderCueList();
+    assert(api.captionCueRowEls.length === 2, 'renderCueList built two rows');
+    const rowA = api.captionCueRowEls[0], rowB = api.captionCueRowEls[1];
+
+    const video = documentMock.getElementById('captionVideo');
+    video.currentTime = 3; // inside cue B
+    api.onCaptionVideoTimeUpdate();
+
+    assert(api.captionCueRowEls[0] === rowA && api.captionCueRowEls[1] === rowB, 'the SAME row elements survive a timeupdate — renderCueList was never called');
+    assert(rowB.classList.contains('active') === true, 'the row containing currentTime gets .active');
+    assert(rowA.classList.contains('active') === false, 'the previously-active row loses .active');
+    assert(ec.activeCueIndex === 1, 'activeCueIndex tracks the cue under the playhead');
+
+    // A second tick still inside the same cue must not even touch the rows.
+    video.currentTime = 3.5;
+    api.onCaptionVideoTimeUpdate();
+    assert(api.captionCueRowEls[1] === rowB, 'no rebuild on a tick that stays inside the same active cue either');
+  });
+
+  await scenario("DB captionUpdateCueTime rejects an edit that would put the cue's end at or before its start, in both directions, without mutating the cue", async () => {
+    const ec = api.captionEditorState;
+    ec.cues = [{ id: null, start: 2, end: 5, text: 'x', settings: '' }];
+
+    const pushStartPastEnd = api.captionUpdateCueTime(0, 'start', '00:00:06.000'); // start(6) >= end(5)
+    assert(pushStartPastEnd.ok === false && pushStartPastEnd.reason === 'order', 'pushing start at/past end is rejected');
+    assert(ec.cues[0].start === 2, 'start is left unchanged');
+    assert(/end time needs to come after the start time/i.test(pushStartPastEnd.message), 'plain-language message explains the ordering rule');
+
+    const pullEndBeforeStart = api.captionUpdateCueTime(0, 'end', '00:00:01.000'); // end(1) <= start(2)
+    assert(pullEndBeforeStart.ok === false && pullEndBeforeStart.reason === 'order', 'pulling end at/before start is rejected');
+    assert(ec.cues[0].end === 5, 'end is left unchanged');
+
+    const okEdit = api.captionUpdateCueTime(0, 'end', '00:00:09.000');
+    assert(okEdit.ok === true && ec.cues[0].end === 9, 'a valid ordering still succeeds normally');
+  });
+
+  await scenario('DD the Firefox/download export path posts an honest, caption-specific status line — not just the generic recording-save copy', async () => {
+    const ec = api.captionEditorState;
+    ec.videoInfo = { name: 'lecture.webm', size: 1, lastModified: 1, objectUrl: 'blob:mock' };
+    ec.fileKey = api.captionFileKey(ec.videoInfo);
+    ec.cues = [{ id: null, start: 0, end: 1, text: 'x', settings: '' }];
+
+    const result = await api.captionExport('vtt'); // no showSaveFilePicker => Firefox/download path (resetState leaves it absent)
+    assert(result === 'downloaded', 'the download fallback path is taken');
+    assert(downloadClicks.length === 1 && downloadClicks[0] === 'lecture.vtt', 'startDownload fires with the sidecar filename');
+    assert(statusHistory.some(m => /Downloaded/i.test(m)), 'the existing generic recording-save copy still fires from startDownload, unchanged');
+    const captionStatusText = documentMock.getElementById('captionStatus').textContent;
+    assert(captionStatusText.includes('sent to the browser as a download'), 'an honest, caption-specific status line is ALSO shown');
+    assert(captionStatusText.includes('stay saved here'), 'the message reassures the user their edits are not lost');
+  });
+
+  await scenario("DE opening a video that has a saved draft still clears out stale cue rows from whatever was showing before (both branches of handleCaptionVideoFile render+schedule)", async () => {
+    // Simulate stale rows left on screen from a previous video.
+    api.captionEditorState.cues = [{ id: null, start: 0, end: 1, text: 'stale', settings: '' }];
+    api.renderCueList();
+    assert(api.captionCueRowEls.length === 1, 'a stale row exists before opening the new video');
+
+    // Save a draft for the video we're about to "open".
+    const info = { name: 'lecture.webm', size: 20, lastModified: 200 };
+    api.captionEditorState.videoInfo = info;
+    api.captionEditorState.fileKey = api.captionFileKey(info);
+    api.captionEditorState.cues = [{ id: null, start: 0, end: 1, text: 'draft cue', settings: '' }];
+    await api.saveCaptionDraft();
+
+    const file = makeFile('lecture.webm', 'y'.repeat(20), 200);
+    await api.handleCaptionVideoFile(file);
+
+    assert(documentMock.getElementById('captionDraftBanner').classList.contains('visible') === true, 'the draft-restore banner is shown for the reopened video');
+    assert(api.captionEditorState.cues.length === 0, 'cues are reset to empty while Continue/Start-fresh is pending');
+    assert(api.captionCueRowEls.length === 0, 'renderCueList ran on the draft-found branch too, so the stale row from the PREVIOUS video is gone');
+  });
+
+  await scenario('DF the video and import file inputs clear their .value after a pick, so choosing the same file twice fires change again', async () => {
+    const videoInput = documentMock.getElementById('captionVideoInput');
+    videoInput.value = 'C:\\fakepath\\lecture.webm';
+    videoInput.files = [makeFile('lecture.webm', 'x', 1)];
+    api.onCaptionVideoInputChange({ target: videoInput });
+    assert(videoInput.value === '', 'the video input value is cleared right after a pick (synchronously, before the async open completes)');
+
+    api.captionEditorState.videoInfo = { name: 'lecture.webm', size: 1, lastModified: 1, objectUrl: 'blob:mock' }; // satisfy the video-first guard (fix H) so this test isolates the value-reset behavior
+    const importInput = documentMock.getElementById('captionImportInput');
+    importInput.value = 'C:\\fakepath\\lecture.vtt';
+    importInput.files = [makeFile('lecture.vtt', 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi\n', 1)];
+    await api.onCaptionImportInputChange({ target: importInput });
+    assert(importInput.value === '', 'the import input value is also cleared after a pick');
+  });
+
+  await scenario('DG closing the caption editor pauses the video, so its audio does not keep playing behind the hidden pane', async () => {
+    const video = documentMock.getElementById('captionVideo');
+    let pauseCalls = 0;
+    video.pause = () => { pauseCalls++; };
+    api.captionEditorState.active = true;
+    documentMock.getElementById('captionEditor').classList.add('visible');
+
+    api.closeCaptionEditor();
+
+    assert(pauseCalls === 1, 'video.pause() is called exactly once on Back to recorder');
+    assert(api.captionEditorState.active === false, 'editor state deactivates');
+    assert(documentMock.getElementById('captionEditor').classList.contains('visible') === false, 'the editor pane hides');
+    delete video.pause;
+  });
+
+  await scenario('DH importing captions or adding a caption before any video is open is refused with a gentle status message, and does nothing else (video-first)', async () => {
+    const ec = api.captionEditorState;
+    assert(ec.videoInfo === null, 'no video open (reset default)');
+
+    api.onAddCaptionClick();
+    assert(ec.cues.length === 0, 'Add caption does nothing with no video open');
+    assert(documentMock.getElementById('captionStatus').textContent === 'Open your video first — captions are saved with it.', 'a gentle status message explains why (Add caption path)');
+
+    documentMock.getElementById('captionStatus').textContent = '';
+    const importInput = documentMock.getElementById('captionImportInput');
+    importInput.files = [makeFile('lecture.vtt', 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHi\n', 1)];
+    await api.onCaptionImportInputChange({ target: importInput });
+    assert(ec.cues.length === 0, 'Import captions does nothing with no video open');
+    assert(documentMock.getElementById('captionStatus').textContent === 'Open your video first — captions are saved with it.', 'the same gentle message is shown for the import path');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

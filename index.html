@@ -391,6 +391,155 @@
 
   .error-banner.visible { display: block; }
 
+  /* Caption editor (v1.18) */
+  .btn-caption-editor {
+    background: var(--border);
+    color: var(--text);
+  }
+  .btn-caption-editor:hover { background: #3a4a6c; }
+
+  .btn-back-recorder {
+    background: var(--border);
+    color: var(--text);
+  }
+  .btn-back-recorder:hover { background: #3a4a6c; }
+
+  .caption-editor {
+    display: none;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  .caption-editor.visible { display: flex; }
+
+  .caption-editor-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .caption-editor-header h2 {
+    font-size: 1rem;
+    font-weight: 600;
+  }
+
+  .caption-editor-toolbar {
+    display: flex;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .btn-open-video, .btn-import-captions, .btn-add-caption {
+    background: var(--surface);
+    color: var(--green);
+    border: 1px solid var(--green-dim);
+  }
+  .btn-open-video:hover, .btn-import-captions:hover, .btn-add-caption:hover { background: var(--surface-hover); }
+
+  .btn-save-vtt {
+    background: var(--green);
+    color: #111;
+  }
+  .btn-save-vtt:hover { background: #6fe0bb; }
+
+  .btn-save-srt {
+    background: var(--surface);
+    color: var(--text-dim);
+    border: 1px solid var(--border);
+  }
+  .btn-save-srt:hover { background: var(--surface-hover); }
+
+  .caption-status {
+    font-size: 0.8rem;
+    color: var(--text-dim);
+    min-height: 1.2em;
+  }
+
+  .caption-video-wrap {
+    position: relative;
+    width: 100%;
+    background: #0d0d1a;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    overflow: hidden;
+  }
+
+  .caption-video-wrap video {
+    width: 100%;
+    max-height: 420px;
+    display: block;
+    background: #000;
+  }
+
+  .caption-video-placeholder {
+    padding: 2rem;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 0.9rem;
+  }
+
+  .caption-video-placeholder.hidden { display: none; }
+
+  .caption-cue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-height: 360px;
+    overflow-y: auto;
+    padding-right: 0.25rem;
+  }
+
+  .caption-cue-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: flex-start;
+    padding: 0.5rem;
+    border-radius: var(--radius);
+    border: 1px solid var(--border);
+    background: var(--surface);
+    cursor: pointer;
+  }
+
+  .caption-cue-row.active {
+    border-color: var(--green);
+    background: rgba(78, 204, 163, 0.08);
+  }
+
+  .caption-time-input {
+    width: 6.5rem;
+    padding: 0.3rem 0.4rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .caption-cue-text {
+    flex: 1;
+    min-height: 2.4rem;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.8rem;
+    font-family: inherit;
+    resize: vertical;
+  }
+
+  .btn-delete-cue {
+    background: transparent;
+    color: var(--accent-hover);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.75rem;
+    cursor: pointer;
+  }
+  .btn-delete-cue:hover { background: rgba(233, 69, 96, 0.1); }
+
   /* Footer */
   footer {
     width: 100%;
@@ -447,7 +596,7 @@
   <div class="error-banner" id="errorBanner"></div>
 
   <!-- Preview -->
-  <div class="preview-container">
+  <div class="preview-container" id="previewContainer">
     <canvas id="previewCanvas"></canvas>
     <div class="preview-placeholder" id="placeholder">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
@@ -459,7 +608,7 @@
   </div>
 
   <!-- Status bar -->
-  <div class="status-bar">
+  <div class="status-bar" id="statusBar">
     <div class="status-dot" id="statusDot"></div>
     <div class="timer" id="timer">00:00:00</div>
     <div class="status-text" id="statusText">Ready</div>
@@ -467,7 +616,7 @@
   </div>
 
   <!-- Controls -->
-  <div class="controls">
+  <div class="controls" id="controlsBar">
     <div class="source-toggles">
       <div class="source-group">
         <button class="toggle-btn active" id="toggleScreen" onclick="toggleSource('screen')">
@@ -518,11 +667,65 @@
       </div>
     </div>
     <div class="action-btns">
+      <button class="primary btn-caption-editor" id="btnCaptionEditor" onclick="openCaptionEditor()">Caption editor</button>
       <button class="primary btn-pause" id="btnPause" onclick="pauseResume()" style="display:none;">Pause</button>
       <button class="primary btn-stop" id="btnStop" onclick="stopRecording()" style="display:none;">Stop &amp; save</button>
       <button class="primary btn-select-screen" id="btnSelectScreen" onclick="selectScreen()">Select Screen</button>
       <button class="primary btn-record" id="btnRecord" onclick="startRecording()" disabled>Record</button>
     </div>
+  </div>
+
+  <!-- Caption editor (v1.18): open-a-file editor for a .webm recording's -->
+  <!-- .vtt/.srt sidecar captions. Hidden until "Caption editor" is clicked; -->
+  <!-- toggled the same way as the other in-app banners (base display:none + -->
+  <!-- .visible modifier). Entering/leaving this pane never touches recorder -->
+  <!-- state, held streams, or the recovery/download-confirm banners above. -->
+  <div class="caption-editor" id="captionEditor" ondragover="onCaptionDragOver(event)" ondrop="onCaptionDrop(event)">
+    <div class="caption-editor-header">
+      <h2>Caption editor</h2>
+      <button class="primary btn-back-recorder" onclick="closeCaptionEditor()">Back to recorder</button>
+    </div>
+
+    <!-- Draft-restore banner: shown when the opened video's fileKey has a saved draft -->
+    <div class="recovery-banner" id="captionDraftBanner">
+      <h3>Saved caption edits found</h3>
+      <p>You have saved caption edits for this video from before.</p>
+      <div class="recovery-actions">
+        <button class="primary btn-record" onclick="captionContinueDraftUI()">Continue editing them</button>
+        <button class="primary btn-stop" onclick="captionStartFreshUI()">Start fresh</button>
+      </div>
+    </div>
+
+    <!-- Import-replace confirmation banner: shown when importing over a non-empty cue list -->
+    <div class="recovery-banner" id="captionImportConfirmBanner">
+      <h3>Replace current captions?</h3>
+      <p>Importing a caption file will replace the captions you're currently editing.</p>
+      <div class="recovery-actions">
+        <button class="primary btn-record" onclick="captionConfirmImportUI()">Replace with imported captions</button>
+        <button class="primary btn-stop" onclick="captionCancelImportUI()">Keep current captions</button>
+      </div>
+    </div>
+
+    <div class="caption-editor-toolbar">
+      <input type="file" id="captionVideoInput" accept=".webm" style="display:none;" onchange="onCaptionVideoInputChange(event)">
+      <button class="primary btn-open-video" onclick="document.getElementById('captionVideoInput').click()">Open video</button>
+      <input type="file" id="captionImportInput" accept=".vtt,.srt" style="display:none;" onchange="onCaptionImportInputChange(event)">
+      <button class="primary btn-import-captions" onclick="document.getElementById('captionImportInput').click()">Import captions</button>
+      <button class="primary btn-add-caption" onclick="onAddCaptionClick()">Add caption</button>
+      <button class="primary btn-save-vtt" onclick="onExportCaptionsClick('vtt')">Save captions (.vtt)</button>
+      <button class="primary btn-save-srt" onclick="onExportCaptionsClick('srt')">.srt</button>
+    </div>
+
+    <div class="caption-status" id="captionStatus"></div>
+
+    <div class="caption-video-wrap">
+      <video id="captionVideo" controls preload="metadata" ontimeupdate="onCaptionVideoTimeUpdate()">
+        <track id="captionPreviewTrack" kind="captions" default>
+      </video>
+      <div class="caption-video-placeholder" id="captionVideoPlaceholder">Open a .webm recording, or drag one in here, to start captioning it</div>
+    </div>
+
+    <div class="caption-cue-list" id="captionCueList"></div>
   </div>
 </main>
 
@@ -577,7 +780,7 @@ const state = {
 // IndexedDB — crash-resilient chunk storage
 // ============================================================
 const DB_NAME = 'screen-recorder-db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 function openDB() {
   return new Promise((resolve, reject) => {
@@ -590,6 +793,13 @@ function openDB() {
       if (!db.objectStoreNames.contains('chunks')) {
         const store = db.createObjectStore('chunks', { keyPath: ['sessionId', 'index'] });
         store.createIndex('bySession', 'sessionId', { unique: false });
+      }
+      // v1.18: caption editor drafts, keyed by the opened video's identity
+      // (name|size|lastModified — see captionFileKey). Guarded the same way
+      // as the stores above so this upgrade runs cleanly on top of an
+      // existing v1 database without touching sessions/chunks data.
+      if (!db.objectStoreNames.contains('captions')) {
+        db.createObjectStore('captions', { keyPath: 'fileKey' });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -4149,6 +4359,588 @@ function serializeSRT(data) {
     out += (cue.text || '') + '\n\n';
   });
   return out.replace(/\n+$/, '\n');
+}
+
+// ============================================================
+// Caption editor (v1.18)
+// ============================================================
+// The open-a-file editor UI built on top of the v1.17 caption logic above.
+// Nothing in this section reimplements or modifies parseVTT/parseSRT/
+// serializeVTT/serializeSRT/parseCaptionTimestamp/formatCaptionTimestamp/
+// parseCueTimingLine/detectCaptionFormat — it only calls them. Module-level
+// state (precedent: pipState), NOT new fields on `state` — entering/leaving
+// the editor must never disturb recorder state, held streams, or a pending
+// recovery banner.
+const captionEditorState = {
+  active: false,          // is the editor pane currently shown
+  cues: [],                // [{ id, start, end, text, settings }], kept sorted by start
+  prologue: '',
+  videoInfo: null,         // { name, size, lastModified, objectUrl } of the opened video
+  fileKey: null,           // `${name}|${size}|${lastModified}` — draft storage key
+  dirty: false,            // true when there are edits not yet EXPORTED to a .vtt/.srt file
+                            // (separate from the IndexedDB autosave, which always runs)
+  activeCueIndex: -1,      // index of the cue under the video's current playhead, or selected
+  pendingDraft: null,      // draft record loaded from IndexedDB, awaiting Continue/Start-fresh
+  pendingImport: null,     // parsed import result awaiting the replace-confirmation banner
+};
+
+// fileKey identity for a video, used both to look up and to store a draft.
+// Deliberately NOT a content hash (would require reading the whole file) —
+// name+size+lastModified is the same lightweight identity trick browsers'
+// own "recent files" pickers use.
+function captionFileKey(info) {
+  if (!info) return null;
+  return `${info.name}|${info.size}|${info.lastModified}`;
+}
+
+// ---- Cue editing (small, testable, DOM-free — renderCueList() is the only
+// thing that reads these back into the page) ----
+
+// Insert a cue at `currentTime` (default 2s duration, placeholder text),
+// keeping `cues` sorted by start. Returns { ok, index } where index is the
+// new cue's position AFTER sorting.
+function captionAddCue(currentTime) {
+  const start = Math.max(0, Number(currentTime) || 0);
+  const cue = { id: null, start, end: start + 2, text: 'New caption', settings: '' };
+  captionEditorState.cues.push(cue);
+  captionEditorState.cues.sort((a, b) => a.start - b.start);
+  const index = captionEditorState.cues.indexOf(cue);
+  captionEditorState.activeCueIndex = index;
+  captionEditorState.dirty = true;
+  return { ok: true, index };
+}
+
+// Delete the cue at `index`. Returns { ok:false } for an out-of-range index
+// instead of throwing — callers (a stale row re-render) shouldn't crash the editor.
+function captionDeleteCue(index) {
+  if (!Number.isInteger(index) || index < 0 || index >= captionEditorState.cues.length) {
+    return { ok: false, reason: 'range' };
+  }
+  captionEditorState.cues.splice(index, 1);
+  if (captionEditorState.activeCueIndex === index) captionEditorState.activeCueIndex = -1;
+  else if (captionEditorState.activeCueIndex > index) captionEditorState.activeCueIndex--;
+  captionEditorState.dirty = true;
+  return { ok: true };
+}
+
+// Replace a cue's text in place. No parsing/validation needed (unlike times) —
+// any string is a valid caption.
+function captionUpdateCueText(index, text) {
+  const cue = captionEditorState.cues[index];
+  if (!cue) return { ok: false, reason: 'range' };
+  cue.text = text == null ? '' : String(text);
+  captionEditorState.dirty = true;
+  return { ok: true };
+}
+
+// Update a cue's start or end time from a typed string (parsed via the
+// v1.17 parseCaptionTimestamp — same tolerant HH:MM:SS.mmm/MM:SS.mmm/.,-sep
+// grammar the file parsers use). An unparseable string, OR one that would put
+// this cue's end at or before its start, is rejected WITHOUT touching the
+// cue — the caller reverts the input to the old value and shows `message`.
+// (Without this check, serializeVTT would happily emit a cue that parseVTT
+// itself skips on reimport and that <track> silently ignores — an
+// end<=start cue is exactly as unparseable as a bad string, just later.) On
+// success, re-sorts by start and returns the edited cue's new index so the
+// caller can keep it visibly selected after the list reorders.
+function captionUpdateCueTime(index, which, str) {
+  const cue = captionEditorState.cues[index];
+  if (!cue || (which !== 'start' && which !== 'end')) return { ok: false, reason: 'range' };
+  const parsed = parseCaptionTimestamp(str);
+  if (parsed === null) {
+    return { ok: false, reason: 'invalid', message: "That doesn't look like a time — use HH:MM:SS.mmm (or MM:SS.mmm)." };
+  }
+  const otherEnd = which === 'start' ? cue.end : cue.start;
+  const wouldBeInvalidOrder = which === 'start' ? !(parsed < otherEnd) : !(parsed > otherEnd);
+  if (wouldBeInvalidOrder) {
+    return { ok: false, reason: 'order', message: "The end time needs to come after the start time — it was left unchanged." };
+  }
+  cue[which] = parsed;
+  captionEditorState.cues.sort((a, b) => a.start - b.start);
+  const newIndex = captionEditorState.cues.indexOf(cue);
+  captionEditorState.activeCueIndex = newIndex;
+  captionEditorState.dirty = true;
+  return { ok: true, index: newIndex };
+}
+
+// Current cue list serialized as WebVTT — this is what the live preview
+// <track> always shows, even when the user plans to export SRT (VTT is the
+// only format <track> understands). Pure and DOM-free so the preview logic
+// itself is testable without touching the page (assert the string).
+function captionPreviewVTT() {
+  return serializeVTT({ cues: captionEditorState.cues, prologue: captionEditorState.prologue });
+}
+
+// ---- Import ----
+
+// Parse caption file text via the v1.17 pipeline (detectCaptionFormat then
+// the matching parser) — no format-specific logic lives here.
+function captionParseCaptionText(text, filename) {
+  const format = detectCaptionFormat(text, filename);
+  const result = format === 'srt' ? parseSRT(text) : parseVTT(text);
+  return Object.assign({ format }, result);
+}
+
+// Faculty-toned import summary. Plain language, no jargon ("skipped",
+// "parse error") — matches the app's existing error-message register.
+function captionBuildImportMessage(count, skipped) {
+  const base = `Imported ${count} caption${count === 1 ? '' : 's'}.`;
+  if (skipped > 0) {
+    return base + ` ${skipped} couldn't be read and ${skipped === 1 ? 'was' : 'were'} left out.`;
+  }
+  return base;
+}
+
+// Apply a parsed import as the current cue list (replacing whatever was
+// there — the caller is responsible for the replace-confirmation banner
+// when the list was non-empty). Schedules the autosave + live preview and
+// posts the editor-local status line.
+function captionApplyImport(parsed) {
+  captionEditorState.cues = (parsed.cues || []).slice().sort((a, b) => a.start - b.start);
+  captionEditorState.prologue = parsed.prologue || '';
+  captionEditorState.dirty = true;
+  captionEditorState.activeCueIndex = -1;
+  captionSetStatus(captionBuildImportMessage(captionEditorState.cues.length, parsed.skipped || 0));
+  scheduleCaptionAutosave();
+  scheduleCaptionPreviewUpdate();
+  renderCueList();
+}
+
+async function onCaptionImportInputChange(event) {
+  const file = event && event.target && event.target.files && event.target.files[0];
+  if (event && event.target) event.target.value = ''; // allow re-picking the same file next time (no change event otherwise)
+  if (!file) return;
+  // Video-first: a cue list with no opened video has no fileKey, so nothing
+  // imported here could ever autosave — and the next "Open video" would
+  // silently wipe it (handleCaptionVideoFile always resets cues to []).
+  if (!captionEditorState.videoInfo) {
+    captionSetStatus('Open your video first — captions are saved with it.');
+    return;
+  }
+  const text = await file.text();
+  const parsed = captionParseCaptionText(text, file.name);
+  if (captionEditorState.cues.length > 0) {
+    captionEditorState.pendingImport = parsed;
+    document.getElementById('captionImportConfirmBanner').classList.add('visible');
+  } else {
+    captionApplyImport(parsed);
+  }
+}
+
+function captionConfirmImportUI() {
+  if (captionEditorState.pendingImport) captionApplyImport(captionEditorState.pendingImport);
+  captionEditorState.pendingImport = null;
+  document.getElementById('captionImportConfirmBanner').classList.remove('visible');
+}
+
+function captionCancelImportUI() {
+  captionEditorState.pendingImport = null;
+  document.getElementById('captionImportConfirmBanner').classList.remove('visible');
+}
+
+// ---- Opening a video ----
+
+async function handleCaptionVideoFile(file) {
+  if (!file) return;
+  const prevUrl = captionEditorState.videoInfo && captionEditorState.videoInfo.objectUrl;
+  const objectUrl = URL.createObjectURL(file);
+  if (prevUrl) URL.revokeObjectURL(prevUrl);
+
+  captionEditorState.videoInfo = { name: file.name, size: file.size, lastModified: file.lastModified, objectUrl };
+  captionEditorState.fileKey = captionFileKey(captionEditorState.videoInfo);
+  captionEditorState.cues = [];
+  captionEditorState.prologue = '';
+  captionEditorState.dirty = false;
+  captionEditorState.activeCueIndex = -1;
+  captionEditorState.pendingDraft = null;
+  captionEditorState.pendingImport = null;
+  document.getElementById('captionImportConfirmBanner').classList.remove('visible');
+
+  const video = document.getElementById('captionVideo');
+  video.src = objectUrl;
+  document.getElementById('captionVideoPlaceholder').classList.add('hidden');
+
+  const draft = await loadCaptionDraft(captionEditorState.fileKey);
+  if (draft) {
+    captionEditorState.pendingDraft = draft;
+    document.getElementById('captionDraftBanner').classList.add('visible');
+  } else {
+    captionEditorState.pendingDraft = null;
+  }
+  // Cues are already [] at this point either way (reset above) — render/
+  // preview unconditionally so a PREVIOUS video's rows never linger behind
+  // the draft-restore banner while the user decides Continue vs. Start fresh.
+  renderCueList();
+  scheduleCaptionPreviewUpdate();
+  captionSetStatus(`Opened ${file.name}.`);
+}
+
+function onCaptionVideoInputChange(event) {
+  const file = event && event.target && event.target.files && event.target.files[0];
+  if (event && event.target) event.target.value = ''; // allow re-picking the same file next time
+  if (file) handleCaptionVideoFile(file);
+}
+
+function onCaptionDragOver(event) { event.preventDefault(); }
+
+function onCaptionDrop(event) {
+  event.preventDefault();
+  const file = event.dataTransfer && event.dataTransfer.files && event.dataTransfer.files[0];
+  if (file) handleCaptionVideoFile(file);
+}
+
+function captionContinueDraftUI() {
+  if (captionEditorState.pendingDraft) {
+    captionEditorState.cues = captionEditorState.pendingDraft.cues || [];
+    captionEditorState.prologue = captionEditorState.pendingDraft.prologue || '';
+  }
+  captionEditorState.pendingDraft = null;
+  document.getElementById('captionDraftBanner').classList.remove('visible');
+  renderCueList();
+  scheduleCaptionPreviewUpdate();
+}
+
+// "Start fresh" — deletes the stored draft (never just hides the banner,
+// per spec: a stale draft left in IndexedDB would resurface next open).
+async function captionStartFreshUI() {
+  const fileKey = captionEditorState.fileKey;
+  captionEditorState.pendingDraft = null;
+  captionEditorState.cues = [];
+  captionEditorState.prologue = '';
+  document.getElementById('captionDraftBanner').classList.remove('visible');
+  await deleteCaptionDraft(fileKey);
+  renderCueList();
+  scheduleCaptionPreviewUpdate();
+}
+
+// ---- Seek-on-click + active-cue highlight ----
+
+function onCaptionCueRowClick(index) {
+  const cue = captionEditorState.cues[index];
+  if (!cue) return;
+  const video = document.getElementById('captionVideo');
+  video.currentTime = cue.start + 0.001; // tiny epsilon so playback lands inside the cue, not on its boundary
+}
+
+function onCaptionVideoTimeUpdate() {
+  const video = document.getElementById('captionVideo');
+  const t = video.currentTime;
+  const idx = captionEditorState.cues.findIndex((c) => t >= c.start && t < c.end);
+  if (idx !== captionEditorState.activeCueIndex) {
+    captionEditorState.activeCueIndex = idx;
+    updateActiveCueHighlight(); // NEVER renderCueList() here — see its comment: a full rebuild on every
+                                  // playhead tick would destroy an in-progress edit (uncommitted textarea
+                                  // text + focus) during transcribe-while-playing, the core workflow.
+  }
+}
+
+// ---- Draft persistence (IndexedDB 'captions' store, added in openDB above) ----
+
+async function saveCaptionDraft() {
+  if (!captionEditorState.fileKey) return null;
+  const record = {
+    fileKey: captionEditorState.fileKey,
+    cues: captionEditorState.cues,
+    prologue: captionEditorState.prologue,
+    updatedAt: Date.now(),
+  };
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('captions', 'readwrite');
+    tx.objectStore('captions').put(record);
+    tx.oncomplete = () => { db.close(); resolve(record); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+async function loadCaptionDraft(fileKey) {
+  if (!fileKey) return null;
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('captions', 'readonly');
+    const req = tx.objectStore('captions').get(fileKey);
+    req.onsuccess = () => { db.close(); resolve(req.result || null); };
+    req.onerror = () => { db.close(); reject(req.error); };
+  });
+}
+
+async function deleteCaptionDraft(fileKey) {
+  if (!fileKey) return;
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('captions', 'readwrite');
+    tx.objectStore('captions').delete(fileKey);
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+  });
+}
+
+let captionAutosaveTimer = null;
+// Debounced ~1s per spec. No beforeunload hook was added for this (deliberate
+// — see BUILD_LOG v1.18: the IndexedDB draft IS the safety net here, same
+// philosophy as the recording pipeline's crash recovery).
+function scheduleCaptionAutosave() {
+  if (captionAutosaveTimer) clearTimeout(captionAutosaveTimer);
+  captionAutosaveTimer = setTimeout(() => {
+    captionAutosaveTimer = null;
+    saveCaptionDraft().catch(() => { /* best-effort; the user's edits stay in captionEditorState regardless */ });
+  }, 1000);
+}
+
+// ---- Live caption preview (debounced ~300ms per spec) ----
+
+let captionPreviewTimer = null;
+let captionPreviewTrackUrl = null;
+
+// NOTE: `track.mode` (on the HTMLTrackElement itself) is not a real property
+// — the browser's actual on/off state lives on `track.track` (the TextTrack
+// object the element exposes once it's attached to a <video> in a live
+// document). Setting the element property directly is a silent no-op that
+// does nothing to whether captions render. The `default` attribute in the
+// markup is belt-and-braces for the same outcome. This can only be verified
+// in a real browser — the test harness's <track> mock has no TextTrack
+// object to check, so covering "captions actually render" is a manual
+// acceptance-pass item, not a harness assertion.
+function updateCaptionPreviewTrackNow() {
+  const track = document.getElementById('captionPreviewTrack');
+  const vtt = captionPreviewVTT();
+  const blob = new Blob([vtt], { type: 'text/vtt' });
+  const url = URL.createObjectURL(blob);
+  const oldUrl = captionPreviewTrackUrl;
+  captionPreviewTrackUrl = url;
+  track.src = url;
+  if (track.track) track.track.mode = 'showing';
+  if (oldUrl) URL.revokeObjectURL(oldUrl);
+}
+
+function scheduleCaptionPreviewUpdate() {
+  if (captionPreviewTimer) clearTimeout(captionPreviewTimer);
+  captionPreviewTimer = setTimeout(() => {
+    captionPreviewTimer = null;
+    updateCaptionPreviewTrackNow();
+  }, 300);
+}
+
+// ---- Add caption / render ----
+
+function onAddCaptionClick() {
+  // Video-first: a cue with no opened video has no fileKey to autosave
+  // under, and the next "Open video" would silently discard it anyway
+  // (handleCaptionVideoFile always resets cues to [] on open).
+  if (!captionEditorState.videoInfo) {
+    captionSetStatus('Open your video first — captions are saved with it.');
+    return;
+  }
+  const video = document.getElementById('captionVideo');
+  const t = (video && typeof video.currentTime === 'number') ? video.currentTime : 0;
+  captionAddCue(t);
+  scheduleCaptionAutosave();
+  scheduleCaptionPreviewUpdate();
+  renderCueList();
+}
+
+// Row elements from the last renderCueList(), indexed the same as
+// captionEditorState.cues — lets updateActiveCueHighlight() below toggle
+// the .active class without asking the DOM to enumerate its own children
+// (the mock doesn't support that, and a real browser doesn't need to).
+let captionCueRowEls = [];
+
+// Rebuilds the cue list DOM from captionEditorState.cues — the only place
+// that reads editor state back onto the page. Every mutation (add/delete/
+// time edit/text edit) goes through the small functions above first; this
+// function never contains cue-editing logic itself.
+//
+// STRUCTURAL changes only (add/delete/import/draft-restore/a time edit that
+// re-sorts the list). Never call this from the video's timeupdate handler —
+// rebuilding every row on every playhead tick would blow away an
+// in-progress edit (textareas commit on blur, so a full re-render mid-typing
+// loses both the uncommitted text AND focus) during transcribe-while-playing,
+// which is the core workflow this editor exists for. Active-cue highlighting
+// during playback goes through updateActiveCueHighlight() instead, which
+// only toggles a class on rows that already exist.
+function renderCueList() {
+  const container = document.getElementById('captionCueList');
+  container.innerHTML = '';
+  captionCueRowEls.length = 0; // clear in place (not reassigned) so an external reference to this array stays valid
+  captionEditorState.cues.forEach((cue, index) => {
+    const row = document.createElement('div');
+    row.className = 'caption-cue-row';
+    row.onclick = () => onCaptionCueRowClick(index);
+
+    const startInput = document.createElement('input');
+    startInput.className = 'caption-time-input';
+    startInput.value = formatCaptionTimestamp(cue.start, '.');
+    startInput.onclick = (e) => { e.stopPropagation(); };
+    startInput.onchange = (e) => {
+      const res = captionUpdateCueTime(index, 'start', e.target.value);
+      if (!res.ok) showError(res.message || "That time couldn't be read — it was left unchanged.");
+      scheduleCaptionAutosave();
+      renderCueList(); // a time edit reorders the list, and the input is already committed — a full render is safe here
+    };
+
+    const endInput = document.createElement('input');
+    endInput.className = 'caption-time-input';
+    endInput.value = formatCaptionTimestamp(cue.end, '.');
+    endInput.onclick = (e) => { e.stopPropagation(); };
+    endInput.onchange = (e) => {
+      const res = captionUpdateCueTime(index, 'end', e.target.value);
+      if (!res.ok) showError(res.message || "That time couldn't be read — it was left unchanged.");
+      scheduleCaptionAutosave();
+      renderCueList();
+    };
+
+    const textArea = document.createElement('textarea');
+    textArea.className = 'caption-cue-text';
+    textArea.value = cue.text;
+    textArea.onclick = (e) => { e.stopPropagation(); };
+    textArea.onchange = (e) => {
+      captionUpdateCueText(index, e.target.value);
+      scheduleCaptionAutosave();
+      scheduleCaptionPreviewUpdate();
+    };
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn-delete-cue';
+    delBtn.textContent = 'Delete';
+    delBtn.onclick = (e) => {
+      e.stopPropagation();
+      captionDeleteCue(index);
+      scheduleCaptionAutosave();
+      scheduleCaptionPreviewUpdate();
+      renderCueList();
+    };
+
+    row.appendChild(startInput);
+    row.appendChild(endInput);
+    row.appendChild(textArea);
+    row.appendChild(delBtn);
+    container.appendChild(row);
+    captionCueRowEls.push(row);
+  });
+  updateActiveCueHighlight();
+}
+
+// Toggles ONLY the .active class (and scrolls the newly-active row into
+// view) — never rebuilds rows. This is what video timeupdate calls, so a
+// caption can be highlighted as it plays without disturbing whatever the
+// user is mid-typing in another row's textarea.
+function updateActiveCueHighlight() {
+  captionCueRowEls.forEach((row, index) => {
+    const isActive = index === captionEditorState.activeCueIndex;
+    row.classList.toggle('active', isActive);
+    if (isActive && typeof row.scrollIntoView === 'function') {
+      row.scrollIntoView({ block: 'nearest' });
+    }
+  });
+}
+
+function captionSetStatus(msg) {
+  const el = document.getElementById('captionStatus');
+  el.textContent = msg || '';
+}
+
+// ---- Export ----
+
+// Sidecar naming: the opened video's filename with its extension replaced
+// (recording.webm -> recording.vtt / recording.srt). Falls back to a plain
+// 'captions' base if no video has been opened (shouldn't normally happen —
+// export buttons only make sense once a video is open — but keeps the
+// function total instead of throwing).
+function captionExportFilename(name, ext) {
+  const base = (name || 'captions').replace(/\.[^./\\]+$/, '');
+  return base + '.' + ext;
+}
+
+// Same FSA-picker-or-download fork saveFile() uses (reusing startDownload
+// as-is, per spec). Export never deletes the IndexedDB draft on ANY path —
+// cheap insurance in case the exported file is lost or the user wants to
+// keep editing (see BUILD_LOG v1.18).
+async function captionExport(format) {
+  const ext = format === 'srt' ? 'srt' : 'vtt';
+  const text = ext === 'srt'
+    ? serializeSRT({ cues: captionEditorState.cues })
+    : serializeVTT({ cues: captionEditorState.cues, prologue: captionEditorState.prologue });
+  const mime = ext === 'srt' ? 'application/x-subrip' : 'text/vtt';
+  const blob = new Blob([text], { type: mime });
+  const videoName = (captionEditorState.videoInfo && captionEditorState.videoInfo.name) || 'captions.webm';
+  const suggestedName = captionExportFilename(videoName, ext);
+
+  if ('showSaveFilePicker' in window) {
+    let handle;
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName,
+        types: [{
+          description: ext === 'srt' ? 'SubRip Captions' : 'WebVTT Captions',
+          accept: ext === 'srt' ? { 'application/x-subrip': ['.srt'] } : { 'text/vtt': ['.vtt'] },
+        }],
+      });
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        // Cancel is not an error — quiet status note, draft untouched.
+        updateStatus('idle', 'Save cancelled — your caption edits are still here.');
+        return 'cancelled';
+      }
+      throw err;
+    }
+    try {
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      captionEditorState.dirty = false;
+      updateStatus('idle', "Captions saved next to your video's name.");
+      return 'saved';
+    } catch (err) {
+      showError("Couldn't save the captions file. Your edits are still in the editor — try saving again.");
+      return 'error';
+    }
+  }
+
+  // startDownload() posts its own generic "Downloaded — check your Downloads
+  // folder" note to the main status bar (unverified-arrival copy, same as
+  // the recording save path) — but that's the ONLY feedback this branch
+  // would otherwise give, and it never mentions captions or the draft at
+  // all. Add an editor-local, caption-specific line so a Firefox user isn't
+  // left wondering whether anything happened.
+  startDownload(blob, suggestedName);
+  captionSetStatus('Your captions file was sent to the browser as a download. Your edits also stay saved here.');
+  return 'downloaded';
+}
+
+function onExportCaptionsClick(format) {
+  captionExport(format).catch((err) => {
+    showError("Couldn't save the captions file. Your edits are still in the editor — try saving again.");
+  });
+}
+
+// ---- Mode switching ----
+
+function setRecorderControlsVisible(visible) {
+  const disp = visible ? '' : 'none';
+  document.getElementById('previewContainer').style.display = disp;
+  document.getElementById('statusBar').style.display = disp;
+  document.getElementById('controlsBar').style.display = disp;
+}
+
+function openCaptionEditor() {
+  if (state.recording) {
+    showError('Finish or stop the current recording before opening the caption editor.');
+    return;
+  }
+  captionEditorState.active = true;
+  setRecorderControlsVisible(false);
+  document.getElementById('captionEditor').classList.add('visible');
+}
+
+function closeCaptionEditor() {
+  captionEditorState.active = false;
+  document.getElementById('captionEditor').classList.remove('visible');
+  setRecorderControlsVisible(true);
+  // Hiding the pane doesn't stop the <video> — without this, going "Back to
+  // recorder" mid-playback leaves it playing (and its audio audible) behind
+  // the hidden editor. Guarded for the test mock, which has no pause().
+  const video = document.getElementById('captionVideo');
+  if (video && typeof video.pause === 'function') video.pause();
 }
 
 // ============================================================

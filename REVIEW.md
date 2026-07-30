@@ -245,29 +245,77 @@ field note), so saves take the verified picker path that never needed the bar.
 
 ## Caption editor: Tier 1 accessibility work begins (2026-07-29)
 
-### 18. Caption editor with VTT/SRT import/export — Tier 1, highest-value open item — IN PROGRESS, foundation shipped v1.17
-Highest-value open item per the Tier 1 feature map above (ADA Title II deadlines).
-Scoped across at least two versions to keep each one reviewable: v1.17 ships the
-foundation layer only (parser/serializer/timestamp utils + tests — zero UI, zero
-DOM, zero changes to the recording pipeline or any existing function); the editor
-surface itself — approved plan is the open-a-file editor model (open a .vtt/.srt
-file, edit cues against the recording, export) rather than an inline overlay —
-lands in v1.18.
+### 18. Caption editor with VTT/SRT import/export — Tier 1, highest-value open item — editor surface shipped v1.18
+
+Foundation (v1.17: pure parse/format/serialize logic) and the editor UI
+(v1.18: the open-a-file editor model — open a `.webm`, edit cues against
+playback with live caption preview, export a `.vtt`/`.srt` sidecar) are both
+now shipped. v1.18 added: mode switching (a "Caption editor" button that
+hides the recorder UI and shows the editor pane, refused with plain-language
+copy while a recording is in progress); open video (file picker + drag-and-
+drop) and import captions (`.vtt`/`.srt`, replace-confirmation banner over a
+non-empty list, partial-import messaging); a cue list (add/delete/edit
+start/end/text, sorted by start, seek-on-click, active-cue highlight during
+playback) built on small testable functions that never touch the DOM
+directly; a live `<track>` preview regenerated from the same `serializeVTT`
+the export path uses; IndexedDB-backed draft autosave (`DB_VERSION` 2, new
+`captions` store, guarded upgrade that leaves `sessions`/`chunks` untouched)
+with a restore-or-start-fresh banner (never a blocking `confirm()`); and
+export via the same FSA-picker-or-download fork `saveFile()` uses, naming the
+sidecar after the video (`lecture.webm` → `lecture.vtt`/`.srt`) and never
+deleting the draft on export.
 
 **v1.17 foundation:** `parseCaptionTimestamp`/`formatCaptionTimestamp` (HH:MM:SS.mmm
 and MM:SS.mmm, `.`/`,` separators, correct ms-rounding carry); `parseVTT`/`parseSRT`
 (BOM/CRLF-tolerant, one bad cue never aborts the file — `skipped` counts malformed
 blocks; VTT keeps cue-settings verbatim where the surveyed prior art discards them;
 VTT prologue NOTE/STYLE/REGION preserved for round-trip); `detectCaptionFormat`;
-`serializeVTT`/`serializeSRT` (SRT renumbers on export, ids never reused). Harness
-98 scenarios / 566 assertions (new CE–CP), all pre-existing scenarios pass
-unchanged. Orchestrator review caught three tolerance gaps in the first draft
+`serializeVTT`/`serializeSRT` (SRT renumbers on export, ids never reused).
+Orchestrator review caught three tolerance gaps in the v1.17 first draft
 (multi-line WEBVTT header blocks, whitespace-only separator lines, one-digit
 hours) — fixed and test-locked.
 
-**Still open:** the actual editor UI (v1.18) — file open/import, cue list/timeline
-editing, export — plus chapter-marker hotkeys and the sidecar export convention
-(Tier 1 remainder, unchanged from the feature map above).
+An orchestrator review pass caught eight defects in the v1.18 first draft
+before ship, headlined by a timeupdate handler that was full-rebuilding the
+cue list on every tick (destroying in-progress, uncommitted caption text
+mid-typing during the core transcribe-while-playing workflow), missing
+end>start validation on cue-time edits, and a `TextTrack.mode` no-op that
+meant the live preview had no guaranteed way to actually turn captions on.
+All eight fixed and test-locked (one — the `TextTrack` fix — is a manual-only
+acceptance check; the harness has no `TextTrack` object to assert against).
+Harness now 115 scenarios / 649 assertions (CQ–CZ then DA–DH), all
+pre-existing assertions unchanged.
+
+**Still open (v1.19 remainder, unchanged scope from the feature map):**
+keyboard shortcuts, split/merge cues, and chapter-marker hotkeys — plus the
+owner's browser acceptance pass for v1.18 itself (manual test list in
+BUILD_LOG's Testing section).
+
+## User documentation (queued 2026-07-29)
+
+### 19. End-user instructions + README refresh — queued for when the feature set stabilizes
+Owner-requested (2026-07-29): once the remaining pieces land (or are
+explicitly descoped — the caption editor's fate is under evaluation), write
+the user-facing documentation. Two deliverables:
+
+1. **README refresh** — it has drifted badly: still says "Works in Chrome and
+   Edge on Windows" and "File System Access API required" (Firefox has been
+   the PRIMARY browser since v1.9, with the anchor-download fallback); the
+   feature list predates pause/resume, recording-quality settings, mic noise
+   suppression, honest device labels, and the entire caption editor; the
+   Usage section still contains a `[your-github-pages-url]` placeholder.
+2. **Faculty-facing usage guide** — plain-language instructions for the
+   actual audience (non-technical faculty): recording basics (Select Screen,
+   source toggles, quality), pause/resume, what crash recovery looks like and
+   what to click, Continue Recording, how saving differs by browser (save
+   dialog vs. download + confirm bar), captions (the import → fix → export
+   sidecar workflow, if the editor is kept), and the file:// Chrome
+   device-name caveat in user terms. Faculty tone throughout: what to click,
+   never how it works. Decide placement when written: README section,
+   separate guide file, and/or a lightweight in-app help affordance.
+
+Not started — deliberately last in the queue so it documents the final shape
+instead of chasing a moving one.
 
 ---
 
