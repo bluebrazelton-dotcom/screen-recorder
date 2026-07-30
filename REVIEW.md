@@ -418,6 +418,18 @@ cluster-bound (~7.5s there) — queued as #22. Remaining: session 3 —
 integration + the rest of the v1.20 manual acceptance list (items 4–13,
 plus Chrome), which pairs with #20.
 
+**Session 3 started (2026-07-30, v1.20.1):** a pre-acceptance code audit of
+manual items 4–13 + the Chrome-divergence surface (Sonnet audit,
+orchestrator-verified) found 1 blocker — Undo re-record restored the stale
+pre-review `priorSegments`, silently dropping the just-reviewed segment
+from the next save; scenario DO had test-locked the wrong semantics via a
+sentinel — and 1 hardening gap (`reviewSaveAsIs` / `reviewDiscardConfirmed`
+/ `undoReRecord` were unguarded, the same silent-dead-click class v1.20's
+Firefox pass exposed in `reviewCutFromHere`). Both fixed and test-pinned
+(DO corrected, DT added; harness 127 scenarios / 831 assertions). Items
+5–13 + Chrome branches audited clean in code. Still owed: the owner's
+real-browser pass of items 4–13, Firefox first, then the full Chrome pass.
+
 ### 22. Block-precision re-record cut (queued 2026-07-30)
 
 Firefox's ~7.5s clusters make Rule-A's cluster-boundary cut precision ~7.5s

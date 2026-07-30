@@ -1537,6 +1537,61 @@ remaining v1.20 manual list items fold into session 3 / #20.
 
 ---
 
+### v1.20.1 — Re-record from a timestamp (#21), session 3 pre-acceptance fixes: Undo chain restore + review-pane handler hardening (2026-07-30)
+
+**Commit:** `#21 session 3 pre-acceptance: fix Undo re-record dropping the reviewed segment; harden reviewSaveAsIs/reviewDiscardConfirmed/undoReRecord`
+
+Found by the session-3 code audit run BEFORE the owner's manual pass of the
+v1.20 list (items 4–13 + Chrome) — the audit traced each item's code path
+so browser time isn't spent discovering catchable defects.
+
+1. **Undo re-record blocker (manual item 4).** `reviewCutFromHere`
+   snapshotted `state.priorSegments` for undo — a value that is stale for
+   the entire life of the review pane, because in review mode
+   `finalizeRecording` hands the just-stopped session to `openReviewPane`
+   without ever writing it into `priorSegments`. So cut → Undo → record →
+   Stop & save saved ONLY the new take; the original survived just as an
+   orphaned `completed:false` session that resurfaces as a recovery banner
+   after a reload. Fix: the undo record now stores the pane's full segment
+   list (`restoreSegments: segments.slice()`), making undo's semantics
+   "exactly as if you'd clicked Back to recorder instead of cutting" —
+   plus the existing exact marker/discard restoration. The non-undo path
+   (`priorSegments = keptSegments`) is untouched. The harness had missed
+   this because scenario DO pinned the snapshot/restore mechanism with a
+   sentinel value — it test-locked the wrong semantics; its two undo
+   assertions now pin the full-chain restore.
+2. **Handler hardening (the v1.20 silent-dead-click class).**
+   `reviewSaveAsIs`, `reviewDiscardConfirmed`, and `undoReRecord` were
+   bare async onclick handlers with no try/catch — the same gap that bit
+   the owner's first v1.20 Firefox pass, where `reviewCutFromHere` got
+   hardened and these three didn't. All three now follow its pattern:
+   save-as-is failure keeps the pane open ("Save failed: … Your recording
+   is still here — try Save as is again."); discard failure surfaces
+   "Couldn't finish discarding the recording. Try Discard recording
+   again." (copy deliberately doesn't claim "nothing was deleted" — a
+   partial failure may have deleted some sessions; the ops are idempotent
+   so retry completes the job); undo failure reports through the
+   recorder-level error banner (the pane is closed by then) and does NOT
+   consume `reviewState.undo` or hide the button, so a retry works.
+
+**Tests:** DO updated to the corrected undo semantics; new scenario DT
+(after DS) pins all three hardened handlers, including the
+failed-undo-then-successful-retry cycle. No seam/duration math changed —
+AL/AM/AN's pinned literals untouched. Harness: **127 scenarios / 831
+assertions** (was 126/812).
+
+**Audit result for the rest of the list:** items 5–13 and the
+Chrome-divergence surface (AbortError cancel detection at every FSA call
+site, seam math shared — not branched — across cluster sizes) audited
+clean in code. The owner's manual pass items 4–13 + full Chrome pass are
+still owed — real-browser behavior stays invisible to the harness.
+
+**No changes to** the live recording pipeline or any save flow's byte
+behavior (the save/discard logic bodies were wrapped, not modified —
+differentials unchanged).
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.

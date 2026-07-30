@@ -3491,12 +3491,15 @@ Real cue text
   });
 
   // DO — cut application + undo
-  await scenario('DO cut application + undo: marker set on the right session, later segments flagged discarded, priorSegments reduced; undo restores everything exactly (including a pre-existing marker); startOver and noop change nothing without confirmation', async () => {
+  await scenario('DO cut application + undo: marker set on the right session, later segments flagged discarded, priorSegments reduced; undo arms the full reviewed chain (same as Back to recorder), restoring markers/discards exactly (including a pre-existing marker); startOver and noop change nothing without confirmation', async () => {
     const buf0 = syntheticWebm(), buf1 = syntheticWebm();
     const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
     const ids = await seedSegments([buf0, buf1]);
     const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }, { sessionId: ids[1], mimeType: 'video/webm' }];
-    // A recognizable pre-cut priorSegments value undo must restore EXACTLY.
+    // A sentinel deliberately DIFFERENT from `segments` — undo must arm the
+    // full pane chain (segments itself), not whatever priorSegments held
+    // before the cut, so an assertion that matches `segments` (and not this
+    // sentinel) actually distinguishes the two behaviors.
     const priorBefore = [{ sessionId: 'zzz-unrelated', mimeType: 'video/webm' }];
     const offset1 = seamOffset(scan0);
 
@@ -3530,7 +3533,8 @@ Real cue text
     sessions = await readStore('sessions');
     const s1u = sessions.find((x) => x.id === ids[1]);
     assert(s1u.cutAtByte === undefined && s1u.cutAtMs === undefined, 'undo clears the marker (no earlier marker existed)');
-    assert(state.priorSegments.length === 1 && state.priorSegments[0].sessionId === 'zzz-unrelated', 'undo restores priorSegments to its exact pre-cut value');
+    assert(state.priorSegments.length === 2 && state.priorSegments[0].sessionId === ids[0] && state.priorSegments[1].sessionId === ids[1],
+      'undo arms the full pane chain (both segments), same as Back to recorder — not the stale pre-review priorSegments value');
     assert(documentMock.getElementById('btnUndoReRecord').style.display === 'none', 'the Undo button hides itself after use');
     assert(api.reviewState.undo === null, 'the undo record is consumed');
 
@@ -3580,7 +3584,8 @@ Real cue text
     await S.undoReRecord();
     sessions = await readStore('sessions');
     assert(sessions.find((x) => x.id === ids[1]).discarded === undefined, 'undo un-discards exactly the session this cut discarded');
-    assert(state.priorSegments.length === 1 && state.priorSegments[0].sessionId === 'zzz-unrelated', 'undo restores priorSegments to its pre-cut value again');
+    assert(state.priorSegments.length === 2 && state.priorSegments[0].sessionId === ids[0] && state.priorSegments[1].sessionId === ids[1],
+      'undo of a whole-segment discard also arms the full pane chain (both segments), same as Back to recorder');
 
     // ---- startOver: shows the in-pane confirm, changes nothing until confirmed ----
     state.priorSegments = priorBefore.slice();
@@ -3835,6 +3840,107 @@ Real cue text
       assert(Buffer.compare(got, want) === 0,
         'DSd: cut-then-stitch (long-cluster) === stitchOracle([buf0.slice(0,cut), buf1]) (' + got.length + ' vs ' + want.length + ' bytes)');
       assertNoOverlap(got, 'DSd cut-then-stitch output');
+    }
+  });
+
+  // DT — hardening for the three previously-unguarded review-pane handlers
+  // (reviewSaveAsIs, reviewDiscardConfirmed, undoReRecord): a click on any of
+  // them must never die silently, same rule DR already pins for
+  // reviewCutFromHere. A caught failure surfaces a plain message and leaves
+  // state exactly as it was before the click — nothing is deleted or consumed
+  // on the failing path, so a retry after the fault clears is safe.
+  await scenario('DT hardening for reviewSaveAsIs/reviewDiscardConfirmed/undoReRecord: a save-path failure keeps the pane open and deletes nothing; a discard failure surfaces a message and deletes nothing; an undo failure keeps the undo record and button so a retry succeeds', async () => {
+    // ---- (a) reviewSaveAsIs: saveFile throws (a real write failure, not a cancel) ----
+    {
+      const buf = syntheticWebm();
+      const ids = await seedSegments([buf]);
+      api.reviewState.segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+      api.reviewState.active = true;
+      documentMock.getElementById('reviewPane').classList.add('visible');
+      const origSaveFile = sandbox.saveFile;
+      sandbox.saveFile = async () => { throw new Error('disk error'); };
+      let escaped = false;
+      try { await S.reviewSaveAsIs(); } catch (e) { escaped = true; }
+      sandbox.saveFile = origSaveFile;
+      assert(escaped === false, 'the error never escapes the click handler');
+      assert(/Save failed:.*disk error.*still here/i.test(documentMock.getElementById('reviewStatus').textContent),
+        'the failure is surfaced in the pane\'s own status line, matching the "your recording is still here" copy convention');
+      assert(api.reviewState.active === true && documentMock.getElementById('reviewPane').classList.contains('visible') === true,
+        'the pane stays open after a caught save failure');
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 1 && sessions[0].id === ids[0], 'nothing is deleted on a failed save-as-is');
+      S.closeReviewPane();
+      await api.deleteSession(ids[0]);
+    }
+
+    // ---- (b) reviewDiscardConfirmed: deleteSession throws ----
+    {
+      const buf = syntheticWebm();
+      const ids = await seedSegments([buf]);
+      api.reviewState.segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+      api.reviewState.active = true;
+      documentMock.getElementById('reviewPane').classList.add('visible');
+      documentMock.getElementById('reviewDiscardConfirm').classList.add('visible');
+      const origDeleteSession = sandbox.deleteSession;
+      sandbox.deleteSession = async () => { throw new Error('tx aborted'); };
+      let escaped = false;
+      try { await S.reviewDiscardConfirmed(); } catch (e) { escaped = true; }
+      sandbox.deleteSession = origDeleteSession;
+      assert(escaped === false, 'the error never escapes the click handler');
+      assert(/Couldn't finish discarding/i.test(documentMock.getElementById('reviewStatus').textContent),
+        'the failure is surfaced in the pane, never silent');
+      assert(documentMock.getElementById('reviewDiscardConfirm').classList.contains('visible') === false,
+        'the confirm banner (hidden unconditionally, before the try) stays hidden regardless of the failure');
+      assert(api.reviewState.active === true && documentMock.getElementById('reviewPane').classList.contains('visible') === true,
+        'the pane itself stays open after a caught failure');
+      const sessions = await readStore('sessions');
+      assert(sessions.length === 1 && sessions[0].id === ids[0], 'nothing is deleted on a failed discard');
+      S.closeReviewPane();
+      await api.deleteSession(ids[0]);
+    }
+
+    // ---- (c) undoReRecord: clearSessionCut throws — the undo record + button survive for a retry, and the retry succeeds once the fault clears ----
+    {
+      const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+      const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+      const ids = await seedSegments([buf0, buf1]);
+      const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }, { sessionId: ids[1], mimeType: 'video/webm' }];
+      api.reviewState.segments = segments;
+      api.reviewState.scans = [scan0, scan1];
+      api.reviewState.scansOk = true;
+      const offset1 = seamOffset(scan0);
+      const T = offset1 + midTs(scan1.clusters[1].timestamp, scan1.clusters[2].timestamp);
+      documentMock.getElementById('reviewVideo').currentTime = T / 1000;
+      documentMock.getElementById('reviewPane').classList.add('visible');
+      state.priorSegments = [];
+
+      await S.reviewCutFromHere();
+      assert(documentMock.getElementById('btnUndoReRecord').style.display === '', 'precondition: the cut armed the Undo affordance');
+      const undoRecordBefore = api.reviewState.undo;
+
+      const origClearSessionCut = sandbox.clearSessionCut;
+      sandbox.clearSessionCut = async () => { throw new Error('tx aborted'); };
+      let escaped = false;
+      try { await S.undoReRecord(); } catch (e) { escaped = true; }
+      assert(escaped === false, 'the error never escapes the click handler');
+      assert(recordedErrors.some((m) => /Couldn't undo the re-record/.test(m)),
+        'the failure is surfaced via the recorder-level error banner (the pane is already closed at this point, not reviewSetStatus)');
+      assert(api.reviewState.undo === undoRecordBefore, 'the undo record is NOT consumed by a failed undo — a retry stays possible');
+      assert(documentMock.getElementById('btnUndoReRecord').style.display === '', 'the Undo button stays visible after a failed undo');
+      let sessions = await readStore('sessions');
+      assert(sessions.find((x) => x.id === ids[1]).cutAtByte !== undefined, 'the cut marker is untouched by the failed undo');
+
+      // Retry once the fault clears — should succeed and consume the record.
+      sandbox.clearSessionCut = origClearSessionCut;
+      await S.undoReRecord();
+      sessions = await readStore('sessions');
+      assert(sessions.find((x) => x.id === ids[1]).cutAtByte === undefined, 'the retried undo clears the marker');
+      assert(state.priorSegments.length === 2 && state.priorSegments[0].sessionId === ids[0] && state.priorSegments[1].sessionId === ids[1],
+        'the retried undo arms the full pane chain, same as a normal undo');
+      assert(api.reviewState.undo === null, 'the undo record is consumed once the retry succeeds');
+      assert(documentMock.getElementById('btnUndoReRecord').style.display === 'none', 'the Undo button hides itself once the retry succeeds');
+
+      for (const id of ids) { try { await api.deleteSession(id); } catch (e) {} }
     }
   });
 

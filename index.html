@@ -5516,13 +5516,22 @@ function requestReviewDiscard() {
 // the whole recording regardless of any cut made during this review) and
 // reset to a clean idle state.
 async function reviewDiscardConfirmed() {
+  // try/catch: hideReviewDiscardConfirm() below runs first regardless, so a
+  // failure partway through must still say something — otherwise the user is
+  // left staring at the pane with the confirm banner gone and no feedback,
+  // the exact silent-in-between state this whole hardening pass targets.
   hideReviewDiscardConfirm();
-  for (const seg of reviewState.segments) await deleteSession(seg.sessionId);
-  await deleteDiscardedSessions();
-  state.priorSegments = [];
-  reviewState.undo = null;
-  closeReviewPane();
-  resetUI();
+  try {
+    for (const seg of reviewState.segments) await deleteSession(seg.sessionId);
+    await deleteDiscardedSessions();
+    state.priorSegments = [];
+    reviewState.undo = null;
+    closeReviewPane();
+    resetUI();
+  } catch (err) {
+    console.error('Discard recording failed:', err);
+    reviewSetStatus("Couldn't finish discarding the recording. Try Discard recording again.");
+  }
 }
 
 // "Back to recorder": nothing was cut, so nothing is discarded — every
@@ -5592,7 +5601,13 @@ async function reviewCutFromHere() {
     reviewState.undo = {
       cutSessionId, hadPrevMarker, prevCutAtByte, prevCutAtMs,
       discardedSessionIds: discardedIds,
-      priorSegmentsBefore: state.priorSegments.slice(),
+      // NOT state.priorSegments.slice() — that value is stale for the whole
+      // life of the pane (openReviewPane never writes it back; see
+      // finalizeRecording's [...state.priorSegments, current] construction).
+      // Undo has to arm the FULL pane chain, exactly what reviewBackToRecorder
+      // would set — segments is reviewState.segments itself here, so this is
+      // reviewState.segments.slice() by another name.
+      restoreSegments: segments.slice(),
     };
     state.priorSegments = keptSegments;
     closeReviewPane();
@@ -5605,23 +5620,38 @@ async function reviewCutFromHere() {
   }
 }
 
-// Full, lossless restore of what a cut just changed — the tail bytes were
-// never touched (truncation is metadata, not byte-surgery), so undo is
-// exact: a re-cut's PREVIOUS marker is restored verbatim (never cleared),
-// and only the sessions THIS cut discarded are un-discarded (sessions
-// discarded by an earlier cut stay discarded).
+// Undo arms the FULL reviewed chain again — exactly as if the user had
+// clicked "Back to recorder" instead of cutting, not a restore of whatever
+// state.priorSegments happened to hold before the review pane opened (that
+// value never included the segment being reviewed in the first place). The
+// tail bytes were never touched (truncation is metadata, not byte-surgery),
+// so the marker/discard side of this is exact: a re-cut's PREVIOUS marker is
+// restored verbatim (never cleared), and only the sessions THIS cut
+// discarded are un-discarded (sessions discarded by an earlier cut stay
+// discarded). try/catch: the metadata ops below are plain read-modify-put,
+// so a failure here is safe to retry — reviewState.undo and the button stay
+// in place instead of being consumed, unlike a success.
 async function undoReRecord() {
   const u = reviewState.undo;
   if (!u) return;
-  if (u.cutSessionId) {
-    if (u.hadPrevMarker) await setSessionCut(u.cutSessionId, u.prevCutAtByte, u.prevCutAtMs);
-    else await clearSessionCut(u.cutSessionId);
+  try {
+    if (u.cutSessionId) {
+      if (u.hadPrevMarker) await setSessionCut(u.cutSessionId, u.prevCutAtByte, u.prevCutAtMs);
+      else await clearSessionCut(u.cutSessionId);
+    }
+    for (const id of u.discardedSessionIds) await setSessionDiscarded(id, false);
+    state.priorSegments = u.restoreSegments;
+    reviewState.undo = null;
+    document.getElementById('btnUndoReRecord').style.display = 'none';
+    resetUI();
+  } catch (err) {
+    console.error('Undo re-record failed:', err);
+    // Runs from the idle state the cut landed in (the review pane is already
+    // closed) — reviewSetStatus would write into a hidden pane, so this goes
+    // through the recorder-level error banner instead, same as every other
+    // idle-state failure (finalizeRecording, discardRecovery).
+    showError("Couldn't undo the re-record. Try Undo re-record again.");
   }
-  for (const id of u.discardedSessionIds) await setSessionDiscarded(id, false);
-  state.priorSegments = u.priorSegmentsBefore;
-  reviewState.undo = null;
-  document.getElementById('btnUndoReRecord').style.display = 'none';
-  resetUI();
 }
 
 // "Save as is": the SAME save path a normal Stop & save would have used from
@@ -5631,37 +5661,47 @@ async function undoReRecord() {
 // a successful cut always closes the pane before this can run, so there is
 // no cut to apply first.
 async function reviewSaveAsIs() {
-  const segments = reviewState.segments;
-  let result;
-  if (segments.length === 1) {
-    result = await saveFile({ kind: 'session', sessionId: segments[0].sessionId, mimeType: segments[0].mimeType });
-  } else {
-    // Mirrors stitchAndSave's own (implicit-default) naming convention explicitly.
-    result = await saveSessionsStreamedStitch(segments, `recording-${formatDateForFilename()}.webm`);
-    if (result === 'bail') {
+  // try/catch: a click here must never die silently (same rule as
+  // reviewCutFromHere). saveFile/saveSessionsStreamedStitch rethrow any
+  // non-cancel failure (a real write/IO error) — nothing here is deleted
+  // until a 'saved'/'downloaded' result is actually observed, so the
+  // recording is intact either way; the pane just has to say so.
+  try {
+    const segments = reviewState.segments;
+    let result;
+    if (segments.length === 1) {
+      result = await saveFile({ kind: 'session', sessionId: segments[0].sessionId, mimeType: segments[0].mimeType });
+    } else {
+      // Mirrors stitchAndSave's own (implicit-default) naming convention explicitly.
+      result = await saveSessionsStreamedStitch(segments, `recording-${formatDateForFilename()}.webm`);
+      if (result === 'bail') {
+        closeReviewPane();
+        resetUI();
+        offerStitchFallback(segments);
+        return;
+      }
+    }
+
+    if (result === 'saved') {
+      for (const seg of segments) await deleteSession(seg.sessionId);
+      await deleteDiscardedSessions();
+      state.priorSegments = [];
+      reviewState.undo = null;
       closeReviewPane();
       resetUI();
-      offerStitchFallback(segments);
-      return;
+    } else if (result === 'downloaded') {
+      offerDownloadConfirm(segments.map(s => s.sessionId), 1);
+      closeReviewPane();
+      resetUI();
+    } else {
+      // Cancelled: unlike a normal Stop & save cancel, the user is still
+      // mid-review with nothing lost — stay in the pane instead of dumping
+      // them back to the recorder.
+      reviewSetStatus('Save cancelled — your recording is still here.');
     }
-  }
-
-  if (result === 'saved') {
-    for (const seg of segments) await deleteSession(seg.sessionId);
-    await deleteDiscardedSessions();
-    state.priorSegments = [];
-    reviewState.undo = null;
-    closeReviewPane();
-    resetUI();
-  } else if (result === 'downloaded') {
-    offerDownloadConfirm(segments.map(s => s.sessionId), 1);
-    closeReviewPane();
-    resetUI();
-  } else {
-    // Cancelled: unlike a normal Stop & save cancel, the user is still
-    // mid-review with nothing lost — stay in the pane instead of dumping
-    // them back to the recorder.
-    reviewSetStatus('Save cancelled — your recording is still here.');
+  } catch (err) {
+    console.error('Save as is failed:', err);
+    reviewSetStatus('Save failed: ' + (err && err.message ? err.message : 'unknown error') + '. Your recording is still here — try Save as is again.');
   }
 }
 
