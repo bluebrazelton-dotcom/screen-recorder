@@ -387,9 +387,25 @@
     font-size: 0.8rem;
     color: var(--accent-hover);
     display: none;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
   }
 
-  .error-banner.visible { display: block; }
+  .error-banner.visible { display: flex; }
+
+  .error-banner-close {
+    flex: none;
+    background: none;
+    border: none;
+    color: var(--accent-hover);
+    font-size: 1.1rem;
+    line-height: 1;
+    padding: 0 0.15rem;
+    cursor: pointer;
+    opacity: 0.7;
+  }
+  .error-banner-close:hover { opacity: 1; }
 
   /* Caption editor (v1.18) */
   .btn-caption-editor {
@@ -448,6 +464,13 @@
     border: 1px solid var(--border);
   }
   .btn-save-srt:hover { background: var(--surface-hover); }
+
+  .caption-hint {
+    font-size: 0.7rem;
+    color: var(--text-dim);
+    opacity: 0.8;
+    margin-top: 0.35rem;
+  }
 
   .caption-status {
     font-size: 0.8rem;
@@ -632,7 +655,10 @@
   </div>
 
   <!-- Error display -->
-  <div class="error-banner" id="errorBanner"></div>
+  <div class="error-banner" id="errorBanner">
+    <span id="errorBannerMsg"></span>
+    <button type="button" class="error-banner-close" onclick="showError('')" aria-label="Dismiss">&times;</button>
+  </div>
 
   <!-- Preview -->
   <div class="preview-container" id="previewContainer">
@@ -756,6 +782,8 @@
       <button class="primary btn-save-vtt" onclick="onExportCaptionsClick('vtt')">Save captions (.vtt)</button>
       <button class="primary btn-save-srt" onclick="onExportCaptionsClick('srt')">.srt</button>
     </div>
+
+    <div class="caption-hint">Captions save as their own small file (.vtt or .srt) next to your video — the video itself is unchanged. Keep the two files together: course sites and video players find the captions automatically.</div>
 
     <div class="caption-status" id="captionStatus"></div>
 
@@ -3945,6 +3973,11 @@ function pauseResume() {
 async function stopRecording() {
   if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') return;
 
+  // Clear any stale pre-stop error (e.g. the caption-editor recording guard)
+  // now, not on the next status update — otherwise it sits on screen through
+  // the whole save and reads as "my Stop click did nothing".
+  showError('');
+
   document.getElementById('btnStop').disabled = true;
   document.getElementById('btnStopReview').disabled = true;
   // Which button's label changes depends on which one was clicked — a
@@ -3954,6 +3987,11 @@ async function stopRecording() {
   } else {
     document.getElementById('btnStop').textContent = 'Saving...';
   }
+  // Freeze the elapsed-time display at the moment Stop is clicked, not
+  // whenever finalize/resetUI eventually gets around to it — the recorder
+  // itself has already stopped capturing by then, but the on-screen timer
+  // used to keep ticking through the entire save.
+  stopTimer();
 
   // Request the final chunk, then stop fires
   state.mediaRecorder.stop();
@@ -3989,7 +4027,9 @@ async function finalizeRecording() {
     // NOTE: we no longer mark the session complete before saving. A recording stays
     // "recoverable" until its bytes are actually on disk, so a cancelled or interrupted
     // save leaves it in the recovery banner instead of being dropped. deleteSession (on a
-    // confirmed save) is now the only thing that retires a session. completeSession() is unused.
+    // confirmed save) is what retires a session on every path except one: confirmDownloadArrived
+    // (Firefox download-confirm) uses completeSession() to mark a session durable immediately,
+    // before backgrounding its physical chunk delete — see that function for why.
 
     // Count chunks WITHOUT loading them (REVIEW #5): the single-segment save
     // streams straight from IndexedDB, so nothing here builds a whole-recording blob.
@@ -4199,18 +4239,61 @@ function offerDownloadConfirm(sessionIds, fileCount) {
 }
 
 async function confirmDownloadArrived() {
-  for (const id of downloadPendingIds) await deleteSession(id);
-  // The download is the "confirmed save" trigger point on this path (saveFile
-  // only ever returns 'downloaded' when arrival can't be verified any other
-  // way) — sweep any discarded siblings from an earlier review-pane cut here,
-  // same as the FSA-confirmed 'saved' branches do immediately.
-  await deleteDiscardedSessions();
+  // Snapshot-then-clear FIRST — this is also what makes a double-click (or a
+  // stray 2nd call landing while the background sweep below is still
+  // running) a harmless no-op: there's nothing left in `ids` for it to act on.
+  const ids = downloadPendingIds;
+  const fileCount = downloadPendingFiles;
   downloadPendingIds = [];
   downloadPendingFiles = 0;
+
+  // Mark durable before anything else: cheap, O(sessions) (one record `put`
+  // each), not O(chunks). completeSession() flips `completed: true`, which is
+  // exactly what checkForRecovery()'s `!s.completed` filter checks — so even
+  // if the tab closes before the background sweep below finishes, these
+  // sessions never resurface as a false "Interrupted recording found" banner
+  // on the next load. Same mark-now/sweep-later idiom as the `discarded`
+  // flag (markSessionDiscarded / deleteDiscardedSessions, above) — just
+  // triggered by this confirm click instead of a review-pane cut.
+  // try/catch: because the queue was snapshotted-and-cleared above, a failure
+  // here would otherwise leave the banner up with a button that no-ops on
+  // retry (nothing left in the queue) — so restore the queue and say so.
+  try {
+    for (const id of ids) await completeSession(id);
+  } catch (err) {
+    console.error('Confirming the download failed:', err);
+    downloadPendingIds = ids.concat(downloadPendingIds);
+    downloadPendingFiles = fileCount + downloadPendingFiles;
+    showError('Couldn\'t finish confirming the download — your recording is still safe. Try "It\'s there — all set" again.');
+    return;
+  }
+
+  // UI updates now, immediately — the user sees "All set" as soon as the
+  // cheap metadata writes above are done, not after every chunk row of every
+  // pending session (plus any discarded siblings) has been individually
+  // cursor-deleted below. That per-chunk delete, awaited before any of this,
+  // is what turned this click into a 5-10s freeze on large recordings.
   state.priorSegments = [];
   document.getElementById('downloadConfirm').classList.remove('visible');
   document.getElementById('recoveryBanner').classList.remove('visible');
   updateStatus('idle', 'All set');
+
+  // Physical cleanup happens in the background, un-awaited by the click
+  // handler. What gets deleted is unchanged from before — same ids, same
+  // deleteDiscardedSessions sweep, deleteSession's cursor internals untouched
+  // — only when/how the UI waits on it changes.
+  (async () => {
+    try {
+      for (const id of ids) await deleteSession(id);
+      // The download is the "confirmed save" trigger point on this path (saveFile
+      // only ever returns 'downloaded' when arrival can't be verified any other
+      // way) — sweep any discarded siblings from an earlier review-pane cut here,
+      // same as the FSA-confirmed 'saved' branches do immediately.
+      await deleteDiscardedSessions();
+    } catch (err) {
+      console.error('Background cleanup after confirmed download failed:', err);
+    }
+  })();
 }
 
 function keepDownloadSession() {
@@ -4544,11 +4627,12 @@ function updateChunkCount(n) {
 
 function showError(msg) {
   const el = document.getElementById('errorBanner');
+  const msgEl = document.getElementById('errorBannerMsg');
   if (msg) {
-    el.textContent = msg;
+    msgEl.textContent = msg;
     el.classList.add('visible');
   } else {
-    el.textContent = '';
+    msgEl.textContent = '';
     el.classList.remove('visible');
   }
 }

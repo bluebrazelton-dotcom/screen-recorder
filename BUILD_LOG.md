@@ -1592,6 +1592,60 @@ differentials unchanged).
 
 ---
 
+### v1.20.2 — Owner-acceptance fixes, batch 1 (2026-08-02)
+
+**Commit:** `v1.20.2: freeze timer + clear stale errors at Stop; instant download-confirm (mark-first, background delete); dismissable error banner; caption sidecar hint`
+
+The owner's manual pass of the accumulated v1.18-era lists surfaced four
+bugs and one feature request (queued as REVIEW #23). Fixes:
+
+1. **Timer froze at the Stop click** — `stopTimer()` was only called from
+   `resetUI()`, which runs after the ENTIRE async save; the elapsed display
+   kept counting until the picker appeared. Now called in `stopRecording()`
+   the moment the stop is registered (covers Stop & review too).
+2. **Stale error cleared at the Stop click** — `startRecording()` cleared
+   the banner at entry but `stopRecording()` didn't, so a pre-stop error
+   (e.g. the caption-editor recording-guard message) sat on screen through
+   the whole save and, combined with (1), read as "my Stop did nothing" —
+   the likely explanation for the owner's "Stop & save dead after the
+   recording-guard error" report, which could not be reproduced in code
+   (scenario DU now exercises that exact sequence end-to-end; the old CY
+   test faked `state.recording` and never actually stopped).
+3. **"It's there — all set" responds instantly** — `confirmDownloadArrived`
+   awaited a one-row-at-a-time cursor delete of every pending session's
+   chunks (5–10s on big recordings, worse when crash-testing piles up
+   unconfirmed downloads) before touching the DOM. Now: snapshot + clear
+   the queue (double-click = no-op), `completeSession()` each id (cheap
+   metadata writes — `checkForRecovery`'s `!s.completed` filter keeps them
+   out of the recovery banner even if the tab closes before cleanup), UI
+   updates immediately, physical deletes run in an un-awaited background
+   task. A marking failure restores the queue and says so — the retry
+   stays live. What gets deleted is unchanged; `deleteSession`'s internals
+   untouched. (`completeSession` had been unused since the
+   recoverable-until-saved change; it now has exactly this one caller.)
+4. **Error banner is dismissable** — message moved into `#errorBannerMsg`
+   with a × close button (`showError('')`, the existing clear path). A
+   call-site audit confirmed no error message is the sole affordance for a
+   required action, so early dismissal can't strand anyone.
+5. **Caption sidecar hint** — small dim line under the caption export
+   buttons explaining the `.vtt`/`.srt` travels next to the video and the
+   video file itself is unchanged. Owner decision (2026-08-02): captions
+   stay sidecar-only; no burn-in/muxing (most players ignore embedded WebM
+   subtitle tracks; re-encoding for pixel burn-in costs realtime duration
+   and quality).
+
+**Tests:** AK extended (gated-delete assertions pin marked-complete-before-
+swept, chunks-then-gone, double-click no-op, and queue-restore on a marking
+failure); new scenario DU (real start/stop mocks: guard refuses
+mid-recording, Stop clears the stale error and freezes the timer at the
+click, save completes). Harness: **128 scenarios / 855 assertions** (was
+127/831).
+
+**No changes to** the recording pipeline, seam/cut math, or any save
+flow's byte behavior.
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.
@@ -1872,6 +1926,24 @@ DOM/video element; run in both Firefox (primary) and Chrome (secondary)):**
     the pane still opens with "Re-record from here" disabled and a plain
     message; Save as is / Discard / Back all still work. (Hard to trigger
     manually — covered by harness scenario DR; verify only if it occurs.)
+
+**Manual acceptance test (v1.20.2 owner-acceptance fixes — both browsers):**
+1. **Timer freeze.** Record ~30s, Stop & save → the elapsed display stops
+   the instant you click, and stays frozen while the save dialog is being
+   prepared. Same for Stop & review.
+2. **Guard → Stop.** While recording, click "Caption editor" → the guard
+   error appears; click Stop & save → the error disappears immediately,
+   the timer freezes, and the save proceeds normally. (This is the re-test
+   of the "Stop & save dead" report — if the save dialog genuinely never
+   appears, open the console (F12) first and report what it shows.)
+3. **Instant all-set.** Record a few minutes (bigger is better), crash the
+   tab, recover via download, click "It's there — all set" → the banner
+   clears and "All set" appears immediately (no multi-second freeze);
+   reload → no recovery banner.
+4. **Error dismiss.** Trigger any error (e.g. caption editor while
+   recording) → the banner has a × that dismisses it.
+5. **Caption hint.** Open the caption editor → the sidecar explanation
+   line is visible under the export buttons and reads sensibly.
 
 ---
 

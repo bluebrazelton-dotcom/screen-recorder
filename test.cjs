@@ -1277,10 +1277,63 @@ async function scenario(name, fn) {
     assert(/2 recording files/.test(msg), 'bar message counts both files (got "' + msg + '")');
     sandbox.offerDownloadConfirm([id2], 1);
     assert(sandbox.downloadPendingIds.length === 2, 're-offering a covered session does not duplicate its id');
+
+    // FIX 3 (BUG C): confirmDownloadArrived now marks-then-backgrounds the physical
+    // delete. fake-indexeddb resolves fast enough that a plain `await
+    // confirmDownloadArrived()` isn't a reliable window to observe the
+    // "marked complete but not yet deleted" intermediate state — the
+    // un-awaited background IIFE can race ahead and finish before we get to
+    // check. Gate deleteSession so the background sweep can't proceed past
+    // its first call until this test explicitly lets it.
+    let releaseDelete;
+    const deleteGate = new Promise((res) => { releaseDelete = res; });
+    const origDeleteSession = sandbox.deleteSession;
+    sandbox.deleteSession = async (id) => { await deleteGate; return origDeleteSession(id); };
+
     await sandbox.confirmDownloadArrived();
-    const sessions = await readStore('sessions');
-    assert(sessions.length === 0, 'confirm deletes BOTH sessions (got ' + sessions.length + ')');
-    assert(sandbox.downloadPendingFiles === 0, 'file count reset after confirm');
+    // completeSession() is awaited by confirmDownloadArrived itself, so it's
+    // guaranteed done by the time the call above resolves; deleteSession is
+    // gated shut above, so the physical delete is guaranteed NOT done yet.
+    let sessions = await readStore('sessions');
+    let chunks = await readStore('chunks');
+    assert(sessions.length === 2 && sessions.every(s => s.completed === true),
+      'both sessions marked completed:true immediately, before the background delete runs');
+    assert(chunks.length === 2, 'chunk rows still present while the background delete is gated (got ' + chunks.length + ')');
+    assert(sandbox.downloadPendingFiles === 0, 'file count reset synchronously, before the background delete');
+
+    releaseDelete();
+    sandbox.deleteSession = origDeleteSession;
+    await drain();
+    sessions = await readStore('sessions');
+    chunks = await readStore('chunks');
+    assert(sessions.length === 0, 'confirm deletes BOTH sessions once the background sweep completes (got ' + sessions.length + ')');
+    assert(chunks.length === 0, 'chunk rows deleted once the background sweep completes (got ' + chunks.length + ')');
+
+    // A second, immediate confirm call must be a harmless no-op — downloadPendingIds
+    // was already snapshotted-and-cleared by the first call.
+    await sandbox.confirmDownloadArrived();
+    await drain();
+    sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'a second confirmDownloadArrived() call is a no-op (got ' + sessions.length + ')');
+
+    // FIX 3 hardening: a completeSession failure must restore the pending
+    // queue (the snapshot-and-clear would otherwise make the retry click a
+    // no-op with the banner stuck up) and surface a message with retry
+    // guidance — then a retry with the fault cleared completes normally.
+    sandbox.offerDownloadConfirm(['ghost-id'], 1);
+    const origComplete = sandbox.completeSession;
+    sandbox.completeSession = async () => { throw new Error('tx aborted'); };
+    let escapedConfirm = false;
+    try { await sandbox.confirmDownloadArrived(); } catch (e) { escapedConfirm = true; }
+    sandbox.completeSession = origComplete;
+    assert(escapedConfirm === false, 'a marking failure never escapes the click handler');
+    assert(sandbox.downloadPendingIds.length === 1 && sandbox.downloadPendingIds[0] === 'ghost-id',
+      'the pending queue is restored after a marking failure — retry stays possible');
+    assert(sandbox.downloadPendingFiles === 1, 'the file count is restored too');
+    assert(recordedErrors.some(m => /all set/i.test(m)), 'the failure is surfaced with retry guidance');
+    await sandbox.confirmDownloadArrived();
+    await drain();
+    assert(sandbox.downloadPendingIds.length === 0, 'the retried confirm clears the queue (completeSession no-ops on the missing session)');
   });
 
   // ============================================================
@@ -3942,6 +3995,68 @@ Real cue text
 
       for (const id of ids) { try { await api.deleteSession(id); } catch (e) {} }
     }
+  });
+
+  await scenario('DU end-to-end with real start/stop mocks (not CY\'s state.recording=true shortcut): caption editor refuses mid-recording, a real Stop clears the stale error and freezes the timer immediately (FIX 1/FIX 2), and finalize saves normally', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.startRecording();
+    const rec = state.mediaRecorder;
+    assert(!!rec && state.recording === true, 'a real recording is in progress (recorder created, state.recording true)');
+    assert(state.timerInterval !== null, 'precondition: the elapsed timer is running');
+
+    // Mid-recording: the caption editor must refuse to open, and leave
+    // everything else untouched — this drives openCaptionEditor() through a
+    // REAL in-progress recording (state.recording flipped true by
+    // startRecording() above), not CY's `state.recording = true` shortcut.
+    // Baseline first: startRecording() itself does its own showError('') at
+    // entry, so recordedErrors is not empty at this point.
+    const errCountBeforeGuard = recordedErrors.length;
+    api.openCaptionEditor();
+    assert(api.captionEditorState.active === false, 'the guard refuses to activate the editor mid-recording');
+    assert(documentMock.getElementById('captionEditor').classList.contains('visible') === false, 'the editor pane never becomes visible');
+    assert(recordedErrors.length === errCountBeforeGuard + 1, 'exactly one new message appended by the refused click (got ' + (recordedErrors.length - errCountBeforeGuard) + ')');
+    const guardMsg = recordedErrors[recordedErrors.length - 1];
+    assert(/recording/i.test(guardMsg), 'the guard message explains why (mentions the in-progress recording)');
+    assert(state.recording === true && rec.state === 'recording', 'the guard click did not touch the in-progress recording');
+
+    // Some real data before Stop, so finalize takes the normal save path
+    // instead of the "No recording data found" empty-session branch.
+    rec.ondataavailable({ data: new Blob(['x']) });
+    rec.ondataavailable({ data: new Blob(['y']) });
+
+    // A real Stop click through the actual stopRecording() handler — not a
+    // direct rec.stop() call — so this exercises FIX 1 and FIX 2 exactly as a
+    // user's click would.
+    await sandbox.stopRecording();
+
+    // Sequencing note: the mock MediaRecorder.stop() invokes onstop()
+    // synchronously, but onstop is `async () => { await lastChunkWrite; await
+    // finalizeRecording(); }` — an async function whose body doesn't run to
+    // completion synchronously — so control returns here before any of that
+    // has executed. stopRecording() itself has no internal `await` before it
+    // calls .stop(), so its own synchronous work (showError('') and
+    // stopTimer()) is guaranteed complete the instant `await
+    // sandbox.stopRecording()` resolves. This is the earliest deterministic
+    // point to pin FIX 1 and FIX 2 — before drain(), and before
+    // finalizeRecording's cleanupStreams()/resetUI() have had any chance to
+    // run (which would make a timerInterval/recordedErrors check here
+    // trivially true for the wrong reason).
+    assert(state.timerInterval === null, 'FIX 1: the elapsed timer stops the instant Stop is clicked, not after the save finishes');
+    assert(recordedErrors[recordedErrors.length - 1] === '', 'FIX 2: stopRecording clears the stale guard error immediately, before the save even starts');
+    assert(state.recording === true, 'sanity: finalize/cleanup has not run yet at this point — still mid-flight');
+
+    // Let the rest of the async chain (lastChunkWrite -> finalizeRecording ->
+    // saveFile -> picker -> cleanupStreams/resetUI) play out.
+    await drain();
+
+    assert(lastWritten.length === 1, 'the recording was actually saved (one file written via the picker mock)');
+    const sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'the session was deleted after the confirmed save');
+    assert(state.recording === false && state.mediaRecorder === null, 'state fully reset once the save completes');
+    assert(documentMock.getElementById('btnRecord').textContent === 'Record', 'resetUI ran (Record button restored)');
+    assert(recordedErrors[recordedErrors.length - 1] === '', 'no new error appeared on the happy-path save — the banner stays cleared');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

@@ -430,6 +430,17 @@ Firefox pass exposed in `reviewCutFromHere`). Both fixed and test-pinned
 5–13 + Chrome branches audited clean in code. Still owed: the owner's
 real-browser pass of items 4–13, Firefox first, then the full Chrome pass.
 
+**v1.20.2 (2026-08-02):** the owner's pass of the accumulated v1.18-era
+lists surfaced 4 bugs, all fixed same-day (timer ran through the save;
+stale errors survived Stop; "It's there — all set" froze 5–10s on chunk
+deletion; error banner undismissable — see BUILD_LOG). The reported
+"Stop & save dead after the recording-guard error" did NOT reproduce in
+code (new end-to-end scenario DU pins the sequence); the timer+stale-banner
+combination likely explains it — owner re-test with console open owed.
+Harness 128 scenarios / 855 assertions. Also from that pass: pause-and-
+switch-screens queued as #23; owner confirmed captions stay sidecar-only
+(no burn-in) and a UI hint now says so.
+
 ### 22. Block-precision re-record cut (queued 2026-07-30)
 
 Firefox's ~7.5s clusters make Rule-A's cluster-boundary cut precision ~7.5s
@@ -439,6 +450,31 @@ unknown-size cluster needs no size rewrite; a known-size one needs its size
 field rewritten (or converted to unknown-size) — and the truncated-known-size
 asymmetry scenario AX pins must be respected. Differential harness coverage
 mandatory. Design brief first; Fable designs/reviews, Sonnet executes.
+
+### 23. Pause → change screens → resume — owner-requested (2026-08-02)
+
+While paused, let the user pick a different screen/window, then resume —
+so the recording never captures the hunt for the next screen. Scoped
+2026-08-02 (Sonnet recon, orchestrator-reviewed): **small-to-medium, and
+NOT pipeline-touching by construction** — MediaRecorder records the
+compositor canvas's capture stream, not the screen stream, so swapping
+what feeds `screenVideo.srcObject` is invisible to the recorder, chunk
+writes, and every save flow. The swap logic already exists in
+`selectScreen()` (stop old tracks → `captureScreen()` → reassign →
+restart compositing); it's only gated away because `btnSelectScreen` hides
+during recording. Pause is `MediaRecorder.pause()` while the draw clock
+keeps painting, so the canvas is live and ready for a new source; doing
+the swap while paused also sidesteps the black-frames-at-switch
+limitation (nothing is encoded during the swap). The ONE genuinely new
+piece: the WebAudio mix (`createAudioMix`) connects source nodes once at
+record start — a new screen's system audio must be connected into the
+existing destination node (and the old source disconnected; don't leak
+nodes on repeated swaps). Verify in a real browser that a deliberate
+`track.stop()` during the swap doesn't trip `selectScreen`'s
+ended-listener (which calls `stopRecording()` when `state.recording`).
+UI: show a "Change screen" affordance only while paused. Differential
+tests must show recorded bytes/save flows unchanged; new tests for the
+swap-while-paused state machine and audio-mix reconnection.
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature
