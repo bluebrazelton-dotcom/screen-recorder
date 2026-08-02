@@ -207,6 +207,7 @@ const ORIG_CARRY_CAP = sandbox.STREAM_CARRY_CAP;
 // resetState() every scenario — same shape as ORIG_CARRY_CAP.
 const ORIG_TIMINGS = {
   START_VERIFY_MS: sandbox.START_VERIFY_MS,
+  START_VERIFY_GRACE_MS: sandbox.START_VERIFY_GRACE_MS,
   STORAGE_WATCHDOG_MS: sandbox.STORAGE_WATCHDOG_MS,
   STOP_WATCHDOG_MS: sandbox.STOP_WATCHDOG_MS,
   WRITE_STALL_MS: sandbox.WRITE_STALL_MS,
@@ -326,6 +327,8 @@ async function resetState() {
   // it — resetState() runs at the top of every scenario() call, so this is
   // the one guaranteed choke point to catch it.
   sandbox.START_VERIFY_MS = ORIG_TIMINGS.START_VERIFY_MS;
+  sandbox.START_VERIFY_GRACE_MS = ORIG_TIMINGS.START_VERIFY_GRACE_MS;
+  sandbox.startVerifyAttempts = 0;
   sandbox.STORAGE_WATCHDOG_MS = ORIG_TIMINGS.STORAGE_WATCHDOG_MS;
   sandbox.STOP_WATCHDOG_MS = ORIG_TIMINGS.STOP_WATCHDOG_MS;
   sandbox.WRITE_STALL_MS = ORIG_TIMINGS.WRITE_STALL_MS;
@@ -4182,7 +4185,11 @@ Real cue text
     let finalizeCalls = 0;
     sandbox.finalizeRecording = async (...args) => { finalizeCalls++; return origFinalize(...args); };
 
-    // --- zero chunks, recorder still reporting "recording" -> abort ---
+    // --- zero chunks, recorder still reporting "recording" -> ONE grace
+    // re-check first (v1.21.1: a healthy Firefox recorder can deliver its
+    // first non-empty blob later than START_VERIFY_MS — ~7.5s cluster
+    // cadence — so a live-looking recorder is NOT aborted on the first
+    // check; owner hit exactly that false abort), THEN abort if still dry ---
     state.sources = { screen: true, camera: false, mic: false };
     state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
     await api.startRecording();
@@ -4190,6 +4197,29 @@ Real cue text
     const emptyRec = state.mediaRecorder;
     const capturedOnstop = emptyRec.onstop; // captured before verifyRecorderStarted nulls state.mediaRecorder
     assert(state.chunkIndex === 0, 'precondition: no chunk has landed yet');
+
+    // Paused defers indefinitely without consuming the grace attempt — a
+    // zero-chunk pause proves nothing (no data can arrive while paused).
+    sandbox.clearStartVerify();
+    state.paused = true;
+    await api.verifyRecorderStarted();
+    assert(sandbox.startVerifyTimer !== null, 'paused + zero chunks: the check re-arms instead of aborting');
+    assert(sandbox.startVerifyAttempts === 0, 'a paused deferral does not consume the grace attempt');
+    assert(state.recording === true, 'paused deferral changes nothing');
+    state.paused = false;
+
+    // First unpaused check: live recorder, zero chunks -> grace re-arm, no abort.
+    sandbox.clearStartVerify();
+    await api.verifyRecorderStarted();
+    assert(sandbox.startVerifyTimer !== null, 'live recorder + zero chunks: first check re-arms a grace window instead of aborting');
+    assert(sandbox.startVerifyAttempts === 1, 'the grace attempt is consumed');
+    assert(state.recording === true && state.mediaRecorder === emptyRec, 'the grace re-arm aborts nothing');
+    let sessionsMid = await readStore('sessions');
+    assert(sessionsMid.find(s => s.id === emptySid) !== undefined, 'the session survives the grace window');
+    assert(recordedErrors.every(m => !/failed silently/i.test(m)), 'no failure message during the grace window');
+
+    // Second check, still dry -> now it is a phantom: abort.
+    sandbox.clearStartVerify();
     await api.verifyRecorderStarted();
     let sessions = await readStore('sessions');
     assert(sessions.find(s => s.id === emptySid) === undefined, 'the empty session is deleted');

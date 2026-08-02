@@ -1727,6 +1727,21 @@ stopRecording).
 seam/cut math — observation and routing only; every differential passes
 unchanged.
 
+**v1.21.1 (same day):** owner field data refined H. (1) A zero-chunk
+recorder that still CLAIMS to be alive gets one grace re-check
+(`START_VERIFY_GRACE_MS` 6s; 4+6=10s total, past Firefox's ~7.5s
+first-blob cadence) before being called a phantom, and a paused
+recording defers indefinitely (a zero-chunk pause proves nothing) — a
+recorder that is outright `inactive` (the diagnosed signature) still
+aborts at 4s. (2) The abort message now leads with the restart —
+"Close all Firefox windows and restart Firefox, then select your screen
+and try again." — because the failure proved sticky per browser session:
+the owner's retry without a restart failed identically. (Same-day
+context: the owner's "R1 failure" was in fact R2 passing — Firefox was
+already broken at session start and the app called it out in 4 seconds.)
+DV(d) pins grace re-arm, paused deferral, and second-check abort.
+Harness: **137 scenarios / 936 assertions**.
+
 ---
 
 ## Known limitations

@@ -3790,6 +3790,14 @@ function updateRecordButton() {
 // exposed via __api instead and called directly, so their *_MS values only
 // matter for the real (non-test) timers.
 var START_VERIFY_MS = 4000;        // H — silent-start-failure detection window
+// H — grace window for a recorder that still claims to be alive but has
+// delivered nothing at START_VERIFY_MS. Firefox produces its first non-empty
+// blob on its own schedule (~7.5s cluster cadence observed on this platform),
+// which can be LATER than START_VERIFY_MS on a perfectly healthy recording —
+// v1.21's owner acceptance hit exactly that false abort (R1 of the v1.21
+// manual list, 2026-08-02). 4s + 6s = 10s total, comfortably past 7.5s.
+var START_VERIFY_GRACE_MS = 6000;
+var startVerifyAttempts = 0;       // grace re-checks consumed for THIS recording
 var STORAGE_WATCHDOG_MS = 8000;    // A/B — IndexedDB open/stat race timeout
 var STOP_WATCHDOG_MS = 8000;       // F — onstop-never-fired detection window
 var WRITE_STALL_MS = 12000;        // C — "no chunk write has landed recently" threshold
@@ -3864,9 +3872,27 @@ async function verifyRecorderStarted() {
     return;
   }
 
-  // chunkIndex === 0: whether the recorder is missing, inactive, or still
-  // claiming 'recording' with nothing to show for START_VERIFY_MS worth of
-  // time, it's phantom either way — Firefox's silent-death failure mode.
+  // chunkIndex === 0 with a recorder that still claims to be alive: NOT
+  // proof of a phantom. A healthy Firefox recorder can deliver its first
+  // non-empty blob later than START_VERIFY_MS (~7.5s cluster cadence), and a
+  // paused recorder delivers nothing by design. Defer instead of aborting:
+  // paused defers indefinitely (a zero-chunk pause proves nothing either
+  // way); a live unpaused recorder gets ONE longer grace window.
+  if (rec && rec.state !== 'inactive') {
+    if (state.paused) {
+      startVerifyTimer = setTimeout(verifyRecorderStarted, START_VERIFY_GRACE_MS);
+      return;
+    }
+    if (startVerifyAttempts < 1) {
+      startVerifyAttempts++;
+      startVerifyTimer = setTimeout(verifyRecorderStarted, START_VERIFY_GRACE_MS);
+      return;
+    }
+  }
+
+  // chunkIndex === 0 with the recorder missing/inactive (the diagnosed
+  // silent-death signature), or still claiming 'recording' with nothing to
+  // show even after the grace window — phantom either way.
   // Nothing was captured, so this is a clean abort, not a stop-and-save.
   // Claim finalize FIRST, before doing anything else: this blocks a late
   // real onstop from finalizing the session we're about to delete out from
@@ -3883,7 +3909,10 @@ async function verifyRecorderStarted() {
   resetUI();
   // cleanupStreams() just released the screen/camera streams, so the user
   // has to re-pick a source before Record works again — say so explicitly.
-  showError("Recording couldn't start — Firefox's recorder failed silently. Select your screen and click Record to try again. If it keeps happening, restart Firefox.");
+  // Field data (2026-08-02): this Firefox failure is sticky for the whole
+  // browser session — retrying without a restart fails the same way — so
+  // the advice leads with the restart, not the retry.
+  showError("Recording couldn't start — Firefox's recorder failed silently. Close all Firefox windows and restart Firefox, then select your screen and try again.");
 }
 
 // C — per-tick body of the write-stall watchdog, exposed via __api so tests
@@ -4100,6 +4129,7 @@ async function startRecording() {
     finalizeStarted = false;
     lastChunkWriteOkAt = Date.now();
     writeStallWarned = false;
+    startVerifyAttempts = 0;
     clearStartVerify();
     startVerifyTimer = setTimeout(verifyRecorderStarted, START_VERIFY_MS);
     clearWriteStallInterval();

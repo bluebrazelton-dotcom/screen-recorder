@@ -466,10 +466,16 @@ salvage in stopRecording, an onstop watchdog with a sync claim flag
 write-stall warning, and storage watchdogs (openDB / sessionChunkStats
 races with restart-Firefox guidance; qm-shutdown-hangs Bugzilla family).
 Orchestrator review caught 5 draft defects incl. a data-loss delete and
-a prematurely-disarmed watchdog. Scenarios DV(a)–(h)/DW(g); harness
-137/928. Owner acceptance of the resilience behaviors owed (BUILD_LOG
-v1.21 manual list). Firefox ~154 may fix the upstream regression;
-v1.21's guards stay valuable regardless.
+a prematurely-disarmed watchdog. Scenarios DV(a)–(h)/DW(g). v1.21.1
+(same day, owner field data): grace re-check before calling a
+live-looking zero-chunk recorder a phantom (10s total; inactive still
+aborts at 4s), paused recordings never judged, and the abort message
+leads with restart-Firefox (the failure is sticky per browser session —
+retry without restart fails identically; first live detection fired
+correctly 4s into the owner's session). Harness 137/936. Owner
+acceptance of the resilience behaviors owed (BUILD_LOG v1.21 manual
+list). Firefox ~154 may fix the upstream regression; v1.21's guards stay
+valuable regardless.
 
 ### 23. Pause → change screens → resume — owner-requested (2026-08-02)
 
