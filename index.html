@@ -4023,11 +4023,20 @@ async function startRecording() {
 
     state.compositeStream = combinedStream;
 
-    // Choose codec
-    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-      ? 'video/webm;codecs=vp9,opus'
-      : MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
-        ? 'video/webm;codecs=vp8,opus'
+    // Choose codec. CRITICAL: request opus ONLY when the stream actually has
+    // audio. Firefox 153's recorder SILENTLY produces nothing — state stuck
+    // on 'recording', zero dataavailable, no onstop/onerror ever — when
+    // asked for an audio codec on a video-only stream (owner-reproduced
+    // deterministically 2026-08-02: vp8,opus/video-only = 0 chunks;
+    // vp8/video-only = fine, same healthy session; vp9,opus isn't supported
+    // by FF at all, so FF always landed on the broken vp8,opus combo). The
+    // v1.21 start-verification watchdog detects that silent death; this
+    // removes the app's own trigger for it.
+    const audioCodecSuffix = audioStreams.length > 0 ? ',opus' : '';
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9' + audioCodecSuffix)
+      ? 'video/webm;codecs=vp9' + audioCodecSuffix
+      : MediaRecorder.isTypeSupported('video/webm;codecs=vp8' + audioCodecSuffix)
+        ? 'video/webm;codecs=vp8' + audioCodecSuffix
         : 'video/webm';
 
     // Create session in IndexedDB

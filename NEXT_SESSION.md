@@ -1,82 +1,122 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-07-30 (post-v1.20). Supersedes the post-v1.18 snapshot.
+Close-out snapshot, 2026-08-02 (post-v1.21.2). Supersedes the post-v1.20
+snapshot.
 
 ## Where things stand
 
-- **v1.19 (metadata cut primitive) and v1.20 (Stop & review pane, re-record
-  flow, Firefox seam fix) are shipped, committed (`469389a`, `89e5c31`), and
-  past the owner's targeted Firefox acceptance** (2026-07-30: full re-record
-  cycle — clean cut at the chosen point, stitched output plays smoothly
-  through the seam). Not yet pushed to origin at snapshot time — check.
-- **#21 is 2 of 3 sessions done.** Session 3 = the remaining v1.20 manual
-  acceptance items (4–13, plus a Chrome pass) and whatever they shake out;
-  pairs naturally with #20.
-- **Harness: 126 scenarios / 812 assertions** (`node test.cjs`; prefixes end
-  at DS). Orchestrator review caught 1 defect in the v1.19 draft and 4 in
-  the v1.20 draft; owner browser testing caught 2 more the harness cannot
-  see (real-browser behavior) — both the review pass AND the owner
-  acceptance step are load-bearing.
-- **The design in one breath:** truncation is METADATA — a `cutAtByte`
-  marker on the session record, enforced ONLY inside `forEachSessionChunk`
-  (the single choke point; stored chunks are never rewritten; undo =
-  delete the marker). `computeCutPlan` is pure Rule-A math (the cluster
-  containing T is dropped). Whole-segment drops use `discarded: true`,
-  swept by `deleteDiscardedSessions()` at every confirmed-save/discard site.
+- **Five releases shipped and pushed today** (all committed, origin/main
+  current): v1.20.1 (Undo chain-restore blocker + review-handler
+  hardening), v1.20.2 (owner-acceptance batch: timer freeze at Stop,
+  stale-error clear, instant download-confirm via mark-first/background
+  delete, dismissable error banner, caption sidecar hint), v1.21
+  (#24 recorder+storage resilience watchdogs), v1.21.1 (start-verify
+  grace window + restart-first message), **v1.21.2 (THE root-cause fix
+  — see below)**.
+- **Harness: 138 scenarios / 940 assertions** (`node test.cjs`; scenario
+  prefixes end at DX).
+- **#21 is still open on the owner's manual pass.** The owner has a
+  consolidated checklist (Part R resilience + F1–F15 Firefox + C1–C13
+  Chrome; delivered in-chat 2026-08-02 — the scratchpad copy dies with
+  the old session, but BUILD_LOG's Testing section holds every list).
+  Almost all of today went to the Firefox saga; the F/C items are mostly
+  untested. Every dead-save failure the owner hit today was the v1.21.2
+  root cause — with it fixed, the F-list should finally run clean.
+  F6 (Undo) order matters: cut → click Undo IMMEDIATELY (it disappears
+  by design once re-recording starts) → record → save.
 
-## Load-bearing invariant (v1.20 — do not break)
+## The Firefox saga in one breath (today's arc, don't relearn it)
 
-Seam offsets are the previous segment's CONTENT END:
-`Math.max(prevScan.lastClusterMaxBlockTime, prevScan.maxClusterTs) + SEAM_GAP_MS`
-(33ms), implemented in LOCKSTEP in `concatenateWebM` (oracle + review
-preview), `scanSegmentsForStitch` (streamed saves), and `computeCutPlan`.
-Never change one without the others — scenario DS's `assertNoOverlap`
-re-scans real stitched output and fails if any seam rewinds the timeline.
+Owner reported dead save dialogs + missing recovery banners. Storage-wedge
+theory → disproved by owner-run console diagnostics (storage healthy).
+Recorder-death theory → confirmed: recorder inactive, ZERO chunks, no
+onstop/onerror ever. v1.21 shipped watchdogs (start-verify, stop
+watchdog, write-stall, storage watchdogs, salvage paths). Then the owner
+reproduced it DETERMINISTICALLY: **Firefox 153 silently records NOTHING
+(state stuck 'recording', zero dataavailable, no events) when the
+mimeType names opus but the stream has no audio track.** The app
+requested `…,opus` unconditionally → every no-mic recording died; every
+mic recording worked. "Restart fixed it" was coincidence. v1.21.2 fix:
+`audioCodecSuffix = audioStreams.length > 0 ? ',opus' : ''`.
 
 ## Permanent platform knowledge (new ● + carried forward)
 
-- ● **Firefox MediaRecorder emits ~7.5-SECOND clusters** (Chrome: ~1s),
-  regardless of the 1s timeslice. This is why the old `maxClusterTs + 1000`
-  seam formula overlapped by ~6.5s and killed FF video decode (fixed
-  v1.20), and why cut precision is cluster-bound at ~7.5s in FF (queued as
-  #22). Test any cluster-assumption code against `syntheticLongClusterWebm`.
-- ● Diagnostic: `analyze-webm.cjs` (session scratchpad; rebuildable — loads
-  index.html's script in a vm like test.cjs, walks clusters, prints
-  ts/contentEnd/block counts/VP8 keyframe dims/overlap flags). Confirmed
-  the v1.20 root cause from the owner's broken file in seconds.
+- ● **FF153: audio codec in mimeType + no audio track = silent zero-chunk
+  recorder.** Constructor succeeds, start() succeeds, state claims
+  'recording'. Also: FF doesn't support vp9 at all (constructor throws
+  NotSupportedError on vp9,opus), so FF always uses the vp8 tier.
+- ● **FF MediaRecorder can also legitimately deliver its first non-empty
+  blob late** (~7.5s cluster cadence) — hence start-verify's grace window
+  (4s + 6s; inactive recorders still abort at 4s; paused never judged).
+- ● Firefox storage CAN wedge (Bugzilla qm-shutdown-hangs family) — it
+  wasn't today's culprit but the A/B storage watchdogs guard it.
+- ● Firefox MediaRecorder emits ~7.5-SECOND clusters (Chrome ~1s) — the
+  v1.20 seam-formula lesson; cut precision cluster-bound in FF (→ #22).
 - file://-served Chrome can't list mic/camera names; owner's Chrome has
   `showSaveFilePicker` on file://; Bluetooth hands-free masquerades as
-  interference (all unchanged from the post-v1.18 snapshot).
+  interference (unchanged).
+
+## Load-bearing invariants (do not break)
+
+- Seam offsets = previous segment's CONTENT END:
+  `Math.max(lastClusterMaxBlockTime, maxClusterTs) + SEAM_GAP_MS` (33ms),
+  in LOCKSTEP in `concatenateWebM` / `scanSegmentsForStitch` /
+  `computeCutPlan`; scenario DS's `assertNoOverlap` enforces.
+- `claimFinalize()` (sync check-and-set) makes onstop / stop-watchdog /
+  salvage mutually exclusive. `finalizeStarted` deliberately SURVIVES
+  resetUI and resets only in startRecording — a late onstop after a
+  watchdog salvage must stay a no-op. Don't "clean it up" into resetUI.
+- onstop clears the stop watchdog only AFTER winning the claim (a hung
+  final chunk-write must leave the watchdog armed).
+- All salvage paths force `stopMode='save'` — a dead recorder is never a
+  review moment.
+- Undo re-record arms the FULL pane chain (`restoreSegments`), same model
+  as Back-to-recorder — scenario DO pins it (v1.20.1 fixed the stale
+  `priorSegmentsBefore` data-loss bug; don't reintroduce it).
+- confirmDownloadArrived: mark-completed-first, background the physical
+  delete; a marking failure restores the queue (retry stays live).
+
+## Gotchas (new ● + still-true old ones)
+
+- ● New module state for the vm must be `var` (top-level let/const don't
+  attach to the sandbox). Timing consts (START_VERIFY_MS etc.) are
+  captured in test.cjs `ORIG_TIMINGS` and restored per scenario;
+  resetState also clears pending watchdog timers (real timers leak
+  across scenarios otherwise) — extend BOTH when adding any.
+- ● PowerShell Get-Content/Set-Content rewrites mangle this repo's
+  BOM-less LF files — use Edit tools or bash/sed only.
+- ● Grep tool output can render `//` comment leaders as `\` (display
+  artifact) — verify with Read before believing a "syntax error".
+- Scenarios AL/AM/AN pin literal timestamp/Duration strings — recompute
+  if seam/duration math ever changes (it didn't today).
+- The review-pane preview is the ONE legitimate `concatenateWebM` caller.
+- New `reviewState` fields must go into `resetState()`.
+- Real-browser behavior is invisible to the harness — owner acceptance
+  gates every UI-flow feature. Console-paste diagnostics (alert + copy())
+  proved extremely effective for field debugging — reuse that pattern.
 
 ## Queue
 
-- **#21 session 3 (next):** v1.20 manual list items 4–13 + Chrome pass;
-  fix findings; close #21.
-- **#22 block-precision cut** (design brief first): truncate INSIDE the
-  final kept cluster at a block boundary — fixes FF's ~7.5s cut precision.
-- **#19 (docs/README) + #20 (final regression)** at stabilization.
-  Authoring polish stays parked and unversioned.
-
-## Gotchas (new ones ●; older ones from the post-v1.18 snapshot still apply)
-
-- ● Top-level `const`s don't attach to the vm sandbox — expose via the
-  `__api` line (`SEAM_GAP_MS`, `reviewState` are there now); function
-  declarations attach automatically.
-- ● Scenarios AL/AM/AN pin literal timestamp/Duration strings — any seam or
-  duration change means recomputing their expected values (they fail loudly).
-- ● The review-pane preview is the ONE legitimate `concatenateWebM` caller
-  (preview only) — saves must never route through it.
-- ● New `reviewState` fields must be added to `resetState()`; tests that
-  hand-rig `reviewState` for cut calls must set `scansOk: true`.
-- Real-browser behavior (playback, seams, silent unhandled rejections) is
-  invisible to the harness — every UI-flow feature needs an owner
-  acceptance pass before it counts as done.
+- **#21 session 3 (next): the owner's manual pass**, now on a build where
+  mic-less Firefox recordings actually work: Part R (R1 healthy-cycle;
+  R2 already witnessed live), F1–F15 Firefox first, then C1–C13 Chrome.
+  Fix findings; close #21.
+- **#22 block-precision cut** (design brief first — Fable designs,
+  truncate INSIDE the final kept cluster; scenario-AX asymmetry applies).
+- **#23 pause → change screens → resume** (scoped in REVIEW #23: canvas
+  compositor makes the video swap pipeline-free; audio-mix reconnection
+  is the one new piece; show the affordance only while paused).
+- **#19 (docs/README) + #20 (final full regression)** at stabilization.
+- Watch for **Firefox 154** (~2 weeks): may fix the upstream opus bug;
+  v1.21.2's fix and the watchdogs stay regardless.
 
 ## Ground rules (unchanged)
 
 Zero dependencies, single `index.html`, ONE `<script>` block. WebM only.
-Don't touch the recording pipeline or the streamed save flows' byte
-behavior (differentials enforce it). Firefox first. Faculty tone. File
-Edit Rule: agents draft in scratch; orchestrator reviews, presents in
-full, and waits for approval. End with a working page; bump BUILD_LOG and
-REVIEW when done.
+Don't touch the recording pipeline's byte behavior or the streamed save
+flows (differentials enforce). Firefox first. Faculty tone. Delegate
+drafting to Sonnet agents; orchestrator reviews EVERYTHING before it
+ships (today: 5 defects caught in the v1.21 draft alone, incl. a
+data-loss delete — the review pass stays load-bearing). File Edit Rule:
+agents draft in scratch; orchestrator presents in full, waits for
+approval. End with a working page; bump BUILD_LOG and REVIEW when done.

@@ -475,7 +475,14 @@ retry without restart fails identically; first live detection fired
 correctly 4s into the owner's session). Harness 137/936. Owner
 acceptance of the resilience behaviors owed (BUILD_LOG v1.21 manual
 list). Firefox ~154 may fix the upstream regression; v1.21's guards stay
-valuable regardless.
+valuable regardless. **v1.21.2 (same day): ROOT CAUSE found and fixed —
+the app requested `…,opus` unconditionally; FF153 silently records
+NOTHING on `vp8,opus` with a video-only stream (owner-reproduced
+deterministically via console experiment; vp9 isn't supported by FF at
+all, so FF always landed on the broken combo). Opus is now requested
+only when the stream has audio (scenario DX; harness 138/940). The
+failure was never intermittent — it was configuration-determined
+(no-mic recordings always died; mic recordings always worked).**
 
 ### 23. Pause → change screens → resume — owner-requested (2026-08-02)
 

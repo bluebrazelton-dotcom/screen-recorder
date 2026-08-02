@@ -4547,6 +4547,35 @@ Real cue text
     sandbox.finalizeRecording = origFinalize;
   });
 
+  // DX — v1.21.2: the opus request must track actual audio presence.
+  // Firefox 153's recorder silently produces NOTHING (state stuck on
+  // 'recording', zero dataavailable, no onstop/onerror) when asked for an
+  // audio codec on a video-only stream — owner-reproduced deterministically
+  // (2026-08-02): vp8,opus/video-only = 0 chunks; vp8/video-only = fine, in
+  // the SAME healthy session. The app must never name opus without audio.
+  await scenario('DX codec choice tracks audio presence: no audio source -> no opus in the requested/stored mimeType; mic on -> opus requested', async () => {
+    // --- no audio sources: opus must NOT be requested ---
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    await api.startRecording();
+    assert(state.mediaRecorder && state.mediaRecorder.opts && !/opus/.test(state.mediaRecorder.opts.mimeType),
+      'video-only recording must not request opus (got ' + (state.mediaRecorder && state.mediaRecorder.opts && state.mediaRecorder.opts.mimeType) + ')');
+    assert(/^video\/webm/.test(state.mediaRecorder.opts.mimeType), 'still a webm video mimeType');
+    let sessions = await readStore('sessions');
+    assert(sessions.length === 1 && !/opus/.test(sessions[0].mimeType), 'the stored session mimeType matches (no opus)');
+    await sandbox.stopRecording();
+    await drain();
+
+    // --- mic on: opus must be requested ---
+    state.sources = { screen: true, camera: false, mic: true };
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    await api.startRecording();
+    assert(state.mediaRecorder && /,opus/.test(state.mediaRecorder.opts.mimeType),
+      'a recording WITH an audio source requests opus (got ' + (state.mediaRecorder && state.mediaRecorder.opts && state.mediaRecorder.opts.mimeType) + ')');
+    await sandbox.stopRecording();
+    await drain();
+  });
+
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');
   process.exit(failed ? 1 : 0);
 })();

@@ -1744,6 +1744,40 @@ Harness: **137 scenarios / 936 assertions**.
 
 ---
 
+### v1.21.2 — ROOT CAUSE of the silent recorder death: opus requested on audio-less streams (2026-08-02)
+
+**Commit:** `v1.21.2: only request opus when the stream has audio — FF153 silently records NOTHING on 'vp8,opus' with a video-only stream (owner-reproduced deterministically)`
+
+The whole day's "intermittent Firefox recorder death" was DETERMINISTIC
+and configuration-triggered — and the app's own doing. The owner's
+console experiment (throwaway canvas stream, same healthy session):
+
+- `video/webm;codecs=vp9,opus` → constructor throws NotSupportedError
+  (FF doesn't do vp9 — so FF always fell to the next choice…)
+- `video/webm;codecs=vp8,opus` on a VIDEO-ONLY stream → **0 chunks,
+  state stuck on 'recording', no events** — the silent death, on demand
+- `video/webm;codecs=vp8` (no audio codec), same stream → records fine
+- browser default, same stream → records fine
+
+The app requested `…,opus` unconditionally; any recording without a mic
+or system audio (screen-only, screen+webcam) named an audio codec for a
+stream with no audio track. Older Firefox tolerated it; 153 does not.
+"Restart Firefox fixed it" was coincidence (source toggles between
+attempts). Fix: `audioCodecSuffix = audioStreams.length > 0 ? ',opus' : ''`
+threaded through the existing vp9→vp8→default fallback chain. Audio
+recordings are byte-identical in behavior to before; audio-less
+recordings now request a video-only codec string.
+
+The v1.21 watchdogs remain fully earned: start-verification is what
+turned this from "silent phantom recordings" into "diagnosed via three
+console pastes," and it still guards every other way a recorder can die.
+
+**Tests:** scenario DX — video-only recording requests AND stores a
+mimeType with no opus; mic-on requests opus. Harness: **138 scenarios /
+940 assertions**.
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.
