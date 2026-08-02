@@ -451,6 +451,26 @@ field rewritten (or converted to unknown-size) — and the truncated-known-size
 asymmetry scenario AX pins must be respected. Differential harness coverage
 mandatory. Design brief first; Fable designs/reviews, Sonnet executes.
 
+### 24. Recorder & storage resilience — SHIPPED v1.21 (2026-08-02)
+
+Owner acceptance testing surfaced a Firefox 153 failure: MediaRecorder
+intermittently dies silently (no onstop, no onerror, zero chunks; sticky
+per browser session; storage healthy — confirmed by in-field console
+diagnostics after a storage-wedge theory was ruled out). The app trusted
+start(): phantom recordings, silently dead Stop & save (the old
+`state==='inactive'` early return), zero-chunk sessions invisible to the
+recovery banner. v1.21 ships: start verification (~4s abort of phantom
+recordings; salvage — never delete — when footage exists), dead-recorder
+salvage in stopRecording, an onstop watchdog with a sync claim flag
+(no double-finalize; survives resetUI by design), onerror salvage, a
+write-stall warning, and storage watchdogs (openDB / sessionChunkStats
+races with restart-Firefox guidance; qm-shutdown-hangs Bugzilla family).
+Orchestrator review caught 5 draft defects incl. a data-loss delete and
+a prematurely-disarmed watchdog. Scenarios DV(a)–(h)/DW(g); harness
+137/928. Owner acceptance of the resilience behaviors owed (BUILD_LOG
+v1.21 manual list). Firefox ~154 may fix the upstream regression;
+v1.21's guards stay valuable regardless.
+
 ### 23. Pause → change screens → resume — owner-requested (2026-08-02)
 
 While paused, let the user pick a different screen/window, then resume —

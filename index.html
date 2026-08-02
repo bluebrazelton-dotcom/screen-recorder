@@ -783,7 +783,7 @@
       <button class="primary btn-save-srt" onclick="onExportCaptionsClick('srt')">.srt</button>
     </div>
 
-    <div class="caption-hint">Captions save as their own small file (.vtt or .srt) next to your video — the video itself is unchanged. Keep the two files together: course sites and video players find the captions automatically.</div>
+    <div class="caption-hint">Captions save as their own small file (.vtt or .srt) next to your video — the video itself is unchanged. Keep the two files in the same folder: course sites and video players find the captions automatically.</div>
 
     <div class="caption-status" id="captionStatus"></div>
 
@@ -3772,6 +3772,167 @@ function updateRecordButton() {
 // ============================================================
 // Recording
 // ============================================================
+
+// Field evidence (Firefox 153, file://): MediaRecorder intermittently dies
+// SILENTLY — start() resolves, state.recording flips true, but no chunk ever
+// lands, and neither onstop nor onerror ever fires. Separately, Firefox's
+// storage layer can wedge outright (the qm-shutdown-hangs Bugzilla family).
+// The watchdogs below assume nothing about the recorder or IndexedDB and
+// verify both are actually alive instead of trusting a call that resolved.
+//
+// var, not let/const (same reason as STREAM_CARRY_CAP/micHoldInFlight above):
+// top-level let/const never attach to the vm sandbox test.cjs runs this
+// script in, so the test harness couldn't read or shrink them. These are
+// deliberately test-adjustable — test.cjs shrinks the *_MS values directly
+// (sandbox.STORAGE_WATCHDOG_MS = ...) for the two watchdogs that are embedded
+// inline in a Promise.race (A/B, checkForRecovery/finalizeRecording) rather
+// than exposed as a standalone check function; H/C/F's check bodies are
+// exposed via __api instead and called directly, so their *_MS values only
+// matter for the real (non-test) timers.
+var START_VERIFY_MS = 4000;        // H — silent-start-failure detection window
+var STORAGE_WATCHDOG_MS = 8000;    // A/B — IndexedDB open/stat race timeout
+var STOP_WATCHDOG_MS = 8000;       // F — onstop-never-fired detection window
+var WRITE_STALL_MS = 12000;        // C — "no chunk write has landed recently" threshold
+var WRITE_STALL_CHECK_MS = 5000;   // C — how often the stall watchdog polls
+
+// H — one-shot timer id (or null) scheduled at recording start; cleared on
+// the first sign the recorder is healthy or on any stop/abort path.
+var startVerifyTimer = null;
+// F — one-shot timer id (or null) armed whenever stopRecording()/onerror
+// calls .stop() and are waiting for onstop to confirm it actually happened.
+var stopWatchdogTimer = null;
+// F — synchronous check-and-set flag: whichever of onstop / the stop
+// watchdog reaches finalizeRecording() first for THIS recording "wins";
+// the other becomes a no-op. Reset per recording start (see claimFinalize).
+var finalizeStarted = false;
+// C — own interval id (distinct from state.timerInterval) polling for a
+// chunk-write stall while a recording is in progress.
+var writeStallIntervalId = null;
+// C — wall-clock time of the last chunk write that actually landed in
+// IndexedDB, stamped from inside the existing ondataavailable chain (see
+// startRecording) without restructuring that chain at all.
+var lastChunkWriteOkAt = 0;
+// C — "have we already warned about the CURRENT stall episode" so the
+// warning fires once per episode, not once per WRITE_STALL_CHECK_MS tick.
+var writeStallWarned = false;
+
+// F helper: onstop and the stop watchdog both want to call finalizeRecording()
+// for the same recording, but only one may actually do it. First caller to
+// see finalizeStarted===false flips it and proceeds; the loser is a no-op.
+function claimFinalize() {
+  if (finalizeStarted) return false;
+  finalizeStarted = true;
+  return true;
+}
+
+function clearStartVerify() {
+  if (startVerifyTimer) { clearTimeout(startVerifyTimer); startVerifyTimer = null; }
+}
+
+function clearStopWatchdog() {
+  if (stopWatchdogTimer) { clearTimeout(stopWatchdogTimer); stopWatchdogTimer = null; }
+}
+
+function clearWriteStallInterval() {
+  if (writeStallIntervalId) { clearInterval(writeStallIntervalId); writeStallIntervalId = null; }
+}
+
+// H — centerpiece of this batch. Scheduled once, START_VERIFY_MS after a
+// recorder's start() call returns without throwing. Exposed via __api so
+// tests invoke it directly instead of waiting out a real 4-second timer.
+async function verifyRecorderStarted() {
+  startVerifyTimer = null; // this firing (real or direct test call) consumes the scheduled check
+  // finalizeStarted covers the window where a normal stop/salvage/watchdog
+  // has already claimed this recording but state.recording hasn't flipped
+  // false yet (finalizeRecording's cleanupStreams runs in its finally,
+  // asynchronously) — without this check, a verify firing in that window
+  // could race a save already in flight.
+  if (!state.recording || finalizeStarted) return;
+  const rec = state.mediaRecorder;
+
+  if (state.chunkIndex > 0) {
+    // At least one chunk landed — there is real footage. Even if the
+    // recorder has since died, this is a SALVAGE, never a delete: deleting
+    // a session with captured footage in it would be data loss.
+    if (rec && rec.state !== 'inactive') return; // still alive — healthy, nothing to do
+    showError('Recording stopped responding — saving what was captured so far.');
+    stopTimer();
+    state.stopMode = 'save'; // a dead recorder is never a moment for the review flow
+    if (claimFinalize()) {
+      await finalizeRecording();
+    }
+    return;
+  }
+
+  // chunkIndex === 0: whether the recorder is missing, inactive, or still
+  // claiming 'recording' with nothing to show for START_VERIFY_MS worth of
+  // time, it's phantom either way — Firefox's silent-death failure mode.
+  // Nothing was captured, so this is a clean abort, not a stop-and-save.
+  // Claim finalize FIRST, before doing anything else: this blocks a late
+  // real onstop from finalizing the session we're about to delete out from
+  // under it. finalizeStarted resets at the next startRecording(), so
+  // claiming it here (with no matching finalizeRecording call) causes no
+  // lasting harm.
+  claimFinalize();
+  const emptySessionId = state.sessionId;
+  cleanupStreams(); // same teardown the normal stop path uses (see finalizeRecording's finally)
+  if (emptySessionId) {
+    try { await deleteSession(emptySessionId); }
+    catch (err) { console.error('Failed to delete empty session after silent start failure:', err); }
+  }
+  resetUI();
+  // cleanupStreams() just released the screen/camera streams, so the user
+  // has to re-pick a source before Record works again — say so explicitly.
+  showError("Recording couldn't start — Firefox's recorder failed silently. Select your screen and click Record to try again. If it keeps happening, restart Firefox.");
+}
+
+// C — per-tick body of the write-stall watchdog, exposed via __api so tests
+// drive it directly. Guards: only while actually recording and unpaused, and
+// only once chunkIndex > 0 — a zero-chunk stall is H's job (the recorder
+// never started at all), not this function's.
+function checkWriteStall() {
+  if (!state.recording || state.paused || state.chunkIndex === 0) return;
+  if (Date.now() - lastChunkWriteOkAt <= WRITE_STALL_MS) return;
+  if (writeStallWarned) return; // already warned this episode
+  writeStallWarned = true;
+  showError('Warning: this recording has stopped saving to disk. Footage up to a moment ago is safe, but NEW footage is not being captured. Stop the recording now, then restart Firefox.');
+}
+
+// F — fires STOP_WATCHDOG_MS after stopRecording()/onerror ask the recorder
+// to stop, in case onstop never arrives (a zombie recorder). Exposed via
+// __api so tests invoke it directly instead of waiting out a real timer.
+async function stopWatchdogFire() {
+  stopWatchdogTimer = null;
+  if (!claimFinalize()) return; // onstop already got there first — nothing to salvage
+  showError('Recording stopped responding — saving what was captured so far.');
+  stopTimer();
+  // A dead recorder is not a moment for the review flow — force 'save'
+  // regardless of which Stop button the user clicked (mirrors E's salvage
+  // branch in stopRecording, and H's salvage branch in verifyRecorderStarted).
+  state.stopMode = 'save';
+  await finalizeRecording();
+}
+
+function armStopWatchdog() {
+  clearStopWatchdog();
+  stopWatchdogTimer = setTimeout(stopWatchdogFire, STOP_WATCHDOG_MS);
+}
+
+// A/B — Firefox's storage layer can wedge outright (qm-shutdown-hangs
+// Bugzilla family). Races `promise` against STORAGE_WATCHDOG_MS so a hung
+// IndexedDB call surfaces a plain-language message instead of hanging the
+// page (or a save) forever. Rejects with StorageWatchdogTimeoutError on
+// timeout so callers can tell "storage is wedged" apart from a normal
+// IndexedDB error.
+class StorageWatchdogTimeoutError extends Error {}
+function withStorageWatchdog(promise) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new StorageWatchdogTimeoutError('storage watchdog timeout')), STORAGE_WATCHDOG_MS);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
 async function startRecording() {
   showError('');
   const btnRecord = document.getElementById('btnRecord');
@@ -3882,6 +4043,11 @@ async function startRecording() {
           if (writeFailed) return;  // an earlier chunk already failed — stop writing
           try {
             await addChunk(state.sessionId, idx, e.data);
+            // C — a write just landed: stamp it and clear any stall warning
+            // for the episode that just ended. Added statement only; the
+            // promise chain above is untouched.
+            lastChunkWriteOkAt = Date.now();
+            writeStallWarned = false;
             updateChunkCount(idx + 1);
           } catch (err) {
             handleWriteFailure(err);
@@ -3893,12 +4059,31 @@ async function startRecording() {
     recorder.onstop = async () => {
       // Wait for the final chunk to be written before saving
       await lastChunkWrite;
+      // F — mutually exclusive with the stop watchdog's own finalize: first
+      // to claim wins (see claimFinalize doc comment above). The watchdog is
+      // only cleared AFTER we've won the claim — NOT before the await above.
+      // If lastChunkWrite hangs (storage dead), the watchdog must stay armed
+      // so it can still salvage; clearing it before the await would silently
+      // disarm the one thing that catches a hung final write.
+      // Consequence: if the final write takes longer than STOP_WATCHDOG_MS,
+      // the watchdog finalizes without that last chunk — acceptable, since
+      // minor tail loss beats total loss, and the watchdog's own message
+      // already says "what was captured so far".
+      if (!claimFinalize()) return;
+      clearStopWatchdog();
       await finalizeRecording();
     };
 
     recorder.onerror = (e) => {
       console.error('MediaRecorder error:', e);
       showError('Recording error: ' + (e.error?.message || 'Unknown error'));
+      // G — mirror handleWriteFailure's pattern: try to stop the recorder so
+      // onstop -> finalize salvages whatever chunks already landed. Arm the
+      // stop watchdog FIRST in case this stop() call is itself swallowed
+      // (throws, or never actually triggers onstop) — see F.
+      armStopWatchdog();
+      try { if (recorder.state !== 'inactive') recorder.stop(); }
+      catch (stopErr) { console.error('Could not stop recorder after onerror:', stopErr); }
     };
 
     // Start recording with 1-second timeslice
@@ -3908,6 +4093,17 @@ async function startRecording() {
     state.paused = false;
     state.startTime = Date.now();
     state.pausedDuration = 0;
+
+    // H/C/F — fresh watchdog state for this recording (STATE HYGIENE: every
+    // one of these is also cleared in resetUI and reset here, never carried
+    // over from a previous recording).
+    finalizeStarted = false;
+    lastChunkWriteOkAt = Date.now();
+    writeStallWarned = false;
+    clearStartVerify();
+    startVerifyTimer = setTimeout(verifyRecorderStarted, START_VERIFY_MS);
+    clearWriteStallInterval();
+    writeStallIntervalId = setInterval(checkWriteStall, WRITE_STALL_CHECK_MS);
 
     // Update UI
     document.getElementById('placeholder').classList.add('hidden');
@@ -3959,6 +4155,11 @@ function pauseResume() {
     state.mediaRecorder.resume();
     state.paused = false;
     state.pausedDuration += Date.now() - state.pauseStart;
+    // C — no dataavailable events land while paused, so the stall clock
+    // would otherwise start counting from before the pause. Reset it here
+    // so resuming never immediately reads as a stall.
+    lastChunkWriteOkAt = Date.now();
+    writeStallWarned = false;
     document.getElementById('btnPause').textContent = 'Pause';
     updateStatus('recording', 'Recording');
   } else {
@@ -3971,7 +4172,37 @@ function pauseResume() {
 }
 
 async function stopRecording() {
-  if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') return;
+  if (!state.recording) return; // idle — nothing to stop, plain no-op
+
+  // R4: whichever branch below this call takes (salvage or normal), the
+  // start-verify timer's job is already moot — we're actively stopping.
+  // Also closes a narrow race: if the recorder died before START_VERIFY_MS
+  // and the user clicks Stop while a salvage finalize is starting, a verify
+  // firing mid-finalize could otherwise interleave with it (verifyRecorderStarted's
+  // own finalizeStarted check closes most of this already, but there's no
+  // reason to leave a pointless timer pending either way).
+  clearStartVerify();
+
+  if (!state.mediaRecorder || state.mediaRecorder.state === 'inactive') {
+    // E — dead-recorder salvage. state.recording is true but there is no
+    // live recorder to call .stop() on and wait for onstop from — the same
+    // silent-death failure mode H catches at start (see verifyRecorderStarted),
+    // just discovered here instead, mid-recording, by the user clicking Stop.
+    // Route straight to finalizeRecording so whatever chunks landed before
+    // it died get saved; finalizeRecording's existing zero-chunk branch
+    // already covers "literally nothing was captured". A dead recorder is
+    // never a moment for the review flow, so force 'save' regardless of
+    // which Stop button was clicked. claimFinalize() guards against a stop
+    // watchdog (F) that's still pending from an earlier onerror also trying
+    // to finalize this same recording.
+    showError('Recording stopped responding — saving what was captured so far.');
+    stopTimer();
+    state.stopMode = 'save';
+    if (claimFinalize()) {
+      await finalizeRecording();
+    }
+    return;
+  }
 
   // Clear any stale pre-stop error (e.g. the caption-editor recording guard)
   // now, not on the next status update — otherwise it sits on screen through
@@ -3992,6 +4223,13 @@ async function stopRecording() {
   // itself has already stopped capturing by then, but the on-screen timer
   // used to keep ticking through the entire save.
   stopTimer();
+
+  // F — arm the stop watchdog BEFORE calling stop(): a mock (or, in theory,
+  // an already-inactive real recorder) can invoke onstop synchronously
+  // inside the .stop() call below, and onstop's own clearStopWatchdog()
+  // call needs a timer to actually cancel, not a race against one that
+  // hasn't been armed yet.
+  armStopWatchdog();
 
   // Request the final chunk, then stop fires
   state.mediaRecorder.stop();
@@ -4033,7 +4271,11 @@ async function finalizeRecording() {
 
     // Count chunks WITHOUT loading them (REVIEW #5): the single-segment save
     // streams straight from IndexedDB, so nothing here builds a whole-recording blob.
-    const stats = await sessionChunkStats(state.sessionId);
+    // B — watchdogged: Firefox's storage layer can wedge outright, and a hung
+    // stat call here would otherwise strand the user on "Saving..." forever
+    // with a perfectly safe recording sitting in IndexedDB. Only this call is
+    // wrapped — the streamed save internals below are untouched.
+    const stats = await withStorageWatchdog(sessionChunkStats(state.sessionId));
     if (stats.count === 0 && state.priorSegments.length === 0) {
       showError('No recording data found.');
       resetUI();
@@ -4068,8 +4310,17 @@ async function finalizeRecording() {
     }
 
   } catch (err) {
-    console.error('Failed to finalize:', err);
-    showError('Save failed: ' + err.message + '. Your recording is safe — refresh and use Recovery.');
+    if (err instanceof StorageWatchdogTimeoutError) {
+      // B — storage is wedged, not merely erroring. Nothing was deleted or
+      // completed above (the watchdog fired on the stats read, before any
+      // save branch), so the recording is exactly as safe as it was before
+      // Stop was clicked — the recovery banner will pick it up once
+      // Firefox's storage layer comes back.
+      showError("Firefox's storage isn't responding, so this recording can't be saved right now. Your recording is safe — close all Firefox windows, restart Firefox, reopen this page, and use the recovery banner to save it.");
+    } else {
+      console.error('Failed to finalize:', err);
+      showError('Save failed: ' + err.message + '. Your recording is safe — refresh and use Recovery.');
+    }
   } finally {
     cleanupStreams();
     resetUI();
@@ -4343,9 +4594,18 @@ function stitchFallbackKeep() {
 // Recovery
 // ============================================================
 async function checkForRecovery() {
+  // R5: declared outside the try so the catch block can still reach it —
+  // the watchdog race doesn't cancel the underlying openDB() call, so if it
+  // resolves late (storage was merely slow, not actually dead), the
+  // connection it opened must still get closed instead of leaking.
+  let dbPromise = null;
   try {
     // Find all incomplete sessions (there may be multiple from repeated crashes)
-    const db = await openDB();
+    // A — watchdogged: Firefox's storage layer can wedge outright at page
+    // load (qm-shutdown-hangs Bugzilla family), which would otherwise hang
+    // this open() forever with no feedback to the user at all.
+    dbPromise = openDB();
+    const db = await withStorageWatchdog(dbPromise);
     const allSessions = await new Promise((resolve, reject) => {
       const tx = db.transaction('sessions', 'readonly');
       const req = tx.objectStore('sessions').getAll();
@@ -4395,6 +4655,13 @@ async function checkForRecovery() {
     window._recoverySessionId = sessionInfos[sessionInfos.length - 1].id;
     window._recoveryMimeType = sessionInfos[sessionInfos.length - 1].mimeType;
   } catch (err) {
+    if (err instanceof StorageWatchdogTimeoutError) {
+      showError("Firefox's storage isn't responding, so DidaRec can't check for recordings to recover. Close ALL Firefox windows, restart Firefox, then reopen this page — any interrupted recording is still safe.");
+      // R5: the raced-out openDB() call is still out there — if/when it
+      // resolves, close that connection instead of leaking it open forever.
+      if (dbPromise) dbPromise.then(d => { try { d.close(); } catch (e) {} }).catch(() => {});
+      return;
+    }
     console.error('Recovery check failed:', err);
   }
 }
@@ -4606,7 +4873,23 @@ function resetUI() {
     updateStatus('idle', 'Ready');
   }
   updateChunkCount(0);
-  stopTimer();
+  stopTimer(); // also clears the C write-stall interval — see stopTimer
+
+  // STATE HYGIENE: belt-and-suspenders clear of the H/F one-shot timers. In
+  // the normal flow these are already cleared at their own call sites, but
+  // resetUI is the single guaranteed exit for every path (normal stop,
+  // salvage, abort, storage-watchdog bail), so it clears them again here
+  // rather than trusting every caller got it right.
+  //
+  // finalizeStarted is deliberately NOT reset here, even though resetUI runs
+  // at the end of every finalizeRecording call. Its whole job is to survive
+  // past this point: a stop-watchdog salvage (F) calls finalizeRecording,
+  // whose finally lands right here, and a LATE onstop can still arrive after
+  // that — finalizeStarted staying true is exactly what makes that late
+  // onstop a no-op instead of a double finalize. It is reset in exactly one
+  // place: startRecording(), at the start of the NEXT recording.
+  clearStartVerify();
+  clearStopWatchdog();
 
   // Clear canvas
   ctx.fillStyle = '#000';
@@ -4648,6 +4931,10 @@ function stopTimer() {
     clearInterval(state.timerInterval);
     state.timerInterval = null;
   }
+  // C — same call sites as the elapsed timer (resetUI + stopRecording), so
+  // the write-stall watchdog's own interval rides along here instead of
+  // needing its own set of call sites threaded through both places.
+  clearWriteStallInterval();
 }
 
 function updateTimerDisplay() {

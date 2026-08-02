@@ -1646,6 +1646,89 @@ flow's byte behavior.
 
 ---
 
+### v1.21 — Recorder & storage resilience (REVIEW #24, owner-incident-driven) (2026-08-02)
+
+**Commit:** `v1.21: verify the recorder is alive (start check, stop watchdog, write-stall watchdog, onerror/dead-recorder salvage); storage watchdogs; caption-hint wording`
+
+**The incident:** on Firefox 153 (file://), MediaRecorder intermittently
+dies SILENTLY — start() resolves and the UI flips to recording, but no
+chunk ever lands and NEITHER onstop NOR onerror ever fires (diagnostic
+captured recorderState=inactive, chunksProduced=0, input track still
+live, storage fully healthy). The failure is sticky per Firefox session;
+a browser restart clears it. The app trusted start(): phantom recordings
+ran indefinitely, Stop & save silently no-opped (the old first-line
+`state === 'inactive'` early return), zero-chunk sessions vanished from
+the recovery banner — the owner's "dead save dialog / no recovery
+banner" reports, previously misattributed to a storage wedge that
+diagnostics then ruled out. Missing chunk counter ("N chunks saved"
+never appearing) is the visible fingerprint.
+
+**What ships — the recorder is verified, never trusted:**
+
+1. **Start verification (H, the centerpiece):** ~4s after start
+   (`START_VERIFY_MS`), `verifyRecorderStarted` checks chunks actually
+   landed. Zero chunks (recorder missing, inactive, or zombie-"recording")
+   → clean abort: claim the finalize flag FIRST (blocks a late onstop
+   from finalizing the session being deleted), teardown, delete the
+   empty session, plain message ("...Select your screen and click Record
+   to try again... restart Firefox"). Chunks-then-died → **SALVAGE, never
+   delete** (orchestrator review caught the draft deleting real footage
+   here — R1) — routes to the normal finalize/save.
+2. **Dead-recorder salvage in stopRecording (E):** the silent early
+   return is gone. Idle (`!state.recording`) stays a no-op; recording
+   with a dead recorder → message + finalizeRecording saves whatever
+   landed. Double-click can't mistrigger it (first click disables both
+   stop buttons synchronously).
+3. **Stop watchdog (F):** armed before every .stop(); if onstop never
+   arrives within `STOP_WATCHDOG_MS` (8s), force-finalize with what's
+   stored. `claimFinalize()` (sync check-and-set) makes onstop and the
+   watchdog mutually exclusive; onstop only disarms the watchdog AFTER
+   winning the claim, so a hung final chunk-write can't silently disarm
+   it (R2). `finalizeStarted` deliberately survives resetUI and resets
+   only at the next startRecording — a late onstop after a watchdog
+   salvage must stay a no-op.
+4. **onerror salvage (G):** onerror now arms the stop watchdog and
+   attempts recorder.stop() (handleWriteFailure's pattern) instead of
+   only displaying the error.
+5. **Write-stall watchdog (C):** chunk-write completions stamp
+   `lastChunkWriteOkAt` (added statement inside the existing
+   ondataavailable chain — the await chain is untouched); an interval
+   warns once per stall episode if no write lands for `WRITE_STALL_MS`
+   (12s) while recording ("footage up to a moment ago is safe, NEW
+   footage is not being captured"). Pause-aware (resume restamps);
+   zero-chunk stalls are H's job. All salvage paths force
+   stopMode='save' — a dead recorder is never a moment for the review
+   flow (R3).
+6. **Storage watchdogs (A/B):** checkForRecovery's openDB and
+   finalizeRecording's sessionChunkStats race an 8s
+   `StorageWatchdogTimeoutError` → restart-Firefox guidance; nothing
+   deleted/completed on the timeout path; late-resolving openDB
+   connections are closed, not leaked (R5). Firefox storage CAN wedge
+   (Bugzilla qm-shutdown-hangs family) even though it wasn't this
+   incident's culprit. Streamed save internals untouched.
+7. **Caption hint:** "Keep the two files together" → "in the same
+   folder" (owner feedback).
+
+Consts are `var` (vm-visible) and test-adjustable: START_VERIFY_MS,
+STORAGE_WATCHDOG_MS, STOP_WATCHDOG_MS, WRITE_STALL_MS,
+WRITE_STALL_CHECK_MS. Check bodies exposed via `__api` so tests drive
+them directly instead of waiting out real timers.
+
+**Orchestrator review caught 5 defects in the draft:** the R1 data-loss
+delete, the R2 early watchdog disarm, R3 review-mode routing leak, an R4
+start-verify/Stop-click timer race, and the R5 connection leak — all
+fixed and regression-pinned (DV(d), DV(g), DV(h) + clearStartVerify in
+stopRecording).
+
+**Tests:** scenarios DV(a)–(h) and DW(g). Harness: **137 scenarios /
+928 assertions** (was 128/855).
+
+**No changes to** chunk-write logic, any save flow's byte behavior, or
+seam/cut math — observation and routing only; every differential passes
+unchanged.
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.
@@ -1944,6 +2027,28 @@ DOM/video element; run in both Firefox (primary) and Chrome (secondary)):**
    recording) → the banner has a × that dismisses it.
 5. **Caption hint.** Open the caption editor → the sidecar explanation
    line is visible under the export buttons and reads sensibly.
+
+**Manual acceptance test (v1.21 recorder resilience — Firefox primary; the
+failure it detects is the Firefox 153 silent recorder death):**
+1. **Healthy start.** Record normally → "N chunks saved" climbs; no
+   watchdog message ever appears during a normal record/stop/save cycle,
+   including pauses longer than 12s (pause must never trigger the stall
+   warning).
+2. **Phantom start called out.** When Firefox is in its broken state
+   (chunk counter never appears): within ~4s of clicking Record the app
+   must abort on its own with "Recording couldn't start — Firefox's
+   recorder failed silently…" and return to a usable idle (re-select
+   screen + Record works). No phantom recording should ever run longer
+   than ~4 seconds.
+3. **Salvage on dead stop.** If a recording dies mid-way (or Firefox is
+   broken mid-session): Stop & save must NEVER silently do nothing — it
+   either saves what was captured or says plainly what's wrong. The
+   9-item sequence from the v1.20.2 list item 2 (guard → Stop) should
+   also still pass.
+4. **Storage guidance (only if seen).** If the "Firefox's storage isn't
+   responding" message ever appears at page load or save, note the
+   circumstances — it means the (rarer) storage wedge, and restart
+   guidance should be accurate.
 
 ---
 

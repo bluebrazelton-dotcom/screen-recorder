@@ -174,7 +174,7 @@ const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!scriptMatch) { console.log('FATAL: no <script> block found in index.html'); process.exit(2); }
 let code = scriptMatch[1];
-code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT, openDB, captionEditorState, captionFileKey, captionAddCue, captionDeleteCue, captionUpdateCueTime, captionUpdateCueText, captionPreviewVTT, captionParseCaptionText, captionBuildImportMessage, captionApplyImport, captionExportFilename, captionExport, saveCaptionDraft, loadCaptionDraft, deleteCaptionDraft, captionContinueDraftUI, captionStartFreshUI, openCaptionEditor, closeCaptionEditor, handleCaptionVideoFile, renderCueList, updateActiveCueHighlight, onCaptionVideoTimeUpdate, captionCueRowEls, onCaptionVideoInputChange, onCaptionImportInputChange, onAddCaptionClick, reviewState, SEAM_GAP_MS };';
+code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT, openDB, captionEditorState, captionFileKey, captionAddCue, captionDeleteCue, captionUpdateCueTime, captionUpdateCueText, captionPreviewVTT, captionParseCaptionText, captionBuildImportMessage, captionApplyImport, captionExportFilename, captionExport, saveCaptionDraft, loadCaptionDraft, deleteCaptionDraft, captionContinueDraftUI, captionStartFreshUI, openCaptionEditor, closeCaptionEditor, handleCaptionVideoFile, renderCueList, updateActiveCueHighlight, onCaptionVideoTimeUpdate, captionCueRowEls, onCaptionVideoInputChange, onCaptionImportInputChange, onAddCaptionClick, reviewState, SEAM_GAP_MS, checkForRecovery, stopRecording, verifyRecorderStarted, checkWriteStall, stopWatchdogFire, claimFinalize, armStopWatchdog };';
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app_new.js' });
 const api = sandbox.__api;
@@ -198,6 +198,20 @@ sandbox.showError = (m) => { recordedErrors.push(m || ''); };
 const ORIG_updateStatus = sandbox.updateStatus;
 sandbox.updateStatus = (mode, text) => { statusHistory.push(text); return ORIG_updateStatus(mode, text); };
 const ORIG_CARRY_CAP = sandbox.STREAM_CARRY_CAP;
+// DV/DW watchdogs: the *_MS values are declared `var` in index.html (same
+// reason as STREAM_CARRY_CAP above — top-level let/const never attach to
+// this vm sandbox) specifically so scenarios that must actually let a race
+// resolve (A/B's storage watchdogs, which are inline Promise.race calls with
+// no standalone check function to call directly) can shrink them instead of
+// sleeping through real 4-8 second waits. Captured once here, restored by
+// resetState() every scenario — same shape as ORIG_CARRY_CAP.
+const ORIG_TIMINGS = {
+  START_VERIFY_MS: sandbox.START_VERIFY_MS,
+  STORAGE_WATCHDOG_MS: sandbox.STORAGE_WATCHDOG_MS,
+  STOP_WATCHDOG_MS: sandbox.STOP_WATCHDOG_MS,
+  WRITE_STALL_MS: sandbox.WRITE_STALL_MS,
+  WRITE_STALL_CHECK_MS: sandbox.WRITE_STALL_CHECK_MS,
+};
 
 // ---------- helpers ----------
 function flushRaf() { const q = rafQueue; rafQueue = []; for (const { cb } of q) cb(16); }
@@ -302,6 +316,29 @@ async function resetState() {
   getUserMediaCalls = []; mockDevices = [];
   localStorageStore = {};
   sandbox.STREAM_CARRY_CAP = ORIG_CARRY_CAP;
+  // DV/DW watchdogs: restore the real timing constants (a scenario that
+  // shrank one to force a fast race must not leak that into the next
+  // scenario), and — critically — clear any real setTimeout/setInterval a
+  // previous scenario's startRecording()/armStopWatchdog() left pending.
+  // These are module-level `var`s in index.html (see ORIG_TIMINGS comment
+  // above), so a leftover 4-8s real timer would otherwise fire mid-way
+  // through a LATER, unrelated scenario and mutate its state out from under
+  // it — resetState() runs at the top of every scenario() call, so this is
+  // the one guaranteed choke point to catch it.
+  sandbox.START_VERIFY_MS = ORIG_TIMINGS.START_VERIFY_MS;
+  sandbox.STORAGE_WATCHDOG_MS = ORIG_TIMINGS.STORAGE_WATCHDOG_MS;
+  sandbox.STOP_WATCHDOG_MS = ORIG_TIMINGS.STOP_WATCHDOG_MS;
+  sandbox.WRITE_STALL_MS = ORIG_TIMINGS.WRITE_STALL_MS;
+  sandbox.WRITE_STALL_CHECK_MS = ORIG_TIMINGS.WRITE_STALL_CHECK_MS;
+  if (sandbox.startVerifyTimer) clearTimeout(sandbox.startVerifyTimer);
+  sandbox.startVerifyTimer = null;
+  if (sandbox.stopWatchdogTimer) clearTimeout(sandbox.stopWatchdogTimer);
+  sandbox.stopWatchdogTimer = null;
+  if (sandbox.writeStallIntervalId) clearInterval(sandbox.writeStallIntervalId);
+  sandbox.writeStallIntervalId = null;
+  sandbox.finalizeStarted = false;
+  sandbox.lastChunkWriteOkAt = 0;
+  sandbox.writeStallWarned = false;
 }
 
 // ---------- assertions ----------
@@ -4057,6 +4094,427 @@ Real cue text
     assert(state.recording === false && state.mediaRecorder === null, 'state fully reset once the save completes');
     assert(documentMock.getElementById('btnRecord').textContent === 'Record', 'resetUI ran (Record button restored)');
     assert(recordedErrors[recordedErrors.length - 1] === '', 'no new error appeared on the happy-path save — the banner stays cleared');
+  });
+
+  // ============================================================
+  // DV — watchdogs (H start-verify, C write-stall, A/B storage, F stop-watchdog)
+  // ============================================================
+
+  await scenario('DV(a) checkForRecovery storage watchdog: a hung openDB() -> guidance error, no throw, no banner', async () => {
+    sandbox.STORAGE_WATCHDOG_MS = 20; // shrink so the race resolves fast instead of waiting the real 8s
+    const origOpenDB = sandbox.openDB;
+    sandbox.openDB = () => new Promise(() => {}); // never resolves — models a wedged storage layer
+    let threw = false;
+    try { await api.checkForRecovery(); } catch (e) { threw = true; }
+    sandbox.openDB = origOpenDB;
+    assert(!threw, 'checkForRecovery does not throw on a storage-watchdog timeout');
+    assert(recordedErrors.some(m => /storage isn.t responding/i.test(m) && /recover/i.test(m)),
+      'guidance error shown (got: ' + JSON.stringify(recordedErrors) + ')');
+    assert(!documentMock.getElementById('recoveryBanner').classList.contains('visible'), 'no recovery banner is shown');
+  });
+
+  await scenario('DV(b) finalizeRecording storage watchdog: a hung sessionChunkStats() -> guidance error, nothing deleted/completed, UI restored', async () => {
+    sandbox.STORAGE_WATCHDOG_MS = 20;
+    const id = await seed(2);
+    state.sessionId = id; state.chunkIndex = 2;
+    windowMock.showSaveFilePicker = pickerSequence(['ok']); // must never actually be reached
+    const origStats = sandbox.sessionChunkStats;
+    sandbox.sessionChunkStats = () => new Promise(() => {}); // never resolves
+    let threw = false;
+    try { await api.finalizeRecording(); } catch (e) { threw = true; }
+    sandbox.sessionChunkStats = origStats;
+    assert(!threw, 'finalizeRecording does not throw on a storage-watchdog timeout');
+    assert(recordedErrors.some(m => /storage isn.t responding/i.test(m) && /saved right now/i.test(m)),
+      'guidance error shown (got: ' + JSON.stringify(recordedErrors) + ')');
+    const sessions = await readStore('sessions');
+    assert(sessions.length === 1 && sessions[0].id === id && sessions[0].completed === false,
+      'the session is neither deleted nor completed (got ' + sessions.length + ' sessions)');
+    assert(lastWritten.length === 0, 'no save was attempted');
+    assert(documentMock.getElementById('btnRecord').textContent === 'Record', 'resetUI ran (Record button restored)');
+  });
+
+  await scenario('DV(c) checkWriteStall: warns once per stale episode, a landed write resets it, paused and chunkIndex===0 never warn', async () => {
+    state.recording = true; state.paused = false; state.chunkIndex = 3;
+
+    // A stale write triggers exactly one new warning.
+    sandbox.writeStallWarned = false;
+    sandbox.lastChunkWriteOkAt = Date.now() - (sandbox.WRITE_STALL_MS + 1000);
+    let before = recordedErrors.length;
+    api.checkWriteStall();
+    assert(recordedErrors.length === before + 1, 'a stale write triggers exactly one new warning');
+    assert(/stopped saving to disk/i.test(recordedErrors[recordedErrors.length - 1]),
+      'the warning explains old footage is safe but new footage is not being captured');
+
+    // Repeated ticks within the same stall episode do not re-warn.
+    before = recordedErrors.length;
+    api.checkWriteStall();
+    api.checkWriteStall();
+    assert(recordedErrors.length === before, 'later ticks in the same stall episode do not re-warn');
+
+    // A landed write ends the episode (mirrors the stamp added to ondataavailable);
+    // going stale again afterward is a NEW episode and warns again.
+    sandbox.lastChunkWriteOkAt = Date.now();
+    sandbox.writeStallWarned = false;
+    sandbox.lastChunkWriteOkAt = Date.now() - (sandbox.WRITE_STALL_MS + 1000);
+    before = recordedErrors.length;
+    api.checkWriteStall();
+    assert(recordedErrors.length === before + 1, 'a fresh stale episode after a landed write warns again');
+
+    // A paused recording never warns, no matter how stale.
+    state.paused = true;
+    sandbox.writeStallWarned = false;
+    sandbox.lastChunkWriteOkAt = Date.now() - (sandbox.WRITE_STALL_MS + 1000);
+    before = recordedErrors.length;
+    api.checkWriteStall();
+    assert(recordedErrors.length === before, 'a paused recording never warns, no matter how stale');
+
+    // chunkIndex === 0 never warns via this watchdog — that's verifyRecorderStarted's (H's) job.
+    state.paused = false;
+    state.chunkIndex = 0;
+    sandbox.writeStallWarned = false;
+    before = recordedErrors.length;
+    api.checkWriteStall();
+    assert(recordedErrors.length === before, 'zero chunks never warns via the write-stall watchdog');
+  });
+
+  await scenario('DV(d) verifyRecorderStarted: zero chunks -> clean abort (and blocks a late onstop); chunks-then-died -> SALVAGE not delete (R1); producing chunks with a healthy recorder -> no-op', async () => {
+    const origFinalize = sandbox.finalizeRecording;
+    let finalizeCalls = 0;
+    sandbox.finalizeRecording = async (...args) => { finalizeCalls++; return origFinalize(...args); };
+
+    // --- zero chunks, recorder still reporting "recording" -> abort ---
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    await api.startRecording();
+    const emptySid = state.sessionId;
+    const emptyRec = state.mediaRecorder;
+    const capturedOnstop = emptyRec.onstop; // captured before verifyRecorderStarted nulls state.mediaRecorder
+    assert(state.chunkIndex === 0, 'precondition: no chunk has landed yet');
+    await api.verifyRecorderStarted();
+    let sessions = await readStore('sessions');
+    assert(sessions.find(s => s.id === emptySid) === undefined, 'the empty session is deleted');
+    assert(state.recording === false && state.mediaRecorder === null, 'cleanupStreams/resetUI ran — recording state fully cleared');
+    // Note: resetUI's updateRecordButton() disables Record until a screen is
+    // re-selected (cleanupStreams nulled state.screenStream) — same as after
+    // every normal stop, not something this abort path changes. "Record
+    // clickable again" means the UI is back in its normal idle state, not
+    // literally .disabled === false without re-selecting a screen.
+    assert(documentMock.getElementById('btnRecord').textContent === 'Record', 'resetUI ran (Record button restored to its idle label)');
+    assert(recordedErrors.some(m => /failed silently/i.test(m) && /restart Firefox/i.test(m)),
+      'the silent-start-failure message is shown (got ' + JSON.stringify(recordedErrors) + ')');
+    assert(finalizeCalls === 0, 'a zero-chunk abort never calls finalizeRecording — it deletes directly');
+
+    // The abort path claims finalize BEFORE deleting, specifically so a late
+    // real onstop (e.g. the recorder wasn't actually as dead as it looked,
+    // and eventually fires its own onstop) can never resurrect/finalize the
+    // session that was just deleted out from under it.
+    await capturedOnstop();
+    await drain();
+    assert(finalizeCalls === 0, 'a late onstop after the zero-chunk abort is blocked by claimFinalize — finalizeRecording is NOT called a second time');
+
+    // --- inactive recorder (died some other way), still zero chunks -> abort ---
+    recordedErrors.length = 0; finalizeCalls = 0;
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    await api.startRecording();
+    const emptySid2 = state.sessionId;
+    state.mediaRecorder.state = 'inactive'; // simulate the recorder having silently died
+    await api.verifyRecorderStarted();
+    sessions = await readStore('sessions');
+    assert(sessions.find(s => s.id === emptySid2) === undefined, 'the empty session is deleted (inactive-recorder case)');
+    assert(state.recording === false, 'recording state cleared (inactive-recorder case)');
+    assert(recordedErrors.some(m => /failed silently/i.test(m)), 'the silent-failure message is shown for the inactive-recorder case too');
+    assert(finalizeCalls === 0, 'the inactive-recorder zero-chunk case is also a delete, not a finalize');
+
+    // --- R1 regression guard: chunks produced, THEN the recorder died -> this
+    // MUST be a salvage (finalizeRecording), never the direct-delete abort
+    // path. First prove it is not an unconditional delete: cancel the save
+    // and confirm the chunk-bearing session survives, exactly like any other
+    // cancelled save would leave it.
+    recordedErrors.length = 0; finalizeCalls = 0; lastWritten.length = 0;
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    windowMock.showSaveFilePicker = pickerSequence(['abort']);
+    await api.startRecording();
+    const diedSid1 = state.sessionId;
+    let diedRec = state.mediaRecorder;
+    diedRec.ondataavailable({ data: new Blob(['x']) });
+    await drain();
+    assert(state.chunkIndex === 1, 'precondition: real footage was captured before the recorder died');
+    diedRec.state = 'inactive'; // the recorder silently died sometime after producing this chunk
+    await api.verifyRecorderStarted();
+    await drain();
+    assert(finalizeCalls === 1, 'R1: chunks-then-died routes to finalizeRecording (salvage), never the direct-delete abort path');
+    let sessionsAfterCancel = await readStore('sessions');
+    assert(sessionsAfterCancel.find(s => s.id === diedSid1) !== undefined,
+      'R1 regression guard: a cancelled salvage save leaves the chunk-bearing session intact — the old bug deleted it unconditionally, with no save attempted at all');
+    assert(lastWritten.length === 0, 'nothing was written — the save was cancelled, not skipped');
+    assert(recordedErrors.some(m => /stopped responding/i.test(m)), 'the salvage message (not the silent-start-failure message) is shown');
+    assert(state.stopMode === 'save', 'salvage forces save, never review');
+
+    // Now prove the salvage save actually completes end-to-end when confirmed.
+    recordedErrors.length = 0; finalizeCalls = 0; lastWritten.length = 0;
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.startRecording();
+    const diedSid2 = state.sessionId;
+    diedRec = state.mediaRecorder;
+    diedRec.ondataavailable({ data: new Blob(['y']) });
+    await drain();
+    diedRec.state = 'inactive';
+    await api.verifyRecorderStarted();
+    await drain();
+    assert(finalizeCalls === 1, 'the salvage finalize ran for the confirmed-save case too');
+    assert(lastWritten.length === 1, 'the salvage save actually completed and wrote the captured chunk');
+    const sessionsAfterConfirm = await readStore('sessions');
+    assert(sessionsAfterConfirm.find(s => s.id === diedSid2) === undefined,
+      'the session is deleted only as the natural result of the CONFIRMED save, not by the abort logic');
+
+    // --- chunks produced, recorder still healthy -> no-op, left completely alone ---
+    finalizeCalls = 0;
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    await api.startRecording();
+    const rec = state.mediaRecorder;
+    const healthySid = state.sessionId;
+    rec.ondataavailable({ data: new Blob(['x']) });
+    await drain();
+    assert(state.chunkIndex === 1, 'precondition: a chunk has landed');
+    // Reset AFTER startRecording()'s own showError('') call, right before
+    // the verify — otherwise that leading empty-string entry would make the
+    // exact recordedErrors.length === 0 check below fail for the wrong reason.
+    recordedErrors.length = 0;
+    await api.verifyRecorderStarted();
+    assert(state.recording === true && state.mediaRecorder === rec, 'a healthy recording is left completely untouched');
+    assert(recordedErrors.length === 0, 'no message is shown for a healthy recording');
+    assert(finalizeCalls === 0, 'a healthy recording never touches finalizeRecording via verify');
+    sessions = await readStore('sessions');
+    assert(sessions.find(s => s.id === healthySid) !== undefined, 'the in-progress session is not deleted');
+
+    // Let the still-running recording finish out cleanly (Firefox/download
+    // fallback — no picker needed) rather than leaving it dangling.
+    if (rec && rec.state !== 'inactive') rec.stop();
+    await drain();
+
+    sandbox.finalizeRecording = origFinalize;
+  });
+
+  await scenario('DV(e) stopRecording dead-recorder salvage: null or inactive mediaRecorder with recording=true routes straight to finalize; genuinely idle stays a silent no-op', async () => {
+    const origFinalize = sandbox.finalizeRecording;
+    let finalizeCalls = 0;
+    sandbox.finalizeRecording = async (...args) => { finalizeCalls++; return origFinalize(...args); };
+
+    // --- mediaRecorder === null ---
+    const id1 = await seed(2);
+    state.sessionId = id1; state.chunkIndex = 2; state.recording = true; state.mediaRecorder = null;
+    state.priorSegments = [];
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.stopRecording();
+    await drain();
+    assert(finalizeCalls === 1, 'finalizeRecording was invoked exactly once for the null-mediaRecorder case');
+    assert(lastWritten.length === 1, 'the seeded chunks were actually saved');
+    let sessions = await readStore('sessions');
+    assert(sessions.find(s => s.id === id1) === undefined, 'the session is deleted after the confirmed salvage save');
+    assert(recordedErrors.some(m => /stopped responding/i.test(m)), 'the salvage message is shown (got ' + JSON.stringify(recordedErrors) + ')');
+    assert(state.stopMode === 'save', 'a dead recorder always forces the save stopMode, never review');
+
+    // --- mock inactive recorder ---
+    // In real usage finalizeStarted only ever gets reused within a SINGLE
+    // recording's stop sequence — the next real recording always starts
+    // with startRecording(), which resets it. This scenario simulates two
+    // independent dead recordings back to back with no startRecording()
+    // between them, so it has to do that reset by hand here, same as
+    // startRecording() would.
+    sandbox.finalizeStarted = false;
+    finalizeCalls = 0; lastWritten.length = 0; recordedErrors.length = 0;
+    const id2 = await seed(2);
+    state.sessionId = id2; state.chunkIndex = 2; state.recording = true;
+    state.mediaRecorder = { state: 'inactive' };
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.stopRecording();
+    await drain();
+    assert(finalizeCalls === 1, 'finalizeRecording was invoked exactly once for the inactive-recorder case');
+    assert(lastWritten.length === 1, 'the seeded chunks were saved for the inactive-recorder case too');
+    sessions = await readStore('sessions');
+    assert(sessions.find(s => s.id === id2) === undefined, 'the second session is deleted after its salvage save');
+    assert(recordedErrors.some(m => /stopped responding/i.test(m)), 'the salvage message is shown for the inactive-recorder case');
+
+    // --- genuinely idle: recording === false stays a silent no-op ---
+    finalizeCalls = 0; recordedErrors.length = 0;
+    state.recording = false;
+    state.mediaRecorder = null;
+    await api.stopRecording();
+    await drain();
+    assert(finalizeCalls === 0, 'an idle stopRecording() never calls finalizeRecording');
+    assert(recordedErrors.length === 0, 'an idle stopRecording() shows no message at all — a true silent no-op');
+
+    sandbox.finalizeRecording = origFinalize;
+  });
+
+  await scenario('DV(f) stop watchdog: onstop never fires -> the watchdog forces finalize exactly once; a late onstop afterward does not double-finalize', async () => {
+    const origFinalize = sandbox.finalizeRecording;
+    let finalizeCalls = 0;
+    sandbox.finalizeRecording = async (...args) => { finalizeCalls++; return origFinalize(...args); };
+
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.startRecording();
+    const rec = state.mediaRecorder;
+    const realOnstop = rec.onstop; // capture the real production closure before neutering .stop()
+    rec.ondataavailable({ data: new Blob(['x']) });
+    await drain();
+
+    // Simulate a zombie recorder: .stop() flips state but never invokes onstop.
+    rec.stop = function () { rec._stopCalls++; rec.state = 'inactive'; };
+
+    await api.stopRecording(); // normal branch (rec.state is 'recording' going in): arms the watchdog, calls .stop()
+    assert(finalizeCalls === 0, 'finalize has not run yet — onstop never fired and the watchdog has not been invoked');
+
+    // Fire the watchdog directly instead of waiting out the real 8-second timer.
+    await api.stopWatchdogFire();
+    await drain();
+    assert(finalizeCalls === 1, 'the watchdog forced exactly one finalize');
+    assert(recordedErrors.some(m => /stopped responding/i.test(m)), 'the watchdog salvage message is shown');
+    const sessions = await readStore('sessions');
+    assert(lastWritten.length === 1 && sessions.length === 0, 'the watchdog salvage actually saved and cleaned up the session');
+
+    // A late onstop arriving afterward must NOT double-finalize.
+    await realOnstop();
+    await drain();
+    assert(finalizeCalls === 1, 'a late onstop after the watchdog already salvaged does not finalize a second time');
+
+    sandbox.finalizeRecording = origFinalize;
+  });
+
+  await scenario('DV(g) R2 regression: a hung final chunk write keeps the stop watchdog armed through onstop\'s await, so it can still salvage; releasing the write afterward does not double-finalize', async () => {
+    const origFinalize = sandbox.finalizeRecording;
+    let finalizeCalls = 0;
+    sandbox.finalizeRecording = async (...args) => { finalizeCalls++; return origFinalize(...args); };
+
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.startRecording();
+    const rec = state.mediaRecorder;
+
+    // First chunk writes normally and lands for real.
+    rec.ondataavailable({ data: new Blob(['a']) });
+    await drain();
+    assert(state.chunkIndex === 1, 'precondition: the first chunk landed for real');
+
+    // Gate addChunk (same manually-released-promise pattern as the FIX 3/BUG C
+    // deleteSession gate above) so the SECOND (last) chunk's write hangs —
+    // models storage wedging right as the recorder is asked to stop.
+    let releaseWrite;
+    const writeGate = new Promise((res) => { releaseWrite = res; });
+    const origAddChunk = sandbox.addChunk;
+    sandbox.addChunk = async (sid, idx, blob) => { await writeGate; return origAddChunk(sid, idx, blob); };
+
+    rec.ondataavailable({ data: new Blob(['b']) }); // this write is now gated shut
+    await drain();
+    assert(state.chunkIndex === 2, 'the second chunk is in the pipeline (its own write is gated)');
+
+    // stopRecording() -> the mock's default .stop() synchronously invokes
+    // onstop, which is now stuck at `await lastChunkWrite` (the gated write).
+    await api.stopRecording();
+    await drain();
+    assert(finalizeCalls === 0, 'onstop is stuck behind the gated write — finalize has not run, and the watchdog has not fired yet');
+
+    // R2's whole point: onstop must NOT have cleared the watchdog before its
+    // await, so it's still armed here and the watchdog can salvage.
+    await api.stopWatchdogFire();
+    await drain();
+    assert(finalizeCalls === 1, 'the watchdog salvaged exactly once, without waiting for the hung write');
+    assert(recordedErrors.some(m => /stopped responding/i.test(m)), 'the watchdog salvage message is shown');
+    assert(lastWritten.length === 1, 'the salvage saved the one chunk that had actually landed (the gated second chunk was not waited for)');
+    let sessions = await readStore('sessions');
+    assert(sessions.length === 0, 'the session is deleted after the salvage save completes');
+
+    // Release the gate: the stuck onstop resumes, tries to claim, and must
+    // lose (the watchdog already won) — no double finalize.
+    releaseWrite();
+    sandbox.addChunk = origAddChunk;
+    await drain();
+    assert(finalizeCalls === 1, 'the resumed onstop after the watchdog already salvaged does not finalize a second time');
+
+    sandbox.finalizeRecording = origFinalize;
+  });
+
+  await scenario('DV(h) R3 regression: the stop watchdog forces the SAVE path even if stopMode was left on \'review\' — a dead recorder is never a review moment', async () => {
+    // Same spy technique as DM: prove which path (save vs stitch/review) was
+    // actually taken by spying on saveFile/stitchAndSave rather than trusting
+    // side effects alone.
+    let saveFileCalls = 0, stitchCalls = 0;
+    const savedSaveFile = sandbox.saveFile, savedStitch = sandbox.stitchAndSave;
+    sandbox.saveFile = async () => { saveFileCalls++; return 'saved'; };
+    sandbox.stitchAndSave = async () => { stitchCalls++; };
+
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    await api.startRecording();
+    const rec = state.mediaRecorder;
+    rec.ondataavailable({ data: new Blob(['x']) });
+    await drain();
+
+    // Rig stopMode to 'review', the way stopAndReview() would, then simulate
+    // the recorder zombieing right as "Stop & review" is clicked: .stop()
+    // never triggers onstop, so only the watchdog can salvage.
+    state.stopMode = 'review';
+    rec.stop = function () { rec._stopCalls++; rec.state = 'inactive'; };
+    await api.stopRecording();
+
+    await api.stopWatchdogFire();
+    await drain();
+
+    sandbox.saveFile = savedSaveFile;
+    sandbox.stitchAndSave = savedStitch;
+
+    assert(saveFileCalls === 1 && stitchCalls === 0,
+      'the watchdog salvage went through the SAVE path, not stitch/review (got saveFileCalls=' + saveFileCalls + ', stitchCalls=' + stitchCalls + ')');
+    assert(api.reviewState.active === false, 'the review pane never opened for a watchdog salvage');
+  });
+
+  // ============================================================
+  // DW — onerror salvage (G)
+  // ============================================================
+
+  await scenario('DW(g) onerror salvage: a working stop() finalizes once via onstop; a throwing stop() finalizes once via the watchdog', async () => {
+    const origFinalize = sandbox.finalizeRecording;
+    let finalizeCalls = 0;
+    sandbox.finalizeRecording = async (...args) => { finalizeCalls++; return origFinalize(...args); };
+
+    // --- stop() works: onerror's own recorder.stop() reaches onstop normally ---
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.startRecording();
+    let rec = state.mediaRecorder;
+    rec.ondataavailable({ data: new Blob(['x']) });
+    await drain();
+    rec.onerror({ error: { message: 'device lost' } }); // the mock's default .stop() synchronously fires onstop
+    await drain();
+    assert(finalizeCalls === 1, 'onerror with a working stop() finalizes exactly once via onstop');
+    assert(recordedErrors.some(m => /Recording error: device lost/.test(m)), 'the original onerror message is still shown');
+    assert(lastWritten.length === 1, 'the chunk captured before the error was actually saved');
+
+    // --- stop() throws: onerror's try/catch swallows it, the watchdog must salvage instead ---
+    finalizeCalls = 0; recordedErrors.length = 0; lastWritten.length = 0;
+    state.screenStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} }]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    await api.startRecording();
+    rec = state.mediaRecorder;
+    rec.ondataavailable({ data: new Blob(['y']) });
+    await drain();
+    rec.stop = () => { throw new Error('stop is broken'); };
+    rec.onerror({ error: { message: 'device lost again' } });
+    await drain();
+    assert(finalizeCalls === 0, 'a throwing stop() leaves finalize unclaimed until the watchdog fires');
+    await api.stopWatchdogFire(); // call directly instead of waiting out the real timer
+    await drain();
+    assert(finalizeCalls === 1, 'the watchdog salvages exactly once after the swallowed stop() throw');
+    assert(recordedErrors.some(m => /Recording error: device lost again/.test(m)), 'the onerror message is still shown even though stop() threw');
+    assert(recordedErrors.some(m => /stopped responding/i.test(m)), 'the watchdog salvage message is also shown');
+    assert(lastWritten.length === 1, 'the chunk captured before the error was still saved via the watchdog salvage');
+
+    sandbox.finalizeRecording = origFinalize;
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');
