@@ -1331,7 +1331,9 @@ function stopMicHold() {
 }
 
 function updateToggleUI() {
-  document.getElementById('toggleScreen').classList.toggle('active', state.sources.screen);
+  // Screen's lit state = actually capturing, not just intent: unlike camera/
+  // mic, toggling Screen on doesn't acquire anything — Select Screen does.
+  document.getElementById('toggleScreen').classList.toggle('active', state.sources.screen && !!state.screenStream);
   document.getElementById('toggleCamera').classList.toggle('active', state.sources.camera);
   document.getElementById('toggleMic').classList.toggle('active', state.sources.mic);
   // Disable toggles and selectors during recording
@@ -3721,6 +3723,7 @@ async function selectScreen() {
         document.getElementById('placeholder').classList.remove('hidden');
         document.getElementById('btnSelectScreen').classList.remove('selected');
         document.getElementById('btnSelectScreen').textContent = 'Select Screen';
+        updateToggleUI();
         updateRecordButton();
       }
     });
@@ -3744,6 +3747,7 @@ async function selectScreen() {
     btnSelect.classList.add('selected');
     btnSelect.textContent = 'Change Screen';
     btnSelect.disabled = false;
+    updateToggleUI();
     updateRecordButton();
 
   } catch (err) {
@@ -3755,6 +3759,13 @@ async function selectScreen() {
     }
     btnSelect.disabled = false;
     btnSelect.textContent = 'Select Screen';
+    // A cancelled RE-selection already stopped the old stream (top of try) —
+    // resync everything that reflected it: selected styling, toggle light,
+    // Record enablement, and the now-dead preview canvas.
+    btnSelect.classList.remove('selected');
+    if (!state.screenStream) document.getElementById('placeholder').classList.remove('hidden');
+    updateToggleUI();
+    updateRecordButton();
   }
 }
 

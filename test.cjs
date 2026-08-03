@@ -187,6 +187,7 @@ const INITIAL_SOURCES_MIC = state.sources.mic;
 const ORIG = {
   addChunk: sandbox.addChunk, concatenateWebM: sandbox.concatenateWebM,
   getUserMedia: sandbox.navigator.mediaDevices.getUserMedia,
+  getDisplayMedia: sandbox.navigator.mediaDevices.getDisplayMedia,
   mdEnumerateDevices: sandbox.navigator.mediaDevices.enumerateDevices,
   // REVIEW #21 session 2 (DM): saveFile/stitchAndSave get spied on to prove
   // the 'review' stop mode never reaches the save path — same
@@ -281,6 +282,7 @@ async function resetState() {
   sandbox.addChunk = ORIG.addChunk; sandbox.concatenateWebM = ORIG.concatenateWebM;
   sandbox.saveFile = ORIG.saveFile; sandbox.stitchAndSave = ORIG.stitchAndSave;
   sandbox.navigator.mediaDevices.getUserMedia = ORIG.getUserMedia;
+  sandbox.navigator.mediaDevices.getDisplayMedia = ORIG.getDisplayMedia;
   sandbox.navigator.mediaDevices.enumerateDevices = ORIG.mdEnumerateDevices;
   sandbox.micHoldInFlight = false;
   sandbox.downloadPendingIds = [];
@@ -4574,6 +4576,61 @@ Real cue text
       'a recording WITH an audio source requests opus (got ' + (state.mediaRecorder && state.mediaRecorder.opts && state.mediaRecorder.opts.mimeType) + ')');
     await sandbox.stopRecording();
     await drain();
+  });
+
+  // ============================================================
+  // Screen toggle lit state = actually capturing, not just intent
+  // (owner finding, #21 Chrome pass 2026-08-03)
+  // ============================================================
+  await scenario('DY screen toggle lights only while a screen is actually selected; share-end and cancelled re-selection resync the UI', async () => {
+    const toggleEl = documentMock.getElementById('toggleScreen');
+    const btnSelect = documentMock.getElementById('btnSelectScreen');
+    const btnRecord = documentMock.getElementById('btnRecord');
+    const placeholder = documentMock.getElementById('placeholder');
+
+    const endedHandlers = [];
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => makeStream([{
+      kind: 'video', getSettings: () => ({ width: 1280, height: 720 }),
+      addEventListener: (type, fn) => { if (type === 'ended') endedHandlers.push(fn); },
+      stop() {},
+    }]);
+
+    // (a) intent on, nothing selected (page-load / post-recording shape) -> not lit
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = null;
+    sandbox.updateToggleUI();
+    assert(!toggleEl.classList.contains('active'), 'Screen shows OFF when no screen is selected');
+
+    // (b) selectScreen succeeds -> lit
+    await sandbox.selectScreen();
+    assert(state.screenStream !== null, 'selectScreen acquired a stream');
+    assert(toggleEl.classList.contains('active'), 'Screen lights up once a screen is actually captured');
+
+    // (c) share ended via the browser UI -> unlit, Select Screen reset
+    endedHandlers[0]();
+    assert(state.screenStream === null, 'share-end cleared the stream');
+    assert(!toggleEl.classList.contains('active'), 'Screen goes dark when the share ends');
+    assert(btnSelect.textContent === 'Select Screen', 'Select Screen button reset after share-end');
+    assert(btnRecord.disabled === true, 'Record disabled again after share-end');
+
+    // (d) cancelled RE-selection: the old stream is already stopped -> full resync
+    await sandbox.selectScreen();
+    assert(toggleEl.classList.contains('active'), 're-selected: lit again');
+    const abortErr = new Error('cancelled'); abortErr.name = 'NotAllowedError';
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => { throw abortErr; };
+    await sandbox.selectScreen();
+    assert(state.screenStream === null, 'cancelled re-selection leaves no stream (the old one was stopped)');
+    assert(!toggleEl.classList.contains('active'), 'Screen goes dark on a cancelled re-selection');
+    assert(!btnSelect.classList.contains('selected'), 'selected styling removed on a cancelled re-selection');
+    assert(btnSelect.textContent === 'Select Screen', 'button text back to Select Screen');
+    assert(btnRecord.disabled === true, 'Record disabled — there is no stream to record');
+    assert(!placeholder.classList.contains('hidden'), 'placeholder restored over the dead preview canvas');
+
+    // (e) intent off -> never lit, stream or not
+    state.sources = { screen: false, camera: true, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', stop() {} }]);
+    sandbox.updateToggleUI();
+    assert(!toggleEl.classList.contains('active'), 'Screen-off intent is never lit');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

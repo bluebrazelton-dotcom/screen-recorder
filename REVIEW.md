@@ -324,7 +324,13 @@ the user-facing documentation. Two deliverables:
 Not started — deliberately last in the queue so it documents the final shape
 instead of chasing a moving one.
 
-### 21. Re-record from a timestamp ("take-based recording") — owner-prioritized (2026-07-29), NEXT UP
+Also owed from the owner's 2026-08-03 #21 pass: the caption-editor workflow
+must state that a recording is **saved first, then opened** in the editor
+(it edits saved files, not the in-progress session); and if #25(a) hasn't
+shipped, explain that re-doing a just-recorded take means scrubbing back to
+that timestamp in Stop & review.
+
+### 21. Re-record from a timestamp ("take-based recording") — owner-prioritized (2026-07-29), CLOSED 2026-08-03
 Owner's ask: pause/stop a recording, review it, pick a timestamp, and
 re-record from that point — correcting a big mistake without losing the
 whole effort. This is the Tier 2 "take-based recording" the feature map
@@ -441,6 +447,16 @@ Harness 128 scenarios / 855 assertions. Also from that pass: pause-and-
 switch-screens queued as #23; owner confirmed captions stay sidecar-only
 (no burn-in) and a UI hint now says so.
 
+**CLOSED (2026-08-03): the owner's full acceptance pass PASSED** on build
+v1.21.2 — Part R (R1–R3 resilience), F1–F15 (Firefox), C1–C13 (Chrome),
+every item. Notes from the pass, all handled: Chrome's F3 variant (save
+succeeds with no "all set" bar) confirmed as designed behavior — the
+confirm bar exists only for Firefox's unverifiable anchor-download path,
+Chrome's picker write is programmatically confirmed and retires the
+session directly; take-redo friction + typed-timestamp ideas queued as
+#25; two user-guide notes added to #19; one cosmetic finding (Screen
+toggle lit with no screen selected) fixed same-day as v1.21.3.
+
 ### 22. Block-precision re-record cut (queued 2026-07-30)
 
 Firefox's ~7.5s clusters make Rule-A's cluster-boundary cut precision ~7.5s
@@ -508,6 +524,21 @@ ended-listener (which calls `stopRecording()` when `state.recording`).
 UI: show a "Change screen" affordance only while paused. Differential
 tests must show recorded bytes/save flows unchanged; new tests for the
 swap-while-paused state machine and audio-mix reconnection.
+
+### 25. Review-pane take controls: redo last take + typed timestamp (owner-requested 2026-08-03)
+
+From the owner's #21 F6 pass: after a cut + new take, re-doing that take
+requires manually scrubbing back to the seam. Two additions to the review
+pane: **(a) "Redo last take"** — one click discards the newest segment
+whole and re-arms continue-recording at its start; this is the existing
+whole-segment cut (`cutAtByte === 0`, v1.19) applied at `segIndex = last`,
+so precision is exact (segment boundary — no cluster rounding) and Undo
+works unchanged. Show only when the recording has 2+ segments. **(b) a
+typed `m:ss` timestamp input** beside "Re-record from here," validated and
+fed into the same `computeCutPlan` path as scrubbing (until #22, the cut
+still lands on the nearest cluster boundary at-or-before T — say so in the
+UI). Sonnet drafts, orchestrator reviews; differential tests must show the
+save flows unchanged.
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature

@@ -1778,6 +1778,45 @@ mimeType with no opus; mic-on requests opus. Harness: **138 scenarios /
 
 ---
 
+### v1.21.3 — Screen toggle lit state tracks the live capture, not intent (2026-08-03)
+
+**Commit:** `v1.21.3: Screen toggle lights only while a screen is actually selected; cancelled re-selection fully resyncs the UI (#21 owner pass finding)`
+
+The one finding from the owner's full #21 acceptance pass (Part R +
+F1–F15 Firefox + C1–C13 Chrome — everything else passed): the Screen
+button rendered as toggled-ON whenever `state.sources.screen` was true,
+i.e. at page load, after every recording, and after a share ended — all
+moments when no screen is actually selected. Unlike camera/mic (whose
+toggle-ON click acquires the stream), Screen's toggle is pure intent;
+capture happens in the separate Select Screen step, so lit-state and
+reality diverged.
+
+**Fix:** `updateToggleUI` lights Screen only for
+`state.sources.screen && !!state.screenStream`, plus `updateToggleUI()`
+calls at the three places the stream changes outside `toggleSource`:
+selectScreen success, selectScreen failure/cancel, and the share-ended
+listener. `resetUI` already called it, so post-recording accuracy is
+inherited.
+
+**Adjacent bug fixed in the same pass** (found auditing the cancel
+path): cancelling a RE-selection ("Change Screen" → cancel the picker)
+had already stopped the old stream but only reset the button text —
+leaving stale 'selected' styling, a stale-enabled Record button
+(record-time guard existed, but the button looked live), and a dead
+black preview canvas with the placeholder still hidden. The catch block
+now removes the styling, restores the placeholder when no stream
+remains, and re-syncs toggle + Record state.
+
+No pipeline, save-flow, or state-machine changes — pure display sync.
+
+**Tests:** scenario DY (toggle unlit with intent-but-no-stream, lit
+after selectScreen, dark + reset after share-end, full resync after a
+cancelled re-selection, never lit with intent off) + ORIG/resetState
+now capture/restore `getDisplayMedia` like the other media mocks.
+Harness: **139 scenarios / 955 assertions**.
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.
