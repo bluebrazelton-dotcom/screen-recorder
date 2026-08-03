@@ -574,6 +574,13 @@
     background: var(--surface);
     color: var(--green);
     border: 1px solid var(--green-dim);
+    /* Own row whenever visible (direct child of the wrapping .controls flex):
+       basis 100% forces the line break, max-content keeps it button-sized,
+       auto margin right-aligns it under the action buttons — the persistent
+       controls above never reflow when this appears/disappears. */
+    flex-basis: 100%;
+    max-width: max-content;
+    margin-left: auto;
   }
   .btn-undo-rerecord:hover { background: var(--surface-hover); }
 
@@ -738,8 +745,11 @@
       <button class="primary btn-stop-review" id="btnStopReview" onclick="stopAndReview()" style="display:none;">Stop &amp; review</button>
       <button class="primary btn-select-screen" id="btnSelectScreen" onclick="selectScreen()">Select Screen</button>
       <button class="primary btn-record" id="btnRecord" onclick="startRecording()" disabled>Record</button>
-      <button class="primary btn-undo-rerecord" id="btnUndoReRecord" onclick="undoReRecord()" style="display:none;">Undo re-record</button>
     </div>
+    <!-- Direct child of .controls, NOT .action-btns: flex-basis 100% gives it
+         its own row whenever visible, so the persistent buttons above never
+         reflow when the armed re-record state adds/removes it. -->
+    <button class="primary btn-undo-rerecord" id="btnUndoReRecord" onclick="undoReRecord()" style="display:none;">Undo re-record</button>
   </div>
 
   <!-- Caption editor (v1.18): open-a-file editor for a .webm recording's -->
@@ -1248,6 +1258,21 @@ async function cleanupCompleted() {
 // ============================================================
 function toggleSource(source) {
   if (state.recording) return; // Can't toggle mid-recording
+  // Screen shows dark when intent is on but nothing is captured (see
+  // updateToggleUI) — with the webcam OFF, a click there can only mean
+  // "get me a screen": open the picker directly instead of flipping intent
+  // off and tripping the at-least-one guard with a message that would be
+  // wrong (no screen was ever on). Covers page load AND the armed state
+  // after every recording (streams are released at stop, so the button is
+  // dark until the next Select Screen). The webcam-ON case is deliberately
+  // excluded: there the same dark click is the v1.12 camera-only entrance
+  // (scenario AH) — hijacking it for the picker would leave camera-only
+  // unreachable, since Record stays disabled in screen mode without a
+  // stream.
+  if (source === 'screen' && state.sources.screen && !state.screenStream && !state.sources.camera) {
+    selectScreen();
+    return;
+  }
   state.sources[source] = !state.sources[source];
   // At least one video source must be on
   if (!state.sources.screen && !state.sources.camera) {

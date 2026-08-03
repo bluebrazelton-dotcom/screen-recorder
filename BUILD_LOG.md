@@ -1919,6 +1919,47 @@ the ranged read — throwing call-counting stub).
 **#22 is code-complete.** Remaining: owner Firefox/Chrome acceptance
 (BUILD_LOG Testing section, v1.22 block).
 
+**Owner acceptance PASSED (2026-08-03, B1–B6, both browsers)** — #22
+closed. Cut precision within a second of the scrubbed time everywhere.
+
+---
+
+### v1.22.2 — Screen-toggle click semantics + Undo button row (owner findings from the #22 pass, 2026-08-03)
+
+**Commit:** `v1.22.2: dark Screen click opens the picker when webcam is off (guard message no longer fires inaccurately); Undo re-record gets its own flex row (no more control reflow)`
+
+Two findings from the owner's B1–B6 pass, both fixed same day:
+
+1. **Screen toggle click-at-load.** Since v1.21.3 the Screen button
+   correctly reads dark when nothing is captured — but clicking it
+   flipped the INTENT flag off, tripping the at-least-one guard and its
+   "Screen was turned back on" message, inaccurate when no screen was
+   ever on. Now: with intent on, no stream, and the webcam OFF, the
+   click opens the screen picker directly (page load and the
+   post-recording armed state both land here). **Deliberately scoped:**
+   with the webcam ON, the same dark click keeps its v1.12 role as the
+   camera-only entrance — the first draft shortcut was unconditional,
+   and scenario AH caught that it made camera-only UNREACHABLE (Record
+   is disabled in screen mode without a stream, so the toggle-off is
+   the only path in). The guard's message now only ever fires from the
+   Screen button when a screen is genuinely being captured — exactly
+   when its wording is accurate. Scenario AG re-pinned to that case
+   (live stream survives the guarded no-op); new scenario EI pins all
+   four click meanings (dark+webcam-off → picker; lit → toggle-off;
+   webcam-only → re-enable intent; dark+webcam-on → camera-only).
+2. **Recorder-panel button-row shift.** The armed re-record state's
+   extra "Undo re-record" button overflowed `.action-btns`, wrapping
+   the whole group to a second row — which snapped back up when
+   re-recording started. The button is now a direct child of the
+   wrapping `.controls` flex with `flex-basis: 100%; max-width:
+   max-content; margin-left: auto` — its own right-aligned row whenever
+   visible, zero footprint when hidden, and the persistent controls
+   never reflow. Pure CSS/markup; JS toggling and every existing
+   test assertion untouched (harness has no layout — owner eyeball
+   check owed).
+
+Harness: **149 scenarios / 1053 assertions**.
+
 ---
 
 ## Known limitations

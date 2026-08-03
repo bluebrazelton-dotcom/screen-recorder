@@ -1356,10 +1356,19 @@ async function scenario(name, fn) {
   // Camera-only discoverability (v1.12)
   // ============================================================
   await scenario('AG screen-off with camera off is a no-op with a visible explanation', async () => {
+    // Re-pinned for the v1.22.2 dark-click-opens-picker change: with NO
+    // stream the same click now opens the picker instead (scenario EI), so
+    // the guard's message only ever fires from the Screen button when a
+    // screen is GENUINELY being captured — which is exactly when the
+    // "turned back on" wording is accurate. Give the toggle a live stream.
     state.sources = { screen: true, camera: false, mic: true };
+    let stopped = 0;
+    state.screenStream = makeStream([{ kind: 'video', stop() { stopped++; } }]);
     sandbox.toggleSource('screen');
     assert(state.sources.screen === true, 'screen forced back on (guard still enforced)');
     assert(recordedErrors.length > 0 && /screen/i.test(recordedErrors[recordedErrors.length - 1]), 'a message explains the revert (got: ' + JSON.stringify(recordedErrors) + ')');
+    assert(stopped === 0 && state.screenStream !== null, 'the live screen stream survives the guarded no-op');
+    state.screenStream = null;
   });
 
   await scenario('AH camera-only is reachable: screen-off with camera already on', async () => {
@@ -5298,6 +5307,57 @@ Real cue text
     sessions = await readStore('sessions');
     assert(sessions.every((s) => s.cutAtByte === undefined), 'EH: noop leaves no markers on any session');
     assert(/already the end/i.test(documentMock.getElementById('reviewStatus').textContent), 'EH: the gentle noop message is unchanged');
+  });
+
+  // ============================================================
+  // Screen toggle click semantics (owner finding, #22 acceptance pass
+  // 2026-08-03): a dark-but-intent-on Screen button means "get me a
+  // screen" — clicking it opens the picker instead of flipping intent
+  // off and tripping the at-least-one guard with an inaccurate message.
+  // ============================================================
+  await scenario('EI clicking the dark Screen button (intent on, no stream) opens the picker; a lit one still toggles off; webcam-only click still just re-enables intent', async () => {
+    const origSelect = sandbox.selectScreen;
+    let selectCalls = 0;
+    sandbox.selectScreen = async () => { selectCalls++; };
+
+    // (a) load / post-recording shape: intent on, no stream -> picker, no
+    // intent flip, no guard error.
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = null;
+    sandbox.toggleSource('screen');
+    assert(selectCalls === 1, 'EI: dark-with-intent click opens the screen picker (got ' + selectCalls + ' calls)');
+    assert(state.sources.screen === true, 'EI: intent stays on — the click was never a toggle-off');
+    assert(recordedErrors.length === 0, 'EI: no at-least-one guard error fires (got ' + JSON.stringify(recordedErrors) + ')');
+
+    // (b) lit (intent on, stream live, camera also on so the toggle-off is
+    // legal): the click is a real toggle-off — stream stopped, picker
+    // untouched.
+    let stopped = 0;
+    state.sources = { screen: true, camera: true, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', stop() { stopped++; } }]);
+    state.cameraStream = makeStream([{ kind: 'video', stop() {} }]);
+    sandbox.toggleSource('screen');
+    assert(selectCalls === 1, 'EI: a lit Screen click never opens the picker');
+    assert(state.sources.screen === false, 'EI: a lit Screen click toggles intent off as before');
+    assert(stopped === 1 && state.screenStream === null, 'EI: the live screen stream is stopped on toggle-off');
+
+    // (c) webcam-only (intent off): the click just re-enables screen intent
+    // — Select Screen appears, the picker is NOT auto-opened (second click,
+    // now dark-with-intent, would open it via (a)).
+    sandbox.toggleSource('screen');
+    assert(selectCalls === 1, 'EI: re-enabling screen intent from webcam-only does not auto-open the picker');
+    assert(state.sources.screen === true && state.screenStream === null, 'EI: intent back on, still no stream — the button correctly stays dark');
+    assert(documentMock.getElementById('btnSelectScreen').style.display === '', 'EI: Select Screen is visible again after re-enabling');
+
+    // (a2) with the webcam still ON, the dark-with-intent click is the
+    // v1.12 camera-only entrance, NOT the picker shortcut (scenario AH's
+    // flow) — the round trip lands back in camera-only and the picker
+    // count is untouched.
+    sandbox.toggleSource('screen');
+    assert(selectCalls === 1, 'EI: webcam-on keeps the dark Screen click as the camera-only entrance — no picker');
+    assert(state.sources.screen === false && state.sources.camera === true, 'EI: round trip lands back in camera-only');
+    sandbox.selectScreen = origSelect;
+    state.cameraStream = null;
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

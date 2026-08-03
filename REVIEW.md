@@ -523,6 +523,18 @@ Harness 148 scenarios / 1041 assertions. Remaining: owner acceptance
 (BUILD_LOG Testing, v1.22.1 block — precision, late-cut, undo, re-cut,
 nothing-else-moved, Chrome spot-check).
 
+**CLOSED (2026-08-03): owner acceptance PASSED, B1–B6, both browsers** —
+cut precision lands within a second of the scrubbed time (vs ~7.5s
+Firefox / ~1s Chrome before), undo exact, re-cut consistent, no
+regressions in the surrounding review-pane flows. Two unrelated findings
+from the pass, both fixed same day in v1.22.2: the Screen-toggle
+click-at-load guard confusion (dark-with-intent click now opens the
+picker when the webcam is off; the webcam-on case deliberately keeps its
+v1.12 camera-only role — scenario AH caught that hijacking it would have
+made camera-only unreachable) and the recorder-panel button-row shift
+(Undo re-record moved to its own flex row, so the persistent controls
+never reflow).
+
 ### 24. Recorder & storage resilience — SHIPPED v1.21 (2026-08-02)
 
 Owner acceptance testing surfaced a Firefox 153 failure: MediaRecorder
