@@ -6100,9 +6100,12 @@ function reviewBackToRecorder() {
 }
 
 // "Re-record from here". T is the scrub position on the STITCHED/global
-// timeline computeCutPlan expects; segIndex/cutAtByte/keptMs come straight
-// from its Rule-A math (see computeCutPlan's own doc comment for the four
-// outcome shapes this switches on).
+// timeline computeCutPlan expects; segIndex/cutAtByte/keptMs come from its
+// Rule-A math (see computeCutPlan's own doc comment for the four outcome
+// shapes this switches on). On the cutAtByte>0 branch, cutAtByte/keptMs are
+// then given a chance to be refined to a block boundary inside the dropped
+// cluster (REVIEW #22 session 2, see refineCutToBlock) before being stored;
+// segIndex and the discard/undo bookkeeping are unaffected by that.
 async function reviewCutFromHere() {
   // scansOk gate + try/catch: a click here must NEVER die silently. Any
   // failure leaves the pane open and says so — the recording itself is
@@ -6128,16 +6131,47 @@ async function reviewCutFromHere() {
     const segments = reviewState.segments;
     const discardedIds = [];
     let keptSegments, cutSessionId = null, hadPrevMarker = false, prevCutAtByte = null, prevCutAtMs = null;
+    // Rule A's own byte/time — overwritten below only if refinement succeeds.
+    let cutAtByte = plan.cutAtByte, keptMs = plan.keptMs;
 
     if (plan.cutAtByte > 0) {
       const cutSeg = segments[plan.segIndex];
       cutSessionId = cutSeg.sessionId;
+
+      // Block-precision refinement (REVIEW #22 session 2): Rule A always
+      // drops the WHOLE dropped cluster; try to cut inside it instead, at
+      // the nearest real block boundary. reviewState.scans is populated
+      // exclusively by assembleReviewPreview's default-mode
+      // createWebmStreamScanner() pass over EVERY segment (never clustersOnly
+      // — that shape is only ever used for stitch segments 2..N inside
+      // scanSegmentsForStitch, a different scan reviewState.scans never
+      // holds), so cluster.start is always present here; the undefined check
+      // is a defensive skip for a shape this code doesn't expect to see, not
+      // a reachable path today. The whole attempt is an enhancement over an
+      // already-shippable plan: ANY failure (missing/odd-shaped cluster, a
+      // readSessionByteRange hiccup, refineCutToBlock declining the cluster)
+      // falls back to the Rule A byte/time silently — a DB hiccup here must
+      // never turn a workable Rule A cut into a surfaced error.
+      try {
+        const cluster = reviewState.scans[plan.segIndex] && reviewState.scans[plan.segIndex].clusters[plan.clusterIndex];
+        if (cluster && cluster.start !== undefined) {
+          const clusterBytes = await readSessionByteRange(cutSessionId, cluster.start, cluster.end);
+          const refined = refineCutToBlock(clusterBytes, cluster.timestamp, T - plan.segOffsetMs);
+          if (refined) {
+            cutAtByte = cluster.start + refined.relCutOffset;
+            keptMs = plan.segOffsetMs + refined.keptEndMs;
+          }
+        }
+      } catch (err) {
+        console.error('Block-precision refinement failed, using the whole-cluster cut instead:', err);
+      }
+
       // Read BEFORE overwriting — undo of a re-cut must restore this exact
       // previous marker, not just clear it.
       const prev = await getSessionRecord(cutSessionId);
       hadPrevMarker = !!prev && typeof prev.cutAtByte === 'number' && isFinite(prev.cutAtByte);
       if (hadPrevMarker) { prevCutAtByte = prev.cutAtByte; prevCutAtMs = prev.cutAtMs; }
-      await setSessionCut(cutSessionId, plan.cutAtByte, plan.keptMs);
+      await setSessionCut(cutSessionId, cutAtByte, keptMs);
       for (let i = plan.segIndex + 1; i < segments.length; i++) {
         await setSessionDiscarded(segments[i].sessionId, true);
         discardedIds.push(segments[i].sessionId);
@@ -6169,7 +6203,7 @@ async function reviewCutFromHere() {
     state.priorSegments = keptSegments;
     closeReviewPane();
     resetUI();
-    updateStatus('idle', `Kept ${formatMinSec(plan.keptMs || 0)}. Select a screen and click Record to continue from there.`);
+    updateStatus('idle', `Kept ${formatMinSec(keptMs || 0)}. Select a screen and click Record to continue from there.`);
     document.getElementById('btnUndoReRecord').style.display = '';
   } catch (err) {
     console.error('Re-record cut failed:', err);

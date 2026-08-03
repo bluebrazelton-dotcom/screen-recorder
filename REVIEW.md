@@ -508,6 +508,21 @@ drifting the bookkeeping below the post-cut re-scan's
 lastClusterMaxBlockTime — now floored and test-pinned in DZ). Remaining:
 session 2 — wire-in + owner acceptance.
 
+**Session 2 SHIPPED (2026-08-03, v1.22.1) — #22 CODE-COMPLETE.**
+`reviewCutFromHere` refines the cut between computeCutPlan and
+setSessionCut (ranged read → refineCutToBlock → refined byte/keptMs),
+with the whole attempt contained in its own try/catch falling back to
+Rule A on any failure. Scenarios EE–EH (end-to-end refined cut + exact
+undo; failure containment; refined Firefox-shaped chain through the real
+stitched save with assertNoOverlap; seam-gap/noop never attempt
+refinement). One intended behavior change: the keep-whole promotion —
+T in the gap after a cluster's last block now keeps that whole cluster
+instead of dropping it (pre-existing DO re-pinned via the
+expectedBlockCut oracle; all its undo/data-loss assertions unmodified).
+Harness 148 scenarios / 1041 assertions. Remaining: owner acceptance
+(BUILD_LOG Testing, v1.22.1 block — precision, late-cut, undo, re-cut,
+nothing-else-moved, Chrome spot-check).
+
 ### 24. Recorder & storage resilience — SHIPPED v1.21 (2026-08-02)
 
 Owner acceptance testing surfaced a Firefox 153 failure: MediaRecorder

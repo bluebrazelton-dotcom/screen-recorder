@@ -3686,12 +3686,22 @@ Real cue text
     const expectedPlan = S.computeCutPlan([scan0, scan1], T);
     assert(expectedPlan.kind === 'cut' && expectedPlan.segIndex === 1 && expectedPlan.cutAtByte === scan1.clusters[1].start,
       'precondition: this T cuts mid-cluster in segment 1');
+    // REVIEW #22 session 2: reviewCutFromHere now refines Rule A's plan to a
+    // block boundary before storing it. This T lands past both of cluster
+    // 1's own blocks, so refinement promotes to the keep-whole case and the
+    // byte actually stored is cluster 1's END (== cluster 2's start) —
+    // exactly Rule A's byte for dropping cluster 2 instead.
+    // expectedBlockCut is the same independent oracle scenario EE uses.
+    const expectedRefined = expectedBlockCut(buf1, scan1.clusters[expectedPlan.clusterIndex], T - expectedPlan.segOffsetMs);
+    assert(expectedRefined !== null, 'precondition: refinement finds a real (keep-whole) cut for this T');
+    const expectedCutAtByte = scan1.clusters[expectedPlan.clusterIndex].start + expectedRefined.relCutOffset;
+    const expectedCutAtMs = expectedPlan.segOffsetMs + expectedRefined.keptEndMs;
 
     await S.reviewCutFromHere();
 
     let sessions = await readStore('sessions');
     let s1 = sessions.find((x) => x.id === ids[1]);
-    assert(s1.cutAtByte === expectedPlan.cutAtByte && s1.cutAtMs === expectedPlan.keptMs, 'the cut marker lands on the right session (segIndex 1)');
+    assert(s1.cutAtByte === expectedCutAtByte && s1.cutAtMs === expectedCutAtMs, 'the cut marker lands on the right session (segIndex 1), refined past Rule A\'s whole-cluster-drop byte');
     assert(sessions.find((x) => x.id === ids[0]).cutAtByte === undefined, 'the earlier segment (segIndex 0) is untouched');
     assert(s1.discarded === undefined, 'the cut segment itself is not flagged discarded');
     assert(state.priorSegments.length === 2 && state.priorSegments[0].sessionId === ids[0] && state.priorSegments[1].sessionId === ids[1],
@@ -3725,10 +3735,17 @@ Real cue text
     const m2Plan = S.computeCutPlan([scan0, scan1M1], T2);
     assert(m2Plan.kind === 'cut' && m2Plan.segIndex === 1 && m2Plan.cutAtByte === scan1M1.clusters[1].start,
       'precondition: M2 drops the (post-M1) final cluster — an earlier byte than M1');
+    // REVIEW #22 session 2: same refinement as above — T2 lands strictly
+    // between scan1M1's cluster 1's own two blocks, a genuine mid-cluster
+    // (not keep-whole) refinement, strictly between Rule A's whole-cluster-
+    // drop byte and the cluster's end.
+    const expectedRefinedM2 = expectedBlockCut(buf1M1, scan1M1.clusters[m2Plan.clusterIndex], T2 - m2Plan.segOffsetMs);
+    assert(expectedRefinedM2 !== null, 'precondition: refinement finds a real cut for M2\'s T');
+    const expectedM2CutAtByte = scan1M1.clusters[m2Plan.clusterIndex].start + expectedRefinedM2.relCutOffset;
 
     await S.reviewCutFromHere();
     sessions = await readStore('sessions');
-    assert(sessions.find((x) => x.id === ids[1]).cutAtByte === scan1M1.clusters[1].start, 'M2 (the new, earlier cut) is the marker on disk right after the cut');
+    assert(sessions.find((x) => x.id === ids[1]).cutAtByte === expectedM2CutAtByte, 'M2 (the new, earlier cut) is the marker on disk right after the cut, refined past Rule A\'s whole-cluster-drop byte');
 
     await S.undoReRecord();
     sessions = await readStore('sessions');
@@ -5047,6 +5064,240 @@ Real cue text
       [{ sessionId: id0b, mimeType: 'video/webm' }, { sessionId: id1b, mimeType: 'video/webm' }], 'x.webm');
     assert(rDl === 'downloaded' && Buffer.compare(Buffer.from(await objectUrlBlobs[objectUrlBlobs.length - 1].arrayBuffer()), want) === 0,
       'ED: download block-precision stitched save === stitchOracle([buf0, buf1.slice(0,cut)])');
+  });
+
+  // ============================================================
+  // REVIEW #22 "block-precision re-record cut", session 2 — wiring
+  // refineCutToBlock/readSessionByteRange into reviewCutFromHere itself.
+  // Session 1 (DZ/EA/EB/EC/ED above) proved the pure math and the
+  // differential save path in isolation; these scenarios prove the actual
+  // click handler picks up the refined byte/time, falls back cleanly when
+  // refinement can't run, and that the seam/undo/save machinery downstream
+  // of it doesn't care which one produced the marker.
+  // ============================================================
+
+  // EE — end-to-end refined cut through the real click handler, plus undo.
+  await scenario('EE reviewCutFromHere end-to-end: a mid-cluster T is refined to a block boundary (not Rule A\'s whole-cluster drop), the stored marker/status reflect the refined time, and Undo restores exactly', async () => {
+    const buf = multiBlockClusterWebm([
+      { ts: 0,    blocks: [{ track: 1, relTs: 0, flags: 0x80 }] },   // filler cluster 0 — keeps the refine target at clusterIndex 1
+      { ts: 1000, blocks: [
+        { track: 1, relTs: 0,   flags: 0x80 },
+        { track: 2, relTs: 20,  flags: 0x80 },
+        { track: 1, relTs: 300, flags: 0x00 },
+        { track: 1, relTs: 600, flags: 0x00 },
+      ] },
+    ], false);   // Chrome-shaped (1-byte unknown-size marker)
+    const scan = scanResult(buf);
+    assert(scan.clusters.length === 2, 'EE precondition: fixture has 2 clusters');
+    const ids = await seedSegments([buf]);
+    const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+    // A sentinel deliberately different from `segments` — same distinguishing
+    // trick DO uses to prove undo arms the full pane chain, not whatever
+    // priorSegments held before the cut.
+    const priorBefore = [{ sessionId: 'zzz-unrelated', mimeType: 'video/webm' }];
+
+    const T = midTs(1300, 1600);   // strictly between the abs-1300 and abs-1600 blocks in cluster 1
+    state.priorSegments = priorBefore.slice();
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan];
+    api.reviewState.scansOk = true;
+    documentMock.getElementById('reviewVideo').currentTime = T / 1000;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+
+    const plan = S.computeCutPlan([scan], T);
+    assert(plan.kind === 'cut' && plan.segIndex === 0 && plan.clusterIndex === 1 && plan.cutAtByte === scan.clusters[1].start,
+      'EE precondition: Rule A drops cluster 1 whole (got ' + JSON.stringify(plan) + ')');
+    const localT = T - plan.segOffsetMs;
+    const cluster = scan.clusters[1];
+    const expected = expectedBlockCut(buf, cluster, localT);
+    assert(expected !== null && expected.keptEndMs === 1300,
+      'EE precondition: the independent oracle finds a real block-precision cut keeping up to relTs 300 (got ' + JSON.stringify(expected) + ')');
+    const expectedCutAtByte = cluster.start + expected.relCutOffset;
+    assert(expectedCutAtByte > plan.cutAtByte && expectedCutAtByte < cluster.end,
+      'EE precondition: the refined byte is strictly inside cluster 1, past Rule A\'s whole-cluster-drop byte');
+
+    await S.reviewCutFromHere();
+
+    let sessions = await readStore('sessions');
+    const s = sessions.find((x) => x.id === ids[0]);
+    assert(s.cutAtByte === expectedCutAtByte, 'EE: the stored cutAtByte is the REFINED byte (got ' + s.cutAtByte + ', Rule A would be ' + plan.cutAtByte + ')');
+    assert(s.cutAtByte !== plan.cutAtByte, 'EE: the stored cutAtByte is NOT Rule A\'s whole-cluster-drop byte');
+    assert(s.cutAtMs === 1300, 'EE: the stored cutAtMs is the refined keptMs (got ' + s.cutAtMs + ')');
+    assert(statusHistory.some((m) => m === `Kept ${S.formatMinSec(1300)}. Select a screen and click Record to continue from there.`),
+      'EE: the post-cut status message reports the REFINED kept duration');
+    assert(recordedErrors.length === 0, 'EE: a successful refinement never surfaces an error banner');
+    assert(documentMock.getElementById('reviewPane').classList.contains('visible') === false, 'EE: the review pane closes on a successful cut');
+    assert(documentMock.getElementById('btnUndoReRecord').style.display === '', 'EE: the Undo re-record affordance appears');
+
+    // ---- Undo: no earlier marker existed, so it must be cleared exactly
+    // (same assertion shape DO/DT make for a first-time cut) ----
+    await S.undoReRecord();
+    sessions = await readStore('sessions');
+    const su = sessions.find((x) => x.id === ids[0]);
+    assert(su.cutAtByte === undefined && su.cutAtMs === undefined, 'EE undo: the refined marker is cleared (no earlier marker existed)');
+    assert(state.priorSegments.length === 1 && state.priorSegments[0].sessionId === ids[0],
+      'EE undo: priorSegments arms the full pane chain, not the stale sentinel');
+    assert(documentMock.getElementById('btnUndoReRecord').style.display === 'none', 'EE undo: the Undo button hides itself after use');
+    assert(api.reviewState.undo === null, 'EE undo: the undo record is consumed');
+  });
+
+  // EF — refinement failure containment: any throw during the refinement
+  // attempt must fall back to Rule A silently, never surface as an error or
+  // change any other behavior of the cut.
+  await scenario('EF reviewCutFromHere refinement failure falls back to Rule A: a readSessionByteRange throw is contained, the stored marker is Rule A\'s whole-cluster byte, and no error banner appears', async () => {
+    const buf = multiBlockClusterWebm([
+      { ts: 0,    blocks: [{ track: 1, relTs: 0, flags: 0x80 }] },
+      { ts: 1000, blocks: [
+        { track: 1, relTs: 0,   flags: 0x80 },
+        { track: 2, relTs: 20,  flags: 0x80 },
+        { track: 1, relTs: 300, flags: 0x00 },
+        { track: 1, relTs: 600, flags: 0x00 },
+      ] },
+    ], false);
+    const scan = scanResult(buf);
+    const ids = await seedSegments([buf]);
+    const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }];
+
+    state.priorSegments = [];
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan];
+    api.reviewState.scansOk = true;
+    const T = midTs(1300, 1600);
+    documentMock.getElementById('reviewVideo').currentTime = T / 1000;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+
+    const plan = S.computeCutPlan([scan], T);
+    assert(plan.kind === 'cut' && plan.cutAtByte === scan.clusters[1].start,
+      'EF precondition: Rule A drops cluster 1 whole (got ' + JSON.stringify(plan) + ')');
+
+    // Stub readSessionByteRange to throw — the ranged read refinement needs.
+    // Restored immediately after the click, same capture/restore shape DR
+    // uses for sandbox.computeCutPlan.
+    const origRead = sandbox.readSessionByteRange;
+    sandbox.readSessionByteRange = async () => { throw new Error('synthetic DB hiccup'); };
+    let escaped = false;
+    try { await S.reviewCutFromHere(); } catch (e) { escaped = true; }
+    sandbox.readSessionByteRange = origRead;
+
+    assert(escaped === false, 'EF: a refinement failure never escapes the click handler');
+    const sessions = await readStore('sessions');
+    const s = sessions.find((x) => x.id === ids[0]);
+    assert(s.cutAtByte === plan.cutAtByte, 'EF: the stored cutAtByte falls back to Rule A\'s whole-cluster byte (got ' + s.cutAtByte + ')');
+    assert(s.cutAtMs === plan.keptMs, 'EF: the stored cutAtMs falls back to Rule A\'s keptMs (got ' + s.cutAtMs + ')');
+    assert(recordedErrors.length === 0, 'EF: a contained refinement failure never surfaces a user-facing error banner');
+    assert(statusHistory.some((m) => m === `Kept ${S.formatMinSec(plan.keptMs)}. Select a screen and click Record to continue from there.`),
+      'EF: the pane still reports success with Rule A\'s kept duration — behaves exactly as v1.20 did');
+    assert(documentMock.getElementById('reviewPane').classList.contains('visible') === false, 'EF: the review pane still closes normally on the (Rule-A-fallback) successful cut');
+    assert(documentMock.getElementById('btnUndoReRecord').style.display === '', 'EF: the Undo re-record affordance still appears');
+  });
+
+  // EG — refined chain end-to-end: a refined cut on segment 2 of a 2-segment
+  // chain, then the REAL stitched save, checked against stitchOracle and the
+  // no-overlap property — proves the seam formula stays in lockstep with a
+  // block-precision cut applied through the actual click handler (not a
+  // hand-set setSessionCut, as ED tests).
+  await scenario('EG reviewCutFromHere refined chain end-to-end: a refined cut on segment 2 of a 2-segment chain, then the real stitched save === stitchOracle(sliced buffers), with no cluster overlap', async () => {
+    const buf0 = syntheticWebm();
+    const buf1 = multiBlockClusterWebm([
+      { ts: 0,    blocks: [{ track: 1, relTs: 0, flags: 0x80 }] },
+      { ts: 1000, blocks: [
+        { track: 1, relTs: 0,   flags: 0x80 },
+        { track: 2, relTs: 20,  flags: 0x80 },
+        { track: 1, relTs: 300, flags: 0x00 },
+        { track: 1, relTs: 600, flags: 0x00 },
+      ] },
+    ], true);   // Firefox-shaped (8-byte marker), covering that shape in a chain too
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const offset1 = seamOffset(scan0);
+    const thirds = (b) => splitAt(b, [Math.floor(b.length / 3), Math.floor(2 * b.length / 3)]);
+    const id0 = await seedBuffers(thirds(buf0)), id1 = await seedBuffers(thirds(buf1));
+    const segments = [{ sessionId: id0, mimeType: 'video/webm' }, { sessionId: id1, mimeType: 'video/webm' }];
+
+    state.priorSegments = [];
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    const T = offset1 + midTs(1300, 1600);
+    documentMock.getElementById('reviewVideo').currentTime = T / 1000;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+
+    const plan = S.computeCutPlan([scan0, scan1], T);
+    assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.clusterIndex === 1 && plan.cutAtByte === scan1.clusters[1].start,
+      'EG precondition: Rule A drops segment 1\'s cluster 1 whole (got ' + JSON.stringify(plan) + ')');
+    const localT = T - plan.segOffsetMs;
+    const cluster = scan1.clusters[1];
+    const expected = expectedBlockCut(buf1, cluster, localT);
+    assert(expected !== null && expected.keptEndMs === 1300, 'EG precondition: the oracle finds a real block-precision cut (got ' + JSON.stringify(expected) + ')');
+    const expectedCutAtByte = cluster.start + expected.relCutOffset;
+
+    await S.reviewCutFromHere();
+
+    const sessionsAfter = await readStore('sessions');
+    const s1 = sessionsAfter.find((x) => x.id === id1);
+    assert(s1.cutAtByte === expectedCutAtByte, 'EG: the marker stored on segment 1 is the refined byte, not Rule A\'s whole-cluster-drop byte');
+    assert(s1.cutAtMs === plan.segOffsetMs + expected.keptEndMs, 'EG: the stored cutAtMs is the refined keptMs');
+
+    const want = await stitchOracle([buf0, buf1.slice(0, expectedCutAtByte)]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    const r = await S.saveSessionsStreamedStitch(segments, 'x.webm');
+    assert(r === 'saved', 'EG precondition: the real stitched save succeeded (got ' + r + ')');
+    const got = Buffer.from(await lastWritten.pop().arrayBuffer());
+    assert(Buffer.compare(got, want) === 0,
+      'EG: real stitched save through a click-handler-refined marker === stitchOracle([buf0, buf1.slice(0,cut)]) (' + got.length + ' vs ' + want.length + ' bytes)');
+    assertNoOverlap(got, 'EG refined-chain stitched output');
+  });
+
+  // EH — cutAtByte===0 and noop plans are untouched by refinement: no ranged
+  // read is even attempted, so a hiccup in readSessionByteRange can't affect
+  // paths that were never supposed to reach it.
+  await scenario('EH reviewCutFromHere leaves cutAtByte===0 (seam-gap) and noop plans untouched: refinement is never attempted on either path', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const offset1 = seamOffset(scan0);
+    const ids = await seedSegments([buf0, buf1]);
+    const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+
+    // A throwing stub that also counts calls — if refinement were mistakenly
+    // attempted on either path below, this scenario would fail loudly rather
+    // than silently passing on a fallback.
+    const origRead = sandbox.readSessionByteRange;
+    let readCalls = 0;
+    sandbox.readSessionByteRange = async () => { readCalls++; throw new Error('must not be called on a cutAtByte===0 or noop plan'); };
+
+    // ---- seam-gap: cutAtByte===0 branch ----
+    state.priorSegments = [];
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    const Tgap = midTs(scan0.lastClusterMaxBlockTime, offset1);
+    documentMock.getElementById('reviewVideo').currentTime = Tgap / 1000;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+    const gapPlan = S.computeCutPlan([scan0, scan1], Tgap);
+    assert(gapPlan.kind === 'cut' && gapPlan.cutAtByte === 0, 'EH precondition: the seam gap is a cutAtByte===0 plan (got ' + JSON.stringify(gapPlan) + ')');
+
+    await S.reviewCutFromHere();
+    assert(readCalls === 0, 'EH: refinement is never attempted on a cutAtByte===0 plan (seam gap)');
+    let sessions = await readStore('sessions');
+    const s1 = sessions.find((x) => x.id === ids[1]);
+    assert(s1.discarded === true && s1.cutAtByte === undefined, 'EH: seam-gap cut behaves exactly as before (whole-segment discard, no marker)');
+
+    // ---- noop: past the end ----
+    await S.undoReRecord();
+    state.priorSegments = [];
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    const noopT = offset1 + scan1.lastClusterMaxBlockTime + 1;
+    documentMock.getElementById('reviewVideo').currentTime = noopT / 1000;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+    assert(S.computeCutPlan([scan0, scan1], noopT).kind === 'noop', 'EH precondition: past the end is a noop');
+
+    await S.reviewCutFromHere();
+    sandbox.readSessionByteRange = origRead;
+    assert(readCalls === 0, 'EH: refinement is never attempted on a noop plan');
+    sessions = await readStore('sessions');
+    assert(sessions.every((s) => s.cutAtByte === undefined), 'EH: noop leaves no markers on any session');
+    assert(/already the end/i.test(documentMock.getElementById('reviewStatus').textContent), 'EH: the gentle noop message is unchanged');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

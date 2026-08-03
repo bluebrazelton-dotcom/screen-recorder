@@ -1880,6 +1880,47 @@ acceptance.
 
 ---
 
+### v1.22.1 — Block-precision cut (#22), session 2 of 2: the wire-in (2026-08-03)
+
+**Commit:** `v1.22.1 (#22 session 2): reviewCutFromHere refines the cut to a block boundary (Rule A fallback on any failure); scenarios EE-EH + DO keep-whole companion fix`
+
+`reviewCutFromHere`'s cut branch now attempts refinement between
+`computeCutPlan` and `setSessionCut`: fetch the dropped cluster's bytes
+(`readSessionByteRange`), run `refineCutToBlock` with
+`localT = T - plan.segOffsetMs`, and store the refined byte/keptMs when it
+succeeds. The whole attempt is wrapped in its own try/catch that falls
+back to Rule A's byte/time on ANY failure — refinement is an enhancement
+over an already-shippable plan; a DB hiccup must never turn a workable
+Rule A cut into a surfaced error. Undo/discard bookkeeping and everything
+downstream are untouched; the "Kept m:ss" status reports the refined
+time. Cut precision in the review pane goes from ~7.5s (Firefox) / ~1s
+(Chrome) to ~one block (~33ms).
+
+**Behavior note (intended): the keep-whole promotion.** When T falls in
+the gap after a dropped cluster's last block, Rule A used to drop that
+whole cluster; refinement now keeps it entirely (the cut byte becomes the
+cluster's end — for a mid-chain cluster, byte-identical to Rule A
+targeting the next cluster). Strictly more good content kept. This is
+why pre-existing scenario DO needed a 2-assertion companion fix: its
+chosen T values hit exactly this case, and its pinned Rule-A bytes are
+now computed through the independent `expectedBlockCut` oracle instead.
+Every DO undo-restore and priorSegments assertion (the v1.20.1 data-loss
+pins) passes unmodified.
+
+**Tests (42 new assertions, harness 148 scenarios / 1041 assertions):**
+EE (end-to-end through the real click handler: refined byte + cutAtMs
+stored, refined status, exact undo, pane close, no error); EF (synthetic
+readSessionByteRange failure → Rule A byte stored, no banner, v1.20
+behavior exactly); EG (refined cut on a Firefox-shaped chain segment via
+the click handler, then the REAL stitched save ≡ stitchOracle +
+assertNoOverlap seam proof); EH (seam-gap and noop plans never attempt
+the ranged read — throwing call-counting stub).
+
+**#22 is code-complete.** Remaining: owner Firefox/Chrome acceptance
+(BUILD_LOG Testing section, v1.22 block).
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.
@@ -2200,6 +2241,31 @@ failure it detects is the Firefox 153 silent recorder death):**
    responding" message ever appears at page load or save, note the
    circumstances — it means the (rarer) storage wedge, and restart
    guidance should be accurate.
+
+**Manual acceptance test (block-precision cut, v1.22.1 — Firefox first,
+then a Chrome spot-check):**
+1. **Precision (the headline).** Record ~30s (mic on or off), Stop &
+   review, scrub to a deliberate spot mid-recording (e.g. ~0:12) and note
+   the exact time, click "Re-record from 0:12" → the "Kept 0:12" status
+   must match the scrubbed time to within a second — NOT snapped down or
+   up by ~7.5s (the old Firefox cluster granularity). Record a short new
+   take, Stop & save → the file plays through the seam; the first take's
+   content runs up to ~0:12 (within a frame or two), then the new take.
+2. **Cut inside a long recording's later portion.** Same as 1 but scrub
+   near the end of a ~1 min recording — precision holds anywhere, not
+   just early.
+3. **Undo still exact.** Cut mid-cluster → Undo re-record IMMEDIATELY
+   (before recording) → record + save → the FULL original plus the new
+   take (the refined marker cleared/restored exactly).
+4. **Re-cut of a cut.** Cut at ~0:20, record a take, Stop & review, cut
+   again EARLIER (~0:10) → save → content ends at ~0:10 + the newest
+   take (the refinement of an already-cut segment stays consistent).
+5. **Nothing else moved.** Save as is / Discard / Back to recorder /
+   crash-recovery quick pass — all behave exactly as the #21 checklist
+   verified (refinement touches only where the cut byte lands).
+6. **Chrome spot-check.** Repeat 1 and 3 in Chrome (~1s → ~33ms is less
+   dramatic but the "Kept" time should now match the scrub position
+   almost exactly).
 
 ---
 
