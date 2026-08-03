@@ -958,6 +958,50 @@ async function scenario(name, fn) {
     return Buffer.concat([header, segHdr, infoEl, tracks, c0, c1, c2]);
   }
 
+  // REVIEW #22 session 1 — clusters with MULTIPLE SimpleBlocks at chosen
+  // relative timestamps, for refineCutToBlock's block-precision cut math.
+  // `clusterSpecs` is an array of { ts, blocks }, blocks an array of
+  // { track, relTs, flags, payloadLen } (flags default 0x80 keyframe,
+  // payloadLen default 20) — passed straight to the existing simpleBlock()
+  // builder, so relTs may be negative (legal; see refineCutToBlock's own doc
+  // comment) and tracks may interleave (1 = video, 2 = audio, matching the
+  // two-track Tracks element below). `marker8` selects Firefox's 8-byte
+  // unknown-size cluster marker (default: Chrome's 1-byte 0xFF), via the
+  // existing clusterUnknown(). Byte-deterministic: every size is fixed by
+  // the spec passed in.
+  function multiBlockClusterWebm(clusterSpecs, marker8) {
+    const header = Buffer.from([0x1A, 0x45, 0xDF, 0xA3, 0x80]);
+    const segHdr = Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    const infoEl = el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], uintBytes(1000000, 3)));
+    const tracks = el([0x16, 0x54, 0xAE, 0x6B],
+      el([0xAE], el([0xD7], [0x01]), el([0x83], [0x01])),   // video, track 1
+      el([0xAE], el([0xD7], [0x02]), el([0x83], [0x02])));  // audio, track 2
+    const clusters = clusterSpecs.map(spec => clusterUnknown(
+      spec.ts,
+      spec.blocks.map(b => simpleBlock(
+        b.track,
+        b.relTs,
+        b.flags === undefined ? 0x80 : b.flags,
+        b.payloadLen === undefined ? 20 : b.payloadLen)),
+      !!marker8
+    ));
+    return Buffer.concat([header, segHdr, infoEl, tracks, ...clusters]);
+  }
+
+  // A cluster with a Void element (0xEC — not Timecode/SimpleBlock) sitting
+  // between two SimpleBlocks. Pins refineCutToBlock's "any other child before
+  // the cut point -> null" rule: the Void must bail the walk even when
+  // localT is never actually exceeded by any block in the cluster.
+  function unexpectedChildClusterWebm() {
+    const header = Buffer.from([0x1A, 0x45, 0xDF, 0xA3, 0x80]);
+    const segHdr = Buffer.from([0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+    const infoEl = el([0x15, 0x49, 0xA9, 0x66], el([0x2A, 0xD7, 0xB1], uintBytes(1000000, 3)));
+    const tracks = el([0x16, 0x54, 0xAE, 0x6B], el([0xAE], el([0xD7], [0x01]), el([0x83], [0x01])));
+    const voidEl = el([0xEC], Buffer.alloc(4, 0));
+    return Buffer.concat([header, segHdr, infoEl, tracks,
+      clusterUnknown(0, [simpleBlock(1, 0, 0x80, 20), voidEl, simpleBlock(1, 300, 0x00, 20)])]);
+  }
+
   async function seedBuffers(parts, indexes) {
     const id = await api.createSession('video/webm;codecs=vp9,opus');
     for (let i = 0; i < parts.length; i++) await api.addChunk(id, indexes ? indexes[i] : i, new Blob([parts[i]]));
@@ -1023,6 +1067,38 @@ async function scenario(name, fn) {
         label + ': cluster ' + i + '->' + (i + 1) + ' timeline does not go backward (next ts ' +
         scan.clusters[i + 1].timestamp + ' >= prev contentEnd ' + end + ')');
     }
+  }
+  // REVIEW #22 session 1 — independent oracle for refineCutToBlock, built
+  // from the same low-level primitives scenario K/O already trust
+  // (S.ebmlReadId/ebmlReadSize + the childElems walker above) rather than
+  // calling refineCutToBlock to check itself. `buf` is the FULL fixture
+  // buffer; `cluster` is one entry from a real scan result
+  // ({start,end,timestamp}); `localT` is segment-local, same convention as
+  // refineCutToBlock's third argument. This mirrors refineCutToBlock's own
+  // positional-first-exceed rule by construction — that rule IS the thing
+  // under test, so both walk the same children; what's independent is the
+  // walking mechanism (a generic childElems scan vs refineCutToBlock's own
+  // hand-rolled one) and the primitives trusted (ebmlReadId/ebmlReadSize,
+  // already proven correct by scenarios K/N/O). Kept-end times floor at the
+  // cluster timestamp, same as webmMaxBlockTime (and refineCutToBlock).
+  function expectedBlockCut(buf, cluster, localT) {
+    const ab = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length);
+    const view = new DataView(ab);
+    const cId = S.ebmlReadId(view, cluster.start);
+    const cSize = S.ebmlReadSize(view, cluster.start + cId.length);
+    const dataStart = cluster.start + cId.length + cSize.length;
+    const kids = childElems(view, dataStart, cluster.end);
+    let maxKeptRel = null;
+    for (const k of kids) {
+      if (k.id !== 0xA3) continue;   // SimpleBlock
+      const tn = S.ebmlReadSize(view, k.dataStart);
+      const relTs = view.getInt16(k.dataStart + tn.length, false);
+      if (cluster.timestamp + relTs > localT) {
+        return maxKeptRel === null ? null : { relCutOffset: k.start - cluster.start, keptEndMs: cluster.timestamp + Math.max(0, maxKeptRel) };
+      }
+      if (maxKeptRel === null || relTs > maxKeptRel) maxKeptRel = relTs;
+    }
+    return maxKeptRel === null ? null : { relCutOffset: cluster.end - cluster.start, keptEndMs: cluster.timestamp + Math.max(0, maxKeptRel) };
   }
   // Phase 0 oracle (STREAMING_STITCH_HANDOFF §5): the REAL concatenateWebM +
   // makeSeekable, run over N segment buffers. Uses ORIG.concatenateWebM so this
@@ -4631,6 +4707,346 @@ Real cue text
     state.screenStream = makeStream([{ kind: 'video', stop() {} }]);
     sandbox.updateToggleUI();
     assert(!toggleEl.classList.contains('active'), 'Screen-off intent is never lit');
+  });
+
+  // ============================================================
+  // REVIEW #22 "block-precision re-record cut", session 1 — refineCutToBlock
+  // (pure block-boundary math), readSessionByteRange (the ranged read it
+  // needs), computeCutPlan's new segOffsetMs/clusterIndex fields, and the
+  // differential proof that a block-precision cut saves/stitches exactly
+  // like a Rule-A cut does, just at a finer-grained byte.
+  // ============================================================
+
+  // DZ — refineCutToBlock unit coverage (pure; no IndexedDB at all)
+  await scenario('DZ refineCutToBlock: mid-cluster cut, keep-whole, drop-whole, known-size refusal, unexpected child, interleaved tracks, negative relTs', async () => {
+    // ---- mid-cluster cut: video-only, 3 blocks, cut before the 3rd ----
+    {
+      const buf = multiBlockClusterWebm([
+        { ts: 0, blocks: [
+          { track: 1, relTs: 0,   flags: 0x80 },
+          { track: 1, relTs: 100, flags: 0x00 },
+          { track: 1, relTs: 250, flags: 0x00 },
+        ] },
+      ]);
+      const scan = scanResult(buf);
+      const cluster = scan.clusters[0];
+      const clusterBytes = buf.slice(cluster.start, cluster.end);
+      const localT = 200;
+      const want = expectedBlockCut(buf, cluster, localT);
+      const got = S.refineCutToBlock(clusterBytes, cluster.timestamp, localT);
+      assert(want !== null, 'DZ precondition: oracle finds a real cut point');
+      assert(got && got.relCutOffset === want.relCutOffset && got.keptEndMs === want.keptEndMs,
+        'DZ mid-cluster: refineCutToBlock === independent oracle (got ' + JSON.stringify(got) + ' want ' + JSON.stringify(want) + ')');
+      assert(got.keptEndMs === 100, 'DZ mid-cluster: keeps up to relTs 100 (got ' + got.keptEndMs + ')');
+    }
+
+    // ---- keep-whole: localT past every block in the cluster (fixes Rule
+    // A's over-drop when T falls in the gap after a cluster's last block) ----
+    {
+      const buf = multiBlockClusterWebm([
+        { ts: 0, blocks: [
+          { track: 1, relTs: 0,   flags: 0x80 },
+          { track: 1, relTs: 100, flags: 0x00 },
+          { track: 1, relTs: 250, flags: 0x00 },
+        ] },
+      ]);
+      const scan = scanResult(buf);
+      const cluster = scan.clusters[0];
+      const clusterBytes = buf.slice(cluster.start, cluster.end);
+      const localT = 5000;   // way past the last block
+      const got = S.refineCutToBlock(clusterBytes, cluster.timestamp, localT);
+      assert(got && got.relCutOffset === clusterBytes.length && got.keptEndMs === 250,
+        'DZ keep-whole: relCutOffset === full cluster length, keptEndMs === last block (got ' + JSON.stringify(got) + ')');
+    }
+
+    // ---- drop-whole -> null: localT before even the FIRST block -> zero
+    // blocks kept, byte-identical to Rule A, caller keeps that plan ----
+    {
+      const buf = multiBlockClusterWebm([
+        { ts: 1000, blocks: [
+          { track: 1, relTs: 0,   flags: 0x80 },
+          { track: 1, relTs: 100, flags: 0x00 },
+        ] },
+      ]);
+      const scan = scanResult(buf);
+      const cluster = scan.clusters[0];
+      const clusterBytes = buf.slice(cluster.start, cluster.end);
+      const got = S.refineCutToBlock(clusterBytes, cluster.timestamp, 999);   // before the cluster's own first block (ts 1000)
+      assert(got === null, 'DZ drop-whole: localT before the first block -> null (got ' + JSON.stringify(got) + ')');
+    }
+
+    // ---- known-size cluster -> null (AX asymmetry: refinement never
+    // applies to a known-size cluster, only Rule A's whole-cluster drop) ----
+    {
+      const buf = knownSizeClusterWebm();
+      const scan = scanResult(buf);
+      const cluster = scan.clusters[0];
+      const clusterBytes = buf.slice(cluster.start, cluster.end);
+      const got = S.refineCutToBlock(clusterBytes, cluster.timestamp, cluster.timestamp + 1);
+      assert(got === null, 'DZ known-size: refineCutToBlock refuses a known-size cluster (got ' + JSON.stringify(got) + ')');
+    }
+
+    // ---- unexpected child element before the cut point -> null ----
+    {
+      const buf = unexpectedChildClusterWebm();
+      const scan = scanResult(buf);
+      const cluster = scan.clusters[0];
+      const clusterBytes = buf.slice(cluster.start, cluster.end);
+      const got = S.refineCutToBlock(clusterBytes, cluster.timestamp, 10000);   // localT never exceeded — the Void must still bail the walk
+      assert(got === null, 'DZ unexpected child: a Void element before the cut point -> null (got ' + JSON.stringify(got) + ')');
+    }
+
+    // ---- interleaved tracks: positional first-exceed, not "first video" or
+    // "first audio" ----
+    {
+      const buf = multiBlockClusterWebm([
+        { ts: 0, blocks: [
+          { track: 1, relTs: 0,   flags: 0x80 },
+          { track: 2, relTs: 50,  flags: 0x80 },
+          { track: 1, relTs: 300, flags: 0x00 },
+        ] },
+      ]);
+      const scan = scanResult(buf);
+      const cluster = scan.clusters[0];
+      const clusterBytes = buf.slice(cluster.start, cluster.end);
+      const localT = 200;
+      const want = expectedBlockCut(buf, cluster, localT);
+      const got = S.refineCutToBlock(clusterBytes, cluster.timestamp, localT);
+      assert(got && want && got.relCutOffset === want.relCutOffset && got.keptEndMs === want.keptEndMs && got.keptEndMs === 50,
+        'DZ interleaved: cuts at the 3rd block (track 1) regardless of the 2nd block being a different track (got ' + JSON.stringify(got) + ')');
+    }
+
+    // ---- negative relTs: legal, and must not break max-tracking ----
+    {
+      const buf = multiBlockClusterWebm([
+        { ts: 1000, blocks: [
+          { track: 1, relTs: -50, flags: 0x80 },
+          { track: 1, relTs: 100, flags: 0x00 },
+          { track: 1, relTs: 300, flags: 0x00 },
+        ] },
+      ]);
+      const scan = scanResult(buf);
+      const cluster = scan.clusters[0];
+      const clusterBytes = buf.slice(cluster.start, cluster.end);
+      const localT = 1150;   // absolute: 950 and 1100 kept, 1300 exceeds
+      const want = expectedBlockCut(buf, cluster, localT);
+      const got = S.refineCutToBlock(clusterBytes, cluster.timestamp, localT);
+      assert(got && want && got.relCutOffset === want.relCutOffset && got.keptEndMs === want.keptEndMs && got.keptEndMs === 1100,
+        'DZ negative relTs: kept blocks include the negative one, max-tracking uses relTs not arrival order (got ' + JSON.stringify(got) + ')');
+    }
+
+    // ---- keptEndMs floors at the cluster timestamp: webmMaxBlockTime starts
+    // its max AT cluster.timestamp, so the truncated cluster's re-scanned
+    // lastClusterMaxBlockTime can never sit below it — refineCutToBlock's
+    // bookkeeping must report the same value when every kept relTs is
+    // negative (orchestrator review fix, session 1) ----
+    {
+      const buf = multiBlockClusterWebm([
+        { ts: 1000, blocks: [
+          { track: 1, relTs: -50, flags: 0x80 },
+          { track: 1, relTs: 600, flags: 0x00 },
+        ] },
+      ]);
+      const scan = scanResult(buf);
+      const cluster = scan.clusters[0];
+      const clusterBytes = buf.slice(cluster.start, cluster.end);
+      const got = S.refineCutToBlock(clusterBytes, cluster.timestamp, 1000);   // keeps only the relTs=-50 block (abs 950); 1600 exceeds
+      assert(got && got.keptEndMs === 1000,
+        'DZ floor: all-negative kept relTs floors keptEndMs at the cluster timestamp (got ' + JSON.stringify(got) + ')');
+      const gotWhole = S.refineCutToBlock(
+        buf.slice(cluster.start, cluster.end),
+        cluster.timestamp, 5000);   // keep-whole path floors the same way when maxKeptRel is negative... here max is 600 so this pins the POSITIVE case stays exact
+      assert(gotWhole && gotWhole.keptEndMs === 1600,
+        'DZ floor: positive max is untouched by the floor (got ' + JSON.stringify(gotWhole) + ')');
+    }
+  });
+
+  // EA — computeCutPlan carries segOffsetMs/clusterIndex on the cutAtByte>0
+  // branch only, matching the real seam formula, for session 2's wire-in.
+  await scenario('EA computeCutPlan carries segOffsetMs/clusterIndex for block-precision refinement (session 2 wire-in)', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const offset1 = seamOffset(scan0);   // computeCutPlan's own offsets[1] formula
+
+    // Mid-cluster cut in segment 0 -> segOffsetMs is offsets[0] (0), clusterIndex is the dropped cluster's index.
+    let T = midTs(scan0.clusters[1].timestamp, scan0.clusters[2].timestamp);
+    let plan = S.computeCutPlan([scan0, scan1], T);
+    assert(plan.kind === 'cut' && plan.segIndex === 0 && plan.segOffsetMs === 0 && plan.clusterIndex === 1,
+      'EA: segment-0 cut carries segOffsetMs=0, clusterIndex=1 (got ' + JSON.stringify(plan) + ')');
+    assert(scan0.clusters[plan.clusterIndex].start === plan.cutAtByte, 'EA: clusterIndex indexes the same cluster cutAtByte points at');
+
+    // Mid-cluster cut in segment 1 -> segOffsetMs === offsets[1] (the real seam formula), clusterIndex into scan1.clusters.
+    T = offset1 + midTs(scan1.clusters[1].timestamp, scan1.clusters[2].timestamp);
+    plan = S.computeCutPlan([scan0, scan1], T);
+    assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.segOffsetMs === offset1 && plan.clusterIndex === 1,
+      'EA: segment-1 cut carries segOffsetMs=offsets[1], clusterIndex=1 (got ' + JSON.stringify(plan) + ')');
+    assert(scan1.clusters[plan.clusterIndex].start === plan.cutAtByte, 'EA: clusterIndex indexes the same cluster cutAtByte points at');
+
+    // localT = T - segOffsetMs must be segment-local and land inside the
+    // dropped cluster's own span — exactly what refineCutToBlock needs.
+    const localT = T - plan.segOffsetMs;
+    assert(localT > scan1.clusters[1].timestamp && localT < scan1.clusters[2].timestamp,
+      'EA: T - segOffsetMs is segment-local and lands inside the dropped cluster (got ' + localT + ')');
+
+    // cutAtByte===0 branches (seam gap, and k===0 inside a segment) carry
+    // NEITHER field — there's no cluster to refine into.
+    T = midTs(scan0.lastClusterMaxBlockTime, offset1);
+    plan = S.computeCutPlan([scan0, scan1], T);
+    assert(plan.kind === 'cut' && plan.cutAtByte === 0 && plan.segOffsetMs === undefined && plan.clusterIndex === undefined,
+      'EA: cutAtByte===0 (seam gap) carries no segOffsetMs/clusterIndex (got ' + JSON.stringify(plan) + ')');
+  });
+
+  // EB — readSessionByteRange unit coverage
+  await scenario('EB readSessionByteRange: chunk-spanning ranges match the oracle slice, and respect an existing cutAtByte marker', async () => {
+    const buf = syntheticWebm();
+    const total = buf.length;
+    const cids = clusterIdOffsets(buf);
+    const parts = splitAt(buf, [Math.floor(total / 3), Math.floor(2 * total / 3)]);
+
+    // (a) ranges deliberately spanning >=1 chunk boundary.
+    const id = await seedBuffers(parts);
+    const ranges = [
+      [0, total],
+      [cids[1] - 5, cids[1] + 5],
+      [10, cids[2]],
+      [cids[2], total],
+    ];
+    for (const [s, e] of ranges) {
+      const got = Buffer.from(await S.readSessionByteRange(id, s, e));
+      const want = buf.slice(s, e);
+      assert(Buffer.compare(got, want) === 0,
+        'EB: range [' + s + ',' + e + ') === oracle slice (' + got.length + ' vs ' + want.length + ' bytes)');
+    }
+
+    // (b) an existing cutAtByte marker truncates what readSessionByteRange
+    // can see, exactly like forEachSessionChunk itself (same choke point).
+    const cutId = await seedBuffers(parts);
+    const cutAt = cids[1];
+    await S.setSessionCut(cutId, cutAt, 0);
+    const gotCut = Buffer.from(await S.readSessionByteRange(cutId, 0, total));
+    assert(Buffer.compare(gotCut, buf.slice(0, cutAt)) === 0,
+      'EB: an existing cut marker truncates the range read, even when the caller asks past it (got ' + gotCut.length + ' vs want ' + cutAt + ')');
+    const gotCutMid = Buffer.from(await S.readSessionByteRange(cutId, 10, total));
+    assert(Buffer.compare(gotCutMid, buf.slice(10, cutAt)) === 0,
+      'EB: cut respected even when the range start is mid-buffer (got ' + gotCutMid.length + ' vs want ' + (cutAt - 10) + ')');
+  });
+
+  // EC — single-segment block-precision differential (mandatory): the real
+  // sinks, cut at a REFINED byte (not Rule A's whole-cluster drop), must
+  // still byte-equal makeSeekable(slice(0,cutAtByte)) — same oracle shape as
+  // DK, just with a finer-grained cutAtByte.
+  await scenario('EC block-precision cut differential (single segment): refineCutToBlock + streamed save === makeSeekable(slice) oracle', async () => {
+    const specs = [
+      { ts: 0,    blocks: [
+        { track: 1, relTs: 0,   flags: 0x80 },
+        { track: 2, relTs: 20,  flags: 0x80 },
+        { track: 1, relTs: 300, flags: 0x00 },
+        { track: 1, relTs: 600, flags: 0x00 },
+      ] },
+      { ts: 1000, blocks: [
+        { track: 1, relTs: 0,   flags: 0x80 },
+        { track: 1, relTs: 400, flags: 0x00 },
+      ] },
+    ];
+    const fixtures = [
+      ['chrome',  multiBlockClusterWebm(specs, false)],
+      ['firefox', multiBlockClusterWebm(specs, true)],
+    ];
+
+    for (const [fname, buf] of fixtures) {
+      const scan = scanResult(buf);
+      const c = scan.clusters;
+      assert(c.length === 2, fname + ': fixture precondition, 2 clusters (got ' + c.length + ')');
+
+      // Rule A would drop cluster 0 whole; refineCutToBlock instead cuts
+      // inside it, right before the block at relTs=600 (keeping 0, 20, 300).
+      const localT = 400;   // segment-local: strictly between the 300 and 600 blocks
+      const clusterBytes = buf.slice(c[0].start, c[0].end);
+      const refined = S.refineCutToBlock(clusterBytes, c[0].timestamp, localT);
+      assert(refined && refined.keptEndMs === 300, fname + ': refined keeps up to relTs 300 (got ' + JSON.stringify(refined) + ')');
+      const cutAtByte = c[0].start + refined.relCutOffset;
+      assert(cutAtByte > c[0].start && cutAtByte < c[0].end, fname + ': refined cut lands strictly inside cluster 0 (got ' + cutAtByte + ')');
+
+      const splitStrategies = [
+        ['midChunk',  splitAt(buf, [cutAtByte - 3, cutAtByte + 7])],   // cut byte lands mid-chunk
+        ['chunkEdge', splitAt(buf, [cutAtByte])],                      // cut byte lands exactly on a chunk boundary
+      ];
+
+      const want = await expectedBytes(buf.slice(0, cutAtByte));
+      for (const [sname, parts] of splitStrategies) {
+        const idA = await seedBuffers(parts);
+        await S.setSessionCut(idA, cutAtByte, refined.keptEndMs);
+        const fsa = await runStreamedFSA(idA);
+        assert(fsa.r === 'saved' && Buffer.compare(fsa.bytes, want) === 0,
+          fname + '/' + sname + ': block-precision FSA save === oracle (' + fsa.bytes.length + ' vs ' + want.length + ')');
+
+        const idB = await seedBuffers(parts);
+        await S.setSessionCut(idB, cutAtByte, refined.keptEndMs);
+        const dl = await runStreamedDownload(idB);
+        assert(dl.r === 'downloaded' && Buffer.compare(dl.bytes, want) === 0,
+          fname + '/' + sname + ': block-precision download save === oracle (' + dl.bytes.length + ' vs ' + want.length + ')');
+      }
+
+      // readSessionByteRange over the same span used as refineCutToBlock's
+      // input matches the buffer slice directly.
+      const ranged = await seedBuffers(splitAt(buf, [Math.floor(buf.length / 3)]));
+      const rangedBytes = Buffer.from(await S.readSessionByteRange(ranged, c[0].start, c[0].end));
+      assert(Buffer.compare(rangedBytes, clusterBytes) === 0,
+        fname + ': readSessionByteRange over the dropped cluster span matches the buffer slice used as refineCutToBlock input');
+    }
+  });
+
+  // ED — 2-segment chain block-precision differential (mandatory): segment 2
+  // gets the refined cut; stitched save vs the concatenateWebM oracle of
+  // sliced buffers, mirroring DL's chain-oracle structure exactly.
+  await scenario('ED block-precision cut differential (2-segment chain): segment 2 refined, stitched save === stitchOracle(sliced buffers)', async () => {
+    const buf0 = syntheticWebm();
+    const buf1 = multiBlockClusterWebm([
+      { ts: 0,    blocks: [{ track: 1, relTs: 0, flags: 0x80 }] },   // filler cluster 0 — keeps the refine target at clusterIndex 1
+      { ts: 1000, blocks: [
+        { track: 1, relTs: 0,   flags: 0x80 },
+        { track: 2, relTs: 20,  flags: 0x80 },
+        { track: 1, relTs: 300, flags: 0x00 },
+        { track: 1, relTs: 600, flags: 0x00 },
+      ] },
+    ], true);   // Firefox-shaped (8-byte marker), to cover that shape in a chain too
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const offset1 = seamOffset(scan0);
+
+    // computeCutPlan drops scan1's cluster 1 whole under Rule A; refine it instead.
+    const T = offset1 + 1400;   // segment-1-local 1400: strictly between blocks at relTs 300 (abs 1300) and 600 (abs 1600)
+    const plan = S.computeCutPlan([scan0, scan1], T);
+    assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.clusterIndex === 1 && plan.cutAtByte === scan1.clusters[1].start,
+      'ED precondition: Rule A drops segment 1 cluster 1 whole (got ' + JSON.stringify(plan) + ')');
+    const localT = T - plan.segOffsetMs;
+
+    const cluster = scan1.clusters[plan.clusterIndex];
+    const clusterBytes = buf1.slice(cluster.start, cluster.end);
+    const refined = S.refineCutToBlock(clusterBytes, cluster.timestamp, localT);
+    assert(refined && refined.keptEndMs === 1300, 'ED: refined keeps up to relTs 300 (abs 1300) (got ' + JSON.stringify(refined) + ')');
+    const cutAtByte = cluster.start + refined.relCutOffset;
+    assert(cutAtByte > plan.cutAtByte && cutAtByte < cluster.end,
+      'ED: refined cut keeps strictly more than the Rule A whole-cluster drop (got ' + cutAtByte + ' vs Rule A ' + plan.cutAtByte + ')');
+
+    const want = await stitchOracle([buf0, buf1.slice(0, cutAtByte)]);
+    const thirds = (b) => splitAt(b, [Math.floor(b.length / 3), Math.floor(2 * b.length / 3)]);
+    const cutAtMs = plan.segOffsetMs + refined.keptEndMs;
+
+    const id0 = await seedBuffers(thirds(buf0)), id1 = await seedBuffers(thirds(buf1));
+    await S.setSessionCut(id1, cutAtByte, cutAtMs);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    const r = await S.saveSessionsStreamedStitch(
+      [{ sessionId: id0, mimeType: 'video/webm' }, { sessionId: id1, mimeType: 'video/webm' }], 'x.webm');
+    assert(r === 'saved' && Buffer.compare(Buffer.from(await lastWritten.pop().arrayBuffer()), want) === 0,
+      'ED: FSA block-precision stitched save === stitchOracle([buf0, buf1.slice(0,cut)])');
+
+    const id0b = await seedBuffers(thirds(buf0)), id1b = await seedBuffers(thirds(buf1));
+    await S.setSessionCut(id1b, cutAtByte, cutAtMs);
+    delete windowMock.showSaveFilePicker;
+    const rDl = await S.saveSessionsStreamedStitch(
+      [{ sessionId: id0b, mimeType: 'video/webm' }, { sessionId: id1b, mimeType: 'video/webm' }], 'x.webm');
+    assert(rDl === 'downloaded' && Buffer.compare(Buffer.from(await objectUrlBlobs[objectUrlBlobs.length - 1].arrayBuffer()), want) === 0,
+      'ED: download block-precision stitched save === stitchOracle([buf0, buf1.slice(0,cut)])');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

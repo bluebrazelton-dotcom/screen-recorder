@@ -467,6 +467,47 @@ field rewritten (or converted to unknown-size) — and the truncated-known-size
 asymmetry scenario AX pins must be respected. Differential harness coverage
 mandatory. Design brief first; Fable designs/reviews, Sonnet executes.
 
+**Design (signed off 2026-08-03) — refinement is still pure metadata; no
+byte-surgery anywhere.** Key recon fact: BOTH browsers' MediaRecorders write
+unknown-size clusters (Chrome 1-byte 0xFF, Firefox 8-byte all-ones — pinned
+by scenarios N/O/AL), so a cluster truncated at a block boundary needs no
+size rewrite: it ends at EOF (lone/final) or at the next cluster (chain) —
+the exact shape every crash tail already has, except cleaner (block-aligned,
+not mid-block). The AX asymmetry is respected by construction: refinement
+applies ONLY to unknown-size clusters; known-size falls back to Rule A
+(defensive only — the app never records known-size clusters). Mechanics:
+computeCutPlan runs unchanged and identifies the dropped cluster; a ranged
+read (`readSessionByteRange`, built on forEachSessionChunk so re-cuts inherit
+enforcement) buffers that one cluster (~2–3 MB worst case); a new pure
+function `refineCutToBlock(clusterBytes, clusterTs, localT)` walks the
+cluster's children with byte offsets — skip Timecode, cut at the FIRST
+SimpleBlock with clusterTs+relTs > localT (positional first-exceed: every
+kept block <= T even with interleave), any other child type before the cut
+point → null → Rule A. Three shapes fall out: mid-cluster cut (~33ms
+precision), keep-whole (fixes Rule A's intra-segment-gap over-drop for
+free), drop-whole (= null = Rule A byte-identical). keptEndMs = max kept
+block ts, which IS the truncated cluster's re-scanned
+lastClusterMaxBlockTime, so the seam formula stays in lockstep
+automatically. Undo, cutAtMs bookkeeping, and every consumer inherit
+through the existing choke point untouched. #25(b)'s typed timestamp will
+feed the same path. Differential tests same oracle as v1.19
+(slice(0,cutAtByte) -> makeSeekable; chains vs concatenateWebM), new
+multi-block fixtures (interleaved audio, negative relTs, both size-marker
+shapes, a known-size cluster that must REFUSE refinement), DS assertNoOverlap
+extended. Sessions: (1) primitive + fixtures + differential tests; (2) wire
+into reviewCutFromHere + owner Firefox acceptance.
+
+**Session 1 SHIPPED (2026-08-03, v1.22):** `refineCutToBlock` +
+`readSessionByteRange` + computeCutPlan's `segOffsetMs`/`clusterIndex`
+fields + scenarios DZ–ED (unit edges incl. the keptEndMs floor, ranged-read
+coverage, and the mandatory single-segment and 2-segment-chain
+differentials, both marker shapes, both sinks). Harness 144 scenarios /
+999 assertions. Orchestrator review caught 1 draft defect (keptEndMs could
+sit below the cluster timestamp when every kept relTs is negative,
+drifting the bookkeeping below the post-cut re-scan's
+lastClusterMaxBlockTime — now floored and test-pinned in DZ). Remaining:
+session 2 — wire-in + owner acceptance.
+
 ### 24. Recorder & storage resilience — SHIPPED v1.21 (2026-08-02)
 
 Owner acceptance testing surfaced a Firefox 153 failure: MediaRecorder

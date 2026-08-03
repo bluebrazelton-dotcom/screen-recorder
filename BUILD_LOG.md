@@ -1817,6 +1817,69 @@ Harness: **139 scenarios / 955 assertions**.
 
 ---
 
+### v1.22 — Block-precision re-record cut (#22), session 1 of 2: refinement primitive + differential tests (2026-08-03)
+
+**Commit:** `v1.22 (#22 session 1): refineCutToBlock + readSessionByteRange + computeCutPlan segOffsetMs/clusterIndex + DZ-ED differential tests`
+
+First of #22's two sessions (design signed off 2026-08-03 — see REVIEW #22's
+Design block). No UI this session; pure plumbing + tests, exactly the v1.19
+pattern. The cut stays METADATA — the refinement just computes a
+finer-grained `cutAtByte`, landing INSIDE the dropped cluster at a block
+boundary instead of at the cluster's start. Precision goes from ~7.5s
+(Firefox clusters) / ~1s (Chrome) to ~one block (~33ms video cadence).
+
+**What was built:**
+
+1. **`refineCutToBlock(clusterBytes, clusterTs, localT)`** — pure function,
+   no I/O. Walks one cluster's children with byte offsets: skips Timecode,
+   cuts at the FIRST SimpleBlock whose absolute time exceeds localT
+   (positional first-exceed — every kept block <= T even with track
+   interleave and negative relTs). Returns `{relCutOffset, keptEndMs}` or
+   null → caller keeps the Rule A whole-cluster-drop plan. Null on: a
+   KNOWN-size cluster (the scenario-AX asymmetry — a truncated known-size
+   cluster would bail a chain stitch, so refinement only ever applies to
+   unknown-size clusters, which is all either browser's MediaRecorder
+   writes); any child that isn't Timecode/SimpleBlock; any malformed or
+   overrunning child; zero kept blocks (byte-identical to Rule A anyway).
+   Keep-whole is a real outcome (relCutOffset = full cluster length) and
+   fixes Rule A's over-drop when T falls in the gap after a cluster's last
+   block. `keptEndMs` floors at the cluster timestamp, matching
+   `webmMaxBlockTime`'s own floor, so the bookkeeping can never drift below
+   the post-cut re-scan's `lastClusterMaxBlockTime` (orchestrator review
+   fix — the one defect found in this session's draft).
+2. **`readSessionByteRange(sessionId, startByte, endByte)`** — ranged read
+   built ON `forEachSessionChunk`, so it sees the same cut-enforced view as
+   every other consumer (re-cuts of an already-cut segment stay
+   consistent). Single linear pass, bounded copy; no early-abort plumbed
+   through the shared choke point (documented tradeoff — one cluster is
+   ~2–3 MB worst case).
+3. **`computeCutPlan` cut returns now carry `segOffsetMs`/`clusterIndex`**
+   (cutAtByte > 0 branch only) — session 2's wire-in derives
+   `localT = T - segOffsetMs` and the target cluster from the plan itself
+   instead of recomputing seam offsets. Additive; audited every existing
+   consumer (DI/DK/DL/DS + the stub-swap) — all field-specific assertions,
+   nothing disturbed.
+
+**Tests (44 new assertions, harness 144 scenarios / 999 assertions):**
+fixtures `multiBlockClusterWebm` (parameterizable blocks/tracks/markers,
+Chrome 0xFF + Firefox 8-byte shapes) and `unexpectedChildClusterWebm`
+(Void element mid-cluster); independent oracle `expectedBlockCut` built on
+childElems/ebmlReadId/ebmlReadSize (scenario-K style — never calls the
+function under test); DZ (8 unit edges incl. the keptEndMs floor), EA (new
+plan fields vs the real seam formula, absent on cutAtByte===0), EB (ranged
+reads vs oracle slices incl. through an existing cut marker), EC
+(single-segment differential: refined cut × both marker shapes ×
+mid-chunk/chunk-edge splits × FSA/download sinks ≡ makeSeekable(slice)
+oracle), ED (2-segment chain, Firefox-shaped segment 2 refined, stitched
+save ≡ concatenateWebM oracle, both sinks).
+
+**No changes to the recording pipeline, the v1.11/v1.13 streamed save
+flows' behavior for uncut sessions, or `forEachSessionChunk` itself.**
+Remaining: session 2 — wire into `reviewCutFromHere` + owner Firefox
+acceptance.
+
+---
+
 ## Known limitations
 
 1. ~~**Memory usage during stitching (multi-segment only):** single-segment saves stream with bounded memory since v1.11, but `concatenateWebM` still loads every segment into memory for multi-segment stitching (Continue Recording chains, multi-crash recovery). Very long multi-segment recoveries — roughly beyond 2–3 hours of total footage at Balanced quality — may fail to save on low-RAM machines. Streaming stitch is the queued follow-on.~~ — ✓ Fixed in v1.13: `saveSessionsStreamedStitch` streams every multi-segment save (Continue Recording chains, multi-crash recovery) with the same bounded-carry two-pass shape v1.11 uses for single segments, byte-identical to the old buffered output. Any doubt in the scan bails to streamed separate-parts saves (never back to the buffered path) with an in-app banner instead of a blocking `confirm()`. `concatenateWebM` stays in the file as the differential-test oracle and the reference the header-rewrite logic was extracted from, but is no longer reachable from any save flow.

@@ -1160,6 +1160,42 @@ async function forEachSessionChunk(sessionId, fn) {
   }
 }
 
+// REVIEW #22 (session 1): read an arbitrary [startByte, endByte) range of a
+// session's CUT-ENFORCED byte stream — built on forEachSessionChunk so a
+// range read on an already-cut session (a re-cut of a re-cut) sees the same
+// truncated view every other consumer does. `endByte` may run past the
+// session's real (or already-cut) length; the result is naturally clamped to
+// whatever forEachSessionChunk actually yields.
+//
+// forEachSessionChunk has no early-abort signal (see its own comment above —
+// the per-chunk transaction shape rules that out), so this walks every chunk
+// up to the session's cut/end regardless of where `endByte` falls; it just
+// copies the overlapping slice of each chunk and skips the rest. That's a
+// single linear pass with a bounded amount of copying (never more than
+// endByte - startByte bytes retained) — acceptable for what this is used for
+// (pulling one cluster's bytes for refineCutToBlock, and small ranged reads
+// generally), not a hot path that would justify plumbing an early-exit
+// through the shared choke point.
+async function readSessionByteRange(sessionId, startByte, endByte) {
+  const parts = [];
+  let pos = 0;
+  await forEachSessionChunk(sessionId, (data) => {
+    const chunkStart = pos;
+    const chunkEnd = pos + data.byteLength;
+    pos = chunkEnd;
+    if (chunkEnd <= startByte || chunkStart >= endByte) return; // no overlap with the requested range
+    const sliceStart = Math.max(0, startByte - chunkStart);
+    const sliceEnd = Math.min(data.byteLength, endByte - chunkStart);
+    parts.push(new Uint8Array(data.slice(sliceStart, sliceEnd)));
+  });
+  let total = 0;
+  for (const p of parts) total += p.length;
+  const out = new Uint8Array(total);
+  let w = 0;
+  for (const p of parts) { out.set(p, w); w += p.length; }
+  return out;
+}
+
 async function deleteSession(sessionId) {
   const db = await openDB();
   return new Promise((resolve, reject) => {
@@ -3213,6 +3249,16 @@ function buildStreamIndexParts(scan) {
 //   { kind: 'cut', segIndex, cutAtByte, keptMs }
 //     cutAtByte > 0: setSessionCut(cutAtByte) on segments[segIndex]'s session;
 //       segments[segIndex+1..] are discarded whole. Earlier segments untouched.
+//       ALSO carries segOffsetMs (= offsets[segIndex]) and clusterIndex (= k,
+//       the index into scans[segIndex].clusters of the dropped cluster) —
+//       REVIEW #22 session 2's block-precision refinement needs both:
+//       scans[segIndex].clusters[clusterIndex] gives the dropped cluster's
+//       own {start,end,timestamp} (for a ranged read and as refineCutToBlock's
+//       clusterTs), and localT = T - segOffsetMs is the segment-local target
+//       time refineCutToBlock's own timeline expects. Neither field is
+//       present on the cutAtByte === 0 branches below — there's no cluster to
+//       refine into (the cut already lands at a segment boundary or in a
+//       seam gap), so refinement never applies there.
 //     cutAtByte === 0: segments[segIndex..] are discarded whole (segIndex
 //       itself included). Segments before segIndex are untouched.
 // `keptMs` is the resulting duration on the global timeline (UI/undo
@@ -3266,7 +3312,97 @@ function computeCutPlan(scans, T) {
     const keptMs = offsets[i - 1] + scans[i - 1].lastClusterMaxBlockTime;
     return { kind: 'cut', segIndex: i, cutAtByte: 0, keptMs };
   }
-  return { kind: 'cut', segIndex: i, cutAtByte: cl[k].start, keptMs: offsets[i] + cl[k].timestamp };
+  return { kind: 'cut', segIndex: i, cutAtByte: cl[k].start, keptMs: offsets[i] + cl[k].timestamp,
+           segOffsetMs: offsets[i], clusterIndex: k };
+}
+
+// Refine a Rule-A cluster-drop to a block boundary INSIDE the cluster
+// (REVIEW #22, session 1). PURE — no I/O. `clusterBytes` must be exactly one
+// complete cluster element (Cluster ID through the end of its data, per a
+// scan's own {start,end} — e.g. buf.slice(cluster.start, cluster.end), or the
+// equivalent readSessionByteRange call), `clusterTs` its absolute timestamp
+// (ticks — this file treats WebM ticks and ms interchangeably throughout,
+// see SEAM_GAP_MS), and `localT` the target time on the SEGMENT-LOCAL
+// timeline (the caller subtracts computeCutPlan's segOffsetMs before calling
+// in — see its doc comment).
+//
+// Both browsers write UNKNOWN-SIZE clusters (Chrome: 1-byte 0xFF; Firefox:
+// 8-byte 0x01 FF..FF) — truncating one at a block boundary needs no size
+// rewrite, it just ends at EOF or the next Cluster ID, the same shape a
+// crash tail already has and the whole pipeline already tolerates. A
+// KNOWN-size cluster truncated this way is exactly what scenario AX pins as
+// a chain-stitch bail, so refinement only ever applies to an unknown-size
+// cluster; a known-size one returns null and the caller falls back to Rule A
+// (drop the whole cluster).
+//
+// Returns null (caller keeps the Rule A whole-cluster-drop plan) when: the
+// cluster's size is known; the cluster or a child element doesn't parse or
+// overruns the buffer; a child other than Timecode/SimpleBlock appears
+// before the cut point is found; or the cut point would keep zero blocks
+// (byte-identical to Rule A anyway — nothing to refine).
+//
+// Otherwise returns { relCutOffset, keptEndMs }: relCutOffset is the byte
+// offset from the START of clusterBytes at which to truncate (the caller
+// adds the cluster's own absolute start to get the new cutAtByte); keptEndMs
+// is the resulting content-end time on the segment-local timeline (adding
+// the segment's segOffsetMs recovers the global keptMs, mirroring
+// computeCutPlan's own keptMs convention).
+//
+// SimpleBlock layout: [track VINT (marker-stripped, via ebmlReadSize)]
+// [int16 BE rel. timestamp][flags][data] — same as webmWalkClusterBlocks,
+// but this walk needs byte offsets and must bail on any non-SimpleBlock
+// child, so it does its own scan rather than reusing that helper.
+//
+// Blocks appear in file order, not sorted by timestamp — a negative or
+// out-of-order relTs is legal (e.g. a block timestamped slightly before the
+// cluster's own nominal start). The rule is POSITIONAL: the first block
+// whose absolute time exceeds localT is the cut point, full stop. Every
+// block kept before it is guaranteed <= localT because each is checked in
+// file order before that first exceeder is ever found.
+function refineCutToBlock(clusterBytes, clusterTs, localT) {
+  const view = new DataView(clusterBytes.buffer, clusterBytes.byteOffset, clusterBytes.byteLength);
+  const cId = ebmlReadId(view, 0);
+  if (!cId || cId.value !== EBML_IDS.CLUSTER) return null;
+  const cSize = ebmlReadSize(view, cId.length);
+  if (!cSize || !cSize.isUnknown) return null;   // known-size -> AX asymmetry, let Rule A handle it
+
+  const clusterEnd = clusterBytes.byteLength;
+  let pos = cId.length + cSize.length;
+  let maxKeptRel = null;   // highest relTs kept so far; null until the first block is kept
+
+  while (pos < clusterEnd) {
+    const id = ebmlReadId(view, pos);
+    if (!id) return null;
+    const size = ebmlReadSize(view, pos + id.length);
+    if (!size || size.isUnknown) return null;   // Timecode/SimpleBlock are always known-size
+    const dataStart = pos + id.length + size.length;
+    const dataEnd = dataStart + size.value;
+    if (dataEnd > clusterEnd) return null;      // malformed/overrunning child
+
+    if (id.value === EBML_IDS.TIMESTAMP) {
+      pos = dataEnd;
+      continue;
+    }
+    if (id.value !== EBML_IDS.SIMPLEBLOCK) return null;   // unexpected child before the cut point
+
+    const tn = ebmlReadSize(view, dataStart);   // track number VINT (marker stripped)
+    if (!tn || dataStart + tn.length + 3 > dataEnd) return null;   // malformed SimpleBlock
+    const relTs = view.getInt16(dataStart + tn.length, false);
+    if (clusterTs + relTs > localT) {
+      if (maxKeptRel === null) return null;   // zero blocks kept -> identical to Rule A drop-whole
+      // Math.max(0, …) floor: webmMaxBlockTime starts its max at the cluster
+      // timestamp, so the truncated cluster's re-scanned
+      // lastClusterMaxBlockTime can never sit below clusterTs — keptEndMs
+      // must report that same value (all-negative kept relTs would otherwise
+      // drift this bookkeeping below the seam math's content end).
+      return { relCutOffset: pos, keptEndMs: clusterTs + Math.max(0, maxKeptRel) };
+    }
+    if (maxKeptRel === null || relTs > maxKeptRel) maxKeptRel = relTs;
+    pos = dataEnd;
+  }
+
+  if (maxKeptRel === null) return null;   // no blocks at all — degenerate, nothing to keep
+  return { relCutOffset: clusterBytes.byteLength, keptEndMs: clusterTs + Math.max(0, maxKeptRel) };
 }
 
 // Merged multi-segment stitch plan. segScans[0] is a DEFAULT-mode scan result
