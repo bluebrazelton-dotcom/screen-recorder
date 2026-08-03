@@ -1960,6 +1960,10 @@ Two findings from the owner's B1–B6 pass, both fixed same day:
 
 Harness: **149 scenarios / 1053 assertions**.
 
+**Owner eyeball acceptance PASSED (2026-08-03):** picker-on-dark-click
+(webcam off), camera-only entrance intact (webcam on), and a stable
+control row through the full cut → record → stop cycle.
+
 ---
 
 ## Known limitations
