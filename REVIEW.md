@@ -568,7 +568,7 @@ only when the stream has audio (scenario DX; harness 138/940). The
 failure was never intermittent — it was configuration-determined
 (no-mic recordings always died; mic recordings always worked).**
 
-### 23. Pause → change screens → resume — owner-requested (2026-08-02)
+### 23. Pause → change screens → resume — owner-requested (2026-08-02) — SHIPPED v1.24 (2026-08-04)
 
 While paused, let the user pick a different screen/window, then resume —
 so the recording never captures the hunt for the next screen. Scoped
@@ -592,6 +592,23 @@ ended-listener (which calls `stopRecording()` when `state.recording`).
 UI: show a "Change screen" affordance only while paused. Differential
 tests must show recorded bytes/save flows unchanged; new tests for the
 swap-while-paused state machine and audio-mix reconnection.
+
+SHIPPED v1.24 exactly as scoped: `changeScreenPaused()` (new-capture-
+first ordering — cancel/failure is a proven no-op), the ended-listener
+extracted verbatim into wire/unwire helpers removable by exact
+reference (EU models worst-case stop()-fires-'ended'), audio-mix
+reconnection into the same live destination with zero node leaks
+(EV–EX), and an end-to-end differential (EY: paused-swap session bytes
+=== no-swap session bytes). Cancelled picker is deliberately SILENT
+(diverges from selectScreen's pre-recording cancel banner — routine
+action mid-recording). Orchestrator amendment: mix teardown now
+atomically clears audioMixDest/screenAudioSourceNodes alongside
+audioContext at both teardown sites. Known deliberate limitation:
+canvas stays at the first screen's resolution — differently-sized swap
+sources stretch. Harness 165/1197. Owner real-browser acceptance
+pending (several items are real-browser-only: repeated-picker UX,
+audio pop on swap, canvas-stretch visual, live 'ended' behavior on
+deliberate stop).
 
 ### 25. Review-pane take controls: redo last take + typed timestamp (owner-requested 2026-08-03) — SHIPPED v1.23, CLOSED 2026-08-04
 

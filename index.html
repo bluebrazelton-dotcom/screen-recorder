@@ -314,6 +314,18 @@
     color: var(--text);
   }
 
+  /* REVIEW #23: paused-only screen swap — same neutral look as its neighbor
+     Pause/Resume, since it's part of the same "while paused" control cluster. */
+  .btn-change-screen {
+    background: var(--border);
+    color: var(--text);
+  }
+  .btn-change-screen:hover { background: #3a4a6c; }
+  .btn-change-screen:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   .btn-save {
     background: var(--green);
     color: #111;
@@ -769,6 +781,7 @@
     <div class="action-btns">
       <button class="primary btn-caption-editor" id="btnCaptionEditor" onclick="openCaptionEditor()">Caption editor</button>
       <button class="primary btn-pause" id="btnPause" onclick="pauseResume()" style="display:none;">Pause</button>
+      <button class="primary btn-change-screen" id="btnChangeScreen" onclick="changeScreenPaused()" style="display:none;">Change screen</button>
       <button class="primary btn-stop" id="btnStop" onclick="stopRecording()" style="display:none;">Stop &amp; save</button>
       <button class="primary btn-stop-review" id="btnStopReview" onclick="stopAndReview()" style="display:none;">Stop &amp; review</button>
       <button class="primary btn-select-screen" id="btnSelectScreen" onclick="selectScreen()">Select Screen</button>
@@ -896,8 +909,16 @@ const state = {
   paused: false,
   mediaRecorder: null,
   screenStream: null,
+  screenEndedTrack: null,   // REVIEW #23: the video track a live 'ended' listener
+                             // is currently wired to — see wireScreenEndedListener
+  screenEndedHandler: null, // the handler itself, so it can be removed by reference
   cameraStream: null,
   audioContext: null,
+  audioMixDest: null,        // REVIEW #23: the MediaStreamAudioDestinationNode from
+                              // createAudioMix, kept so a paused screen-swap can
+                              // connect/disconnect nodes into the SAME live mix
+  screenAudioSourceNodes: [], // REVIEW #23: source node(s) for the CURRENT screen's
+                               // system audio within the mix, if any (empty otherwise)
   micStream: null,      // recording-time reference only (see releaseMicRecordingRef) —
                          // may be the SAME object as heldMicStream, or a fallback
                          // fresh-acquire; never assume which without checking
@@ -2171,15 +2192,53 @@ function createAudioMix(streams) {
   const audioCtx = new AudioContext();
   const dest = audioCtx.createMediaStreamDestination();
 
+  // REVIEW #23: track which of the source nodes below carry the SCREEN's
+  // system audio (matched by track id, not stream identity — the screen's
+  // audio arrives wrapped in its own throwaway MediaStream built fresh in
+  // startRecording) so a later paused screen-swap can disconnect exactly
+  // those nodes and reconnect the new screen's audio into this SAME
+  // destination, leaving a mic node (if any) untouched. Pure bookkeeping —
+  // the connect loop and its order are unchanged.
+  const screenAudioIds = new Set((state.screenStream ? state.screenStream.getAudioTracks() : []).map((t) => t.id));
+  state.screenAudioSourceNodes = [];
+
   for (const stream of streams) {
     for (const track of stream.getAudioTracks()) {
       const source = audioCtx.createMediaStreamSource(new MediaStream([track]));
       source.connect(dest);
+      if (screenAudioIds.has(track.id)) state.screenAudioSourceNodes.push(source);
     }
   }
 
   state.audioContext = audioCtx;
+  state.audioMixDest = dest;
   return dest.stream;
+}
+
+// REVIEW #23: connects screen-audio tracks into an ALREADY-LIVE mix (used by
+// the paused screen-swap below) — a no-op if this recording never built a
+// mix in the first place. A mix can't be created mid-recording (MediaRecorder
+// is already running against a fixed track set), so a recording that started
+// with no audio at all simply can't pick up a new screen's system audio;
+// that's expected, not a bug — callers must not treat the no-op as an error.
+function connectScreenAudioToMix(tracks) {
+  if (!state.audioContext || !state.audioMixDest) return;
+  state.screenAudioSourceNodes = tracks.map((track) => {
+    const source = state.audioContext.createMediaStreamSource(new MediaStream([track]));
+    source.connect(state.audioMixDest);
+    return source;
+  });
+}
+
+// Disconnects whatever screen-audio source nodes are currently tracked (the
+// OLD screen's, right before a swap discards it) without touching any other
+// node in the mix (mic, etc.) — degrades silently if there's nothing to
+// disconnect (no mix, or the old screen had no audio).
+function disconnectScreenAudioFromMix() {
+  for (const node of state.screenAudioSourceNodes) {
+    try { node.disconnect(); } catch (e) { /* already disconnected */ }
+  }
+  state.screenAudioSourceNodes = [];
 }
 
 // ============================================================
@@ -3909,6 +3968,49 @@ async function saveSessionsStreamedStitch(segments, suggestedName) {
 // ============================================================
 // Screen selection (two-step flow)
 // ============================================================
+
+// Wires the 'ended' listener on a live screen video track — fires when the
+// user stops sharing via the browser's own UI (e.g. its "Stop sharing" bar),
+// not when this app stops the track itself. The (track, handler) pair is
+// tracked on state, not left as a bare closure, so a later DELIBERATE
+// track.stop() — the paused screen-swap below (REVIEW #23) — can remove
+// THIS EXACT listener first via unwireScreenEndedListener(). That guard
+// matters because a script-initiated stop() firing 'ended' anyway would
+// otherwise trip the state.recording branch below and end the recording
+// mid-swap. Only one (track, handler) pair is ever tracked at a time by
+// design — selectScreen and changeScreenPaused each call this exactly once
+// per newly-acquired stream, and the track it replaces is always already on
+// its way out, so there is nothing to leak or accumulate.
+function wireScreenEndedListener(stream) {
+  const track = stream.getVideoTracks()[0];
+  const handler = () => {
+    if (state.recording) {
+      stopRecording();
+    } else {
+      // Screen share ended before recording started — reset
+      state.screenStream = null;
+      screenVideo.srcObject = null;
+      stopCompositing();
+      document.getElementById('placeholder').classList.remove('hidden');
+      document.getElementById('btnSelectScreen').classList.remove('selected');
+      document.getElementById('btnSelectScreen').textContent = 'Select Screen';
+      updateToggleUI();
+      updateRecordButton();
+    }
+  };
+  track.addEventListener('ended', handler);
+  state.screenEndedTrack = track;
+  state.screenEndedHandler = handler;
+}
+
+function unwireScreenEndedListener() {
+  if (state.screenEndedTrack && state.screenEndedHandler) {
+    state.screenEndedTrack.removeEventListener('ended', state.screenEndedHandler);
+  }
+  state.screenEndedTrack = null;
+  state.screenEndedHandler = null;
+}
+
 async function selectScreen() {
   showError('');
   const btnSelect = document.getElementById('btnSelectScreen');
@@ -3927,22 +4029,11 @@ async function selectScreen() {
     screenVideo.srcObject = state.screenStream;
     await screenVideo.play();
 
-    // If user stops screen share via browser UI, reset
-    state.screenStream.getVideoTracks()[0].addEventListener('ended', () => {
-      if (state.recording) {
-        stopRecording();
-      } else {
-        // Screen share ended before recording started — reset
-        state.screenStream = null;
-        screenVideo.srcObject = null;
-        stopCompositing();
-        document.getElementById('placeholder').classList.remove('hidden');
-        document.getElementById('btnSelectScreen').classList.remove('selected');
-        document.getElementById('btnSelectScreen').textContent = 'Select Screen';
-        updateToggleUI();
-        updateRecordButton();
-      }
-    });
+    // If user stops screen share via browser UI, reset. Wiring is shared
+    // with the paused screen-swap (REVIEW #23) via wireScreenEndedListener —
+    // see its doc comment for why the (track, handler) pair is tracked on
+    // state instead of staying a bare closure.
+    wireScreenEndedListener(state.screenStream);
 
     // Start camera preview too if webcam is toggled on
     if (state.sources.camera && !state.cameraStream) {
@@ -3983,6 +4074,75 @@ async function selectScreen() {
     updateToggleUI();
     updateRecordButton();
   }
+}
+
+// REVIEW #23: while paused, let the user pick a different screen/window and
+// resume onto it, without the hunt for the next screen ever landing in the
+// recording. Deliberately separate from selectScreen() (which stays exactly
+// as it was, still gated to the pre-recording flow scenarios AH/EI pin) —
+// this reuses the same underlying pieces (captureScreen, the ended-listener
+// wiring, the fact that compositing reads screenVideo live every frame) but
+// with a SAFETY-CRITICAL reordering: the new capture must succeed BEFORE
+// anything about the old screen is touched, so a cancelled picker or a
+// failed capture leaves the paused recording exactly as it was — still
+// paused, still resumable, old screen still intact and still feeding.
+async function changeScreenPaused() {
+  if (!state.recording || !state.paused || !state.screenStream) return;
+  showError('');
+  const btn = document.getElementById('btnChangeScreen');
+  btn.disabled = true;
+  btn.textContent = 'Selecting...';
+
+  let newStream;
+  try {
+    newStream = await captureScreen();
+  } catch (err) {
+    console.error('Screen change failed:', err);
+    // A cancelled picker (NotAllowedError) is a routine "changed my mind" —
+    // no banner, matching the fact that nothing at all happened. Any other
+    // failure (e.g. a device error) gets a gentle note; either way this is a
+    // complete no-op — the old screen is still live and still recording.
+    if (err.name !== 'NotAllowedError') {
+      showError("Couldn't switch screens — your current recording is unaffected. " + err.message);
+    }
+    btn.disabled = false;
+    btn.textContent = 'Change screen';
+    return;
+  }
+
+  // New capture is live — safe to retire the old one now.
+  const oldStream = state.screenStream;
+  unwireScreenEndedListener();       // remove the OLD track's listener before we stop it (see its doc comment)
+  disconnectScreenAudioFromMix();    // drop the OLD screen's audio node(s) from the mix, if any
+  oldStream.getTracks().forEach((t) => t.stop());
+
+  state.screenStream = newStream;
+  screenVideo.srcObject = newStream;
+  await screenVideo.play();
+  wireScreenEndedListener(newStream);
+
+  // Audio-mix reconnection: only possible if this recording actually has a
+  // mix (see connectScreenAudioToMix's doc comment for the no-audio-at-start
+  // case). Nothing else about the recording — canvas, MediaRecorder, chunk
+  // writes — is touched; the draw clock kept painting through all of this.
+  const hadNoMixAtStart = !state.audioContext;
+  connectScreenAudioToMix(newStream.getAudioTracks());
+  if (hadNoMixAtStart && newStream.getAudioTracks().length > 0) {
+    showError("This recording started without audio, so sound from the new screen won't be included.");
+  }
+
+  btn.disabled = false;
+  btn.textContent = 'Change screen';
+  updateChangeScreenVisibility();
+}
+
+// Visible only while a screen-capturing recording is paused — hidden the
+// instant it resumes, stops, or was never a screen recording to begin with
+// (camera-only: state.screenStream is never set for the life of that
+// recording, same signal updateRecordButton already relies on).
+function updateChangeScreenVisibility() {
+  document.getElementById('btnChangeScreen').style.display =
+    (state.recording && state.paused && !!state.screenStream) ? '' : 'none';
 }
 
 function updateRecordButton() {
@@ -4406,6 +4566,10 @@ async function startRecording() {
     if (state.audioContext) {
       state.audioContext.close().catch(() => {});
       state.audioContext = null;
+      // REVIEW #23: the swap helpers' mix references die with the context —
+      // clearing them here keeps every teardown of the mix atomic.
+      state.audioMixDest = null;
+      state.screenAudioSourceNodes = [];
     }
     state.recording = false;
     state.paused = false;
@@ -4435,6 +4599,7 @@ function pauseResume() {
     document.getElementById('btnPause').textContent = 'Resume';
     updateStatus('paused', 'Paused');
   }
+  updateChangeScreenVisibility(); // REVIEW #23: shows/hides "Change screen" with the pause state
 }
 
 async function stopRecording() {
@@ -5098,6 +5263,10 @@ function cleanupStreams() {
   if (state.audioContext) {
     state.audioContext.close().catch(() => {});
     state.audioContext = null;
+    // REVIEW #23: the swap helpers' mix references die with the context —
+    // clearing them here keeps every teardown of the mix atomic.
+    state.audioMixDest = null;
+    state.screenAudioSourceNodes = [];
   }
   if (state.compositeStream) {
     state.compositeStream.getTracks().forEach(t => t.stop());
@@ -5125,6 +5294,9 @@ function resetUI() {
   document.getElementById('btnStopReview').textContent = 'Stop & review';
   document.getElementById('btnPause').style.display = 'none';
   document.getElementById('btnPause').textContent = 'Pause';
+  document.getElementById('btnChangeScreen').style.display = 'none';
+  document.getElementById('btnChangeScreen').disabled = false;
+  document.getElementById('btnChangeScreen').textContent = 'Change screen';
   document.getElementById('btnSelectScreen').style.display = '';
   document.getElementById('btnSelectScreen').disabled = false;
   document.getElementById('btnSelectScreen').textContent = 'Select Screen';

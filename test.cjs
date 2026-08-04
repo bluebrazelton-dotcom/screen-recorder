@@ -19,6 +19,12 @@ let addChunkCalls = 0;
 let downloadClicks = [];
 let getUserMediaCalls = []; // every getUserMedia(constraints) call, for permission-prompt assertions
 let mockDevices = [];       // controllable enumerateDevices() result for label-upgrade tests
+// REVIEW #23: audio-mix reconnection observability — createMediaStreamSource/
+// disconnect are otherwise invisible side effects, so the mock below records
+// every connect (as a {source, dest} pair, so a scenario can assert WHICH
+// destination a node landed on) and counts every disconnect call.
+let audioMixConnectCalls = [];
+let audioMixDisconnectCalls = 0;
 let localStorageStore = {}; // real in-memory backing for the localStorage mock below —
                              // a no-op stub can't verify the micEnumAnonymized flag's persistence
 
@@ -36,6 +42,27 @@ function makeStream(tracks) {
     getAudioTracks: () => tracks.filter(t => t.kind === 'audio'),
     addEventListener() {},
   };
+}
+// REVIEW #23: a video track mock with REAL 'ended' listener bookkeeping (add/
+// remove actually take effect, unlike most track mocks' addEventListener() {}
+// no-ops), for scenarios that need to prove a listener was genuinely removed
+// rather than just not-fired. stop() deliberately fires 'ended' itself —
+// modeling the worst case a browser could do on a script-initiated stop()
+// (not spec-required, but the guard needs something real to prove itself
+// against) — while _fireEnded() lets a scenario simulate a GENUINE
+// browser-initiated "stop sharing" independently of any stop() call.
+function makeEndedCapableTrack(kind, id) {
+  const handlers = {};
+  const track = {
+    kind, id,
+    getSettings: () => ({ width: 1280, height: 720 }),
+    addEventListener(type, fn) { (handlers[type] = handlers[type] || []).push(fn); },
+    removeEventListener(type, fn) { if (handlers[type]) handlers[type] = handlers[type].filter((h) => h !== fn); },
+    stop() { track._fireEnded(); },
+    _fireEnded() { (handlers.ended || []).slice().forEach((fn) => fn()); },
+    _handlerCount(type) { return (handlers[type] || []).length; },
+  };
+  return track;
 }
 function makeEl(id) {
   const cls = new Set();
@@ -135,7 +162,15 @@ class MediaStreamMock {
 }
 class AudioContextMock {
   createMediaStreamDestination() { return { stream: makeStream([]) }; }
-  createMediaStreamSource() { return { connect() {} }; }
+  createMediaStreamSource(stream) {
+    const node = {
+      _stream: stream,
+      _disconnected: false,
+      connect(dest) { audioMixConnectCalls.push({ source: node, dest }); },
+      disconnect() { audioMixDisconnectCalls++; node._disconnected = true; },
+    };
+    return node;
+  }
   close() { return Promise.resolve(); }
 }
 
@@ -174,7 +209,7 @@ const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
 const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!scriptMatch) { console.log('FATAL: no <script> block found in index.html'); process.exit(2); }
 let code = scriptMatch[1];
-code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT, openDB, captionEditorState, captionFileKey, captionAddCue, captionDeleteCue, captionUpdateCueTime, captionUpdateCueText, captionPreviewVTT, captionParseCaptionText, captionBuildImportMessage, captionApplyImport, captionExportFilename, captionExport, saveCaptionDraft, loadCaptionDraft, deleteCaptionDraft, captionContinueDraftUI, captionStartFreshUI, openCaptionEditor, closeCaptionEditor, handleCaptionVideoFile, renderCueList, updateActiveCueHighlight, onCaptionVideoTimeUpdate, captionCueRowEls, onCaptionVideoInputChange, onCaptionImportInputChange, onAddCaptionClick, reviewState, SEAM_GAP_MS, checkForRecovery, stopRecording, verifyRecorderStarted, checkWriteStall, stopWatchdogFire, claimFinalize, armStopWatchdog };';
+code += '\n;globalThis.__api = { state, pipState, createSession, addChunk, deleteSession, finalizeRecording, stitchAndSave, recoverRecording, startRecording, startCompositing, stopCompositing, startDrawClock, parseCaptionTimestamp, formatCaptionTimestamp, parseVTT, parseSRT, detectCaptionFormat, serializeVTT, serializeSRT, openDB, captionEditorState, captionFileKey, captionAddCue, captionDeleteCue, captionUpdateCueTime, captionUpdateCueText, captionPreviewVTT, captionParseCaptionText, captionBuildImportMessage, captionApplyImport, captionExportFilename, captionExport, saveCaptionDraft, loadCaptionDraft, deleteCaptionDraft, captionContinueDraftUI, captionStartFreshUI, openCaptionEditor, closeCaptionEditor, handleCaptionVideoFile, renderCueList, updateActiveCueHighlight, onCaptionVideoTimeUpdate, captionCueRowEls, onCaptionVideoInputChange, onCaptionImportInputChange, onAddCaptionClick, reviewState, SEAM_GAP_MS, checkForRecovery, stopRecording, verifyRecorderStarted, checkWriteStall, stopWatchdogFire, claimFinalize, armStopWatchdog, screenVideo, cameraVideo };';
 vm.createContext(sandbox);
 vm.runInContext(code, sandbox, { filename: 'app_new.js' });
 const api = sandbox.__api;
@@ -276,7 +311,7 @@ function pickerSequence(outcomes) {
 }
 async function resetState() {
   await resetDB();
-  Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, cameraStream: null, micStream: null, heldMicStream: null, heldMicDeviceId: null, audioContext: null, compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [], lastMicLabel: null, lastCameraLabel: null, stopMode: 'save' });
+  Object.assign(state, { sessionId: null, chunkIndex: 0, recording: false, paused: false, mediaRecorder: null, screenStream: null, screenEndedTrack: null, screenEndedHandler: null, cameraStream: null, micStream: null, heldMicStream: null, heldMicDeviceId: null, audioContext: null, audioMixDest: null, screenAudioSourceNodes: [], compositeStream: null, drawFrame: null, drawWorker: null, drawWorkerUrl: null, animFrameId: null, priorSegments: [], lastMicLabel: null, lastCameraLabel: null, stopMode: 'save' });
   windowMock._recoverySessions = null; windowMock._recoverySessionId = null; windowMock._recoveryMimeType = null;
   delete windowMock.showSaveFilePicker;   // absent = Firefox mode; FSA scenarios set their own picker
   sandbox.addChunk = ORIG.addChunk; sandbox.concatenateWebM = ORIG.concatenateWebM;
@@ -321,6 +356,11 @@ async function resetState() {
   documentMock.getElementById('btnRerecordAtTime').disabled = false;
   documentMock.getElementById('btnRedoLastTake').style.display = 'none';
   documentMock.getElementById('btnRedoLastTake').disabled = false;
+  // REVIEW #23: same leak-risk shape as the redo/typed-time controls above.
+  documentMock.getElementById('btnChangeScreen').style.display = 'none';
+  documentMock.getElementById('btnChangeScreen').disabled = false;
+  documentMock.getElementById('btnChangeScreen').textContent = 'Change screen';
+  audioMixConnectCalls = []; audioMixDisconnectCalls = 0;
   lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0; downloadClicks = [];
   writeCalls = []; abortCalls = 0; closedFiles = 0; failWriteAfter = -1;
   statusHistory = []; objectUrlBlobs = [];
@@ -5685,6 +5725,381 @@ Real cue text
     assert(Buffer.compare(got, want) === 0,
       'EP: real stitched save after a typed-time cut === stitchOracle([buf0, buf1.slice(0,cut)]) (' + got.length + ' vs ' + want.length + ' bytes)');
     assertNoOverlap(got, 'EP typed-time cut stitched output');
+  });
+
+  // ============================================================
+  // REVIEW #23 — pause -> change screens -> resume (EQ-EY)
+  // MediaRecorder records the compositor CANVAS's capture stream, not the
+  // screen stream, so swapping screenVideo.srcObject while paused is
+  // invisible to the recorder, chunk writes, and every save flow — these
+  // scenarios prove the swap machinery (changeScreenPaused,
+  // wireScreenEndedListener/unwireScreenEndedListener, the audio-mix
+  // reconnection helpers) without ever touching that pipeline.
+  // ============================================================
+
+  // EQ — "Change screen" affordance visibility state machine
+  await scenario('EQ "Change screen" affordance: hidden while actively recording, visible once paused (screen recordings only), hidden again on resume and on stop, never shown for camera-only recordings', async () => {
+    const btn = documentMock.getElementById('btnChangeScreen');
+
+    // ---- screen recording ----
+    state.sources = { screen: true, camera: false, mic: false };
+    state.screenStream = makeStream([{ kind: 'video', id: 'scr-1', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} }]);
+    await api.startRecording();
+    assert(btn.style.display === 'none', 'EQ: hidden while actively recording (not paused)');
+
+    sandbox.pauseResume();
+    assert(state.paused === true, 'EQ precondition: paused');
+    assert(btn.style.display === '', 'EQ: visible once paused with a live screen source');
+
+    sandbox.pauseResume();
+    assert(state.paused === false, 'EQ precondition: resumed');
+    assert(btn.style.display === 'none', 'EQ: hidden again after resume');
+
+    await sandbox.stopRecording();
+    await drain();
+    assert(btn.style.display === 'none', 'EQ: hidden after stop');
+
+    // ---- camera-only recording: never shown, even while paused ----
+    state.sources = { screen: false, camera: true, mic: false };
+    state.cameraStream = makeStream([{ kind: 'video', id: 'cam-1', stop() {} }]);
+    state.screenStream = null;
+    await api.startRecording();
+    assert(btn.style.display === 'none', 'EQ: hidden for a camera-only recording while actively recording');
+    sandbox.pauseResume();
+    assert(state.paused === true, 'EQ precondition: camera-only recording paused');
+    assert(btn.style.display === 'none', 'EQ: stays hidden for a camera-only recording even while paused');
+    await sandbox.stopRecording();
+    await drain();
+  });
+
+  // ER — successful swap while paused
+  await scenario('ER changeScreenPaused: successful swap while paused — new capture acquired FIRST, old track stopped only after, screenVideo reassigned, recording stays paused and resumable, recorder never touched', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    let oldStopped = 0;
+    const oldTrack = { kind: 'video', id: 'old-screen', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const oldStream = makeStream([oldTrack]);
+    state.screenStream = oldStream;
+    S.wireScreenEndedListener(oldStream);
+
+    await api.startRecording();
+    const rec = state.mediaRecorder;
+    const drawFrameBefore = state.drawFrame;
+    sandbox.pauseResume();
+    assert(state.paused === true, 'ER precondition: paused');
+
+    let stopRecordingCalls = 0;
+    const origStopRecording = S.stopRecording;
+    S.stopRecording = (...args) => { stopRecordingCalls++; return origStopRecording(...args); };
+
+    const order = [];
+    oldTrack.stop = () => { order.push('old-stopped'); };
+    const newTrack = { kind: 'video', id: 'new-screen', getSettings: () => ({ width: 1920, height: 1080 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const newStream = makeStream([newTrack]);
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => { order.push('acquired'); return newStream; };
+
+    await S.changeScreenPaused();
+
+    assert(order[0] === 'acquired' && order[1] === 'old-stopped', 'ER: new stream acquired BEFORE the old track was stopped (got ' + JSON.stringify(order) + ')');
+    assert(state.screenStream === newStream, 'ER: state.screenStream reassigned to the new stream');
+    assert(api.screenVideo.srcObject === newStream, 'ER: screenVideo.srcObject reassigned to the new stream');
+    assert(state.paused === true, 'ER: recording is still paused after the swap');
+    assert(state.recording === true, 'ER: state.recording untouched');
+    assert(rec._stopCalls === 0, 'ER: the MediaRecorder was never stopped during the swap');
+    assert(stopRecordingCalls === 0, 'ER: stopRecording() was never called during the swap');
+    assert(state.drawFrame === drawFrameBefore, 'ER: compositing was never stopped/restarted — the SAME draw fn is still driving the clock');
+
+    // Resume still works cleanly after the swap.
+    sandbox.pauseResume();
+    assert(state.paused === false, 'ER: resume works after a paused swap');
+    assert(rec.state === 'recording', 'ER: the SAME recorder resumed recording (got ' + rec.state + ')');
+
+    S.stopRecording = origStopRecording;
+    await sandbox.stopRecording();
+    await drain();
+  });
+
+  // ES — picker cancel is a complete, silent no-op
+  await scenario('ES changeScreenPaused: picker cancel (NotAllowedError) is a complete no-op — old stream/tracks untouched, still paused and resumable, no error banner', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    let oldStopped = 0;
+    const oldTrack = { kind: 'video', id: 'old-screen', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() { oldStopped++; } };
+    const oldStream = makeStream([oldTrack]);
+    state.screenStream = oldStream;
+    S.wireScreenEndedListener(oldStream);
+
+    await api.startRecording();
+    sandbox.pauseResume();
+    assert(state.paused === true, 'ES precondition: paused');
+
+    const cancelErr = new Error('cancelled'); cancelErr.name = 'NotAllowedError';
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => { throw cancelErr; };
+
+    await S.changeScreenPaused();
+
+    assert(oldStopped === 0, 'ES: old track was never stopped');
+    assert(state.screenStream === oldStream, 'ES: state.screenStream still the old stream');
+    assert(state.paused === true, 'ES: still paused');
+    assert(state.recording === true, 'ES: still recording');
+    assert(recordedErrors.every((m) => !m), 'ES: cancel never shows an error banner (got ' + JSON.stringify(recordedErrors) + ')');
+    assert(documentMock.getElementById('btnChangeScreen').textContent === 'Change screen', 'ES: button label resets');
+    assert(documentMock.getElementById('btnChangeScreen').disabled === false, 'ES: button re-enabled');
+
+    // Resumable afterward.
+    sandbox.pauseResume();
+    assert(state.paused === false, 'ES: still resumable after a cancelled swap');
+    await sandbox.stopRecording();
+    await drain();
+  });
+
+  // ET — capture failure (non-cancel) is a no-op except a gentle status note
+  await scenario('ET changeScreenPaused: a real capture failure (not a cancel) is a complete no-op except a gentle status message — old stream/tracks untouched, still paused and resumable', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    let oldStopped = 0;
+    const oldTrack = { kind: 'video', id: 'old-screen', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() { oldStopped++; } };
+    const oldStream = makeStream([oldTrack]);
+    state.screenStream = oldStream;
+    S.wireScreenEndedListener(oldStream);
+
+    await api.startRecording();
+    sandbox.pauseResume();
+
+    const failErr = new Error('device disappeared'); failErr.name = 'NotReadableError';
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => { throw failErr; };
+
+    await S.changeScreenPaused();
+
+    assert(oldStopped === 0, 'ET: old track was never stopped');
+    assert(state.screenStream === oldStream, 'ET: state.screenStream still the old stream');
+    assert(state.paused === true, 'ET: still paused');
+    assert(state.recording === true, 'ET: still recording');
+    assert(recordedErrors.some((m) => m && /couldn.?t switch screens/i.test(m)), 'ET: a gentle status message was shown (got ' + JSON.stringify(recordedErrors) + ')');
+    assert(!recordedErrors.some((m) => /\berror\b|failed|permanently|lost/i.test(m || '')), 'ET: the message stays gentle, not alarming (got ' + JSON.stringify(recordedErrors) + ')');
+
+    sandbox.pauseResume();
+    assert(state.paused === false, 'ET: still resumable after a failed swap');
+    await sandbox.stopRecording();
+    await drain();
+  });
+
+  // EU — ended-listener guard: deliberate stop doesn't trip it, a genuine
+  // ended event after a swap still works, repeated swaps don't accumulate
+  // listeners.
+  await scenario('EU ended-listener guard: a deliberate track.stop() during a swap does not trip stopRecording, a GENUINE ended event after a swap still works, and repeated swaps never accumulate listeners', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    const track1 = makeEndedCapableTrack('video', 'scr-1');
+    const stream1 = makeStream([track1]);
+    state.screenStream = stream1;
+    S.wireScreenEndedListener(stream1);
+
+    await api.startRecording();
+    sandbox.pauseResume();
+
+    let stopRecordingCalls = 0;
+    const origStopRecording = S.stopRecording;
+    S.stopRecording = (...args) => { stopRecordingCalls++; return origStopRecording(...args); };
+
+    // ---- swap #1: track1's deliberate stop() fires 'ended' synchronously
+    // (worst-case browser) but must NOT trip stopRecording — the listener
+    // was removed first. ----
+    const track2 = makeEndedCapableTrack('video', 'scr-2');
+    const stream2 = makeStream([track2]);
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => stream2;
+    await S.changeScreenPaused();
+    assert(stopRecordingCalls === 0, 'EU: the deliberate stop() during swap #1 did not trip stopRecording (got ' + stopRecordingCalls + ' calls)');
+    assert(track1._handlerCount('ended') === 0, "EU: track1's ended listener was actually removed (got " + track1._handlerCount('ended') + ')');
+    assert(track2._handlerCount('ended') === 1, 'EU: track2 has exactly one ended listener wired (got ' + track2._handlerCount('ended') + ')');
+
+    // ---- swap #2: repeat — prove no accumulation ----
+    const track3 = makeEndedCapableTrack('video', 'scr-3');
+    const stream3 = makeStream([track3]);
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => stream3;
+    await S.changeScreenPaused();
+    assert(stopRecordingCalls === 0, "EU: swap #2's deliberate stop() also did not trip stopRecording");
+    assert(track2._handlerCount('ended') === 0, "EU: track2's ended listener was removed on swap #2");
+    assert(track3._handlerCount('ended') === 1, 'EU: track3 has exactly one ended listener — no accumulation across repeated swaps');
+
+    // ---- a GENUINE ended event on the current (post-swap) track still
+    // works exactly as before: state.recording is true, so it stops the
+    // recording. ----
+    track3._fireEnded();
+    assert(stopRecordingCalls === 1, 'EU: a genuine ended event after a swap still calls stopRecording (got ' + stopRecordingCalls + ')');
+    S.stopRecording = origStopRecording;
+    // The spy forwards to the real stopRecording(), so that genuine ended
+    // event just kicked off a real (zero-chunk) finalize cascade — drain it
+    // now so its "No recording data found" / resetUI tail can't land in a
+    // LATER scenario's fresh recordedErrors array instead of this one's.
+    await drain();
+  });
+
+  // EV — audio-mix reconnection: with a mix present, old disconnected, new
+  // connected to the SAME destination; repeated swaps leak nothing.
+  await scenario('EV audio-mix reconnection: with an audio mix present, the old screen-audio source is disconnected and the new one connected into the SAME destination node; repeated swaps leak no nodes', async () => {
+    state.sources = { screen: true, camera: false, mic: true };
+    sandbox.navigator.mediaDevices.getUserMedia = async () => makeStream([{ kind: 'audio', id: 'mic-1', readyState: 'live', stop() {} }]);
+
+    const svTrack1 = { kind: 'video', id: 'scr-video-1', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const saTrack1 = { kind: 'audio', id: 'scr-audio-1', stop() {} };
+    const stream1 = makeStream([svTrack1, saTrack1]);
+    state.screenStream = stream1;
+    S.wireScreenEndedListener(stream1);
+
+    await api.startRecording();
+    assert(/,opus/.test(state.mediaRecorder.opts.mimeType), 'EV precondition: this recording has an audio mix (opus requested)');
+    const dest = state.audioMixDest;
+    assert(!!dest, 'EV precondition: state.audioMixDest is set');
+    assert(state.screenAudioSourceNodes.length === 1, 'EV precondition: the initial screen audio node is tracked (got ' + state.screenAudioSourceNodes.length + ')');
+    const initialConnectCount = audioMixConnectCalls.length; // mic + screen audio
+    assert(initialConnectCount === 2, 'EV precondition: mic + screen audio both connected at record start (got ' + initialConnectCount + ')');
+
+    sandbox.pauseResume();
+
+    // ---- swap #1: new screen also has audio ----
+    const svTrack2 = { kind: 'video', id: 'scr-video-2', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const saTrack2 = { kind: 'audio', id: 'scr-audio-2', stop() {} };
+    const stream2 = makeStream([svTrack2, saTrack2]);
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => stream2;
+    const oldNode1 = state.screenAudioSourceNodes[0];
+    await S.changeScreenPaused();
+
+    assert(oldNode1._disconnected === true, 'EV: the OLD screen audio node was disconnected');
+    assert(state.screenAudioSourceNodes.length === 1, 'EV: exactly one new screen audio node tracked after the swap (got ' + state.screenAudioSourceNodes.length + ')');
+    const newNode1 = state.screenAudioSourceNodes[0];
+    assert(newNode1 !== oldNode1, 'EV: the new node is a different node than the old one');
+    const lastConnect = audioMixConnectCalls[audioMixConnectCalls.length - 1];
+    assert(lastConnect.dest === dest, 'EV: the new screen audio was connected into the SAME destination node');
+    assert(audioMixDisconnectCalls === 1, 'EV: exactly one disconnect so far (got ' + audioMixDisconnectCalls + ')');
+    assert(audioMixConnectCalls.length === initialConnectCount + 1, 'EV: exactly one new connect so far (got ' + audioMixConnectCalls.length + ')');
+
+    // ---- swap #2: repeat — prove no leak/accumulation ----
+    const svTrack3 = { kind: 'video', id: 'scr-video-3', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const saTrack3 = { kind: 'audio', id: 'scr-audio-3', stop() {} };
+    const stream3 = makeStream([svTrack3, saTrack3]);
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => stream3;
+    await S.changeScreenPaused();
+
+    assert(newNode1._disconnected === true, "EV: swap #2 disconnected swap #1's node in turn");
+    assert(state.screenAudioSourceNodes.length === 1, 'EV: still exactly one tracked node after swap #2 (got ' + state.screenAudioSourceNodes.length + ')');
+    assert(audioMixDisconnectCalls === 2, 'EV: exactly two disconnects total across two swaps (got ' + audioMixDisconnectCalls + ')');
+    assert(audioMixConnectCalls.length === initialConnectCount + 2, 'EV: exactly two new connects total across two swaps — no leak (got ' + audioMixConnectCalls.length + ')');
+    assert(state.audioMixDest === dest, 'EV: still the SAME destination node after repeated swaps');
+
+    await sandbox.stopRecording();
+    await drain();
+  });
+
+  // EW — no audio at all at record start: a new screen's system audio
+  // cannot be picked up mid-recording. No throw, no connection attempt, and
+  // a gentle one-line note explains why.
+  await scenario("EW audio-mix reconnection: a recording that started with NO audio at all cannot pick up a new screen's system audio mid-recording — no connection attempted, no throw, and a gentle one-line note is shown", async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    const svTrack1 = { kind: 'video', id: 'scr-video-1', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const stream1 = makeStream([svTrack1]); // no audio track at all
+    state.screenStream = stream1;
+    S.wireScreenEndedListener(stream1);
+
+    await api.startRecording();
+    assert(!/opus/.test(state.mediaRecorder.opts.mimeType), 'EW precondition: no audio at all — no opus requested');
+    assert(state.audioContext === null, 'EW precondition: no audio mix was created');
+
+    sandbox.pauseResume();
+
+    const svTrack2 = { kind: 'video', id: 'scr-video-2', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const saTrack2 = { kind: 'audio', id: 'scr-audio-2', stop() {} };
+    const stream2 = makeStream([svTrack2, saTrack2]); // the NEW screen DOES have system audio
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => stream2;
+
+    let threw = null;
+    try { await S.changeScreenPaused(); } catch (e) { threw = e; }
+
+    assert(threw === null, 'EW: the swap does not throw (got ' + (threw && threw.message) + ')');
+    assert(state.screenStream === stream2, 'EW: the swap itself still succeeds — only the audio is left out');
+    assert(state.audioContext === null, "EW: still no audio mix — one can't be created mid-recording");
+    assert(audioMixConnectCalls.length === 0, 'EW: no connection was attempted (got ' + audioMixConnectCalls.length + ')');
+    assert(state.screenAudioSourceNodes.length === 0, 'EW: no source nodes tracked');
+    assert(recordedErrors.some((m) => m && /without audio/i.test(m)), "EW: a gentle one-line note explains the new screen's audio will not be recorded (got " + JSON.stringify(recordedErrors) + ')');
+
+    await sandbox.stopRecording();
+    await drain();
+  });
+
+  // EX — swapping FROM a screen with audio TO one without degrades silently
+  await scenario('EX audio-mix reconnection: swapping FROM a screen with audio TO one without degrades silently — old node disconnected, nothing new connected, the mix (e.g. mic) is otherwise untouched', async () => {
+    state.sources = { screen: true, camera: false, mic: true };
+    sandbox.navigator.mediaDevices.getUserMedia = async () => makeStream([{ kind: 'audio', id: 'mic-1', readyState: 'live', stop() {} }]);
+
+    const svTrack1 = { kind: 'video', id: 'scr-video-1', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const saTrack1 = { kind: 'audio', id: 'scr-audio-1', stop() {} };
+    const stream1 = makeStream([svTrack1, saTrack1]);
+    state.screenStream = stream1;
+    S.wireScreenEndedListener(stream1);
+
+    await api.startRecording();
+    const dest = state.audioMixDest;
+    assert(state.screenAudioSourceNodes.length === 1, 'EX precondition: initial screen audio node tracked');
+    const connectCountBefore = audioMixConnectCalls.length; // mic + screen
+
+    sandbox.pauseResume();
+
+    const svTrack2 = { kind: 'video', id: 'scr-video-2', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const stream2 = makeStream([svTrack2]); // NO audio on the new screen
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => stream2;
+    const oldNode = state.screenAudioSourceNodes[0];
+
+    await S.changeScreenPaused();
+
+    assert(oldNode._disconnected === true, 'EX: the old screen audio node was disconnected');
+    assert(state.screenAudioSourceNodes.length === 0, 'EX: no new screen audio node — the new screen has none');
+    assert(audioMixConnectCalls.length === connectCountBefore, 'EX: no new connect call was made (got ' + audioMixConnectCalls.length + ' vs ' + connectCountBefore + ')');
+    assert(audioMixDisconnectCalls === 1, 'EX: exactly one disconnect (got ' + audioMixDisconnectCalls + ')');
+    assert(state.audioMixDest === dest, 'EX: the mix itself (and whatever else feeds it, e.g. mic) is untouched');
+    assert(!recordedErrors.some((m) => /couldn.?t switch|without audio/i.test(m || '')), 'EX: this degrades silently — no note needed (mic keeps recording)');
+
+    sandbox.pauseResume();
+    await sandbox.stopRecording();
+    await drain();
+  });
+
+  // EY — differential: a paused-swap session's chunk/save behavior matches a
+  // no-swap session given identical chunk data. The swap machinery never
+  // touches state.mediaRecorder, chunk writes, or the save path — this
+  // proves it end to end rather than by code inspection alone.
+  await scenario("EY differential: a paused-swap session's chunk/save behavior is byte-identical to a no-swap session given identical chunk data — the swap machinery never touches the recording pipeline or the save flow", async () => {
+    const chunkBytes = ['a', 'bb', 'ccc'];
+
+    async function runSession(withSwap) {
+      state.sources = { screen: true, camera: false, mic: false };
+      const svTrackA = { kind: 'video', id: 'scr-video-a', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+      state.screenStream = makeStream([svTrackA]);
+      S.wireScreenEndedListener(state.screenStream);
+
+      await api.startRecording();
+      const rec = state.mediaRecorder;
+
+      if (withSwap) {
+        sandbox.pauseResume();
+        const svTrackB = { kind: 'video', id: 'scr-video-b', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+        sandbox.navigator.mediaDevices.getDisplayMedia = async () => makeStream([svTrackB]);
+        await S.changeScreenPaused();
+        sandbox.pauseResume();
+      }
+
+      for (const c of chunkBytes) rec.ondataavailable({ data: new Blob([c]) });
+      await drain();
+
+      windowMock.showSaveFilePicker = pickerSequence(['ok']);
+      await api.finalizeRecording();
+      await drain();
+      const bytes = Buffer.from(await lastWritten.pop().arrayBuffer());
+      lastWritten = []; // keep the two runs' captures from colliding
+      return bytes;
+    }
+
+    const noSwapBytes = await runSession(false);
+    const swapBytes = await runSession(true);
+
+    assert(noSwapBytes.length > 0, 'EY precondition: the no-swap run actually wrote bytes');
+    assert(Buffer.compare(noSwapBytes, swapBytes) === 0,
+      'EY: paused-swap session bytes === no-swap session bytes given identical chunk data (' + noSwapBytes.length + ' vs ' + swapBytes.length + ' bytes)');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

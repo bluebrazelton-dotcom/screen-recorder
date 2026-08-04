@@ -2023,6 +2023,79 @@ seam playback after a redone take, typed-time cut vs scrub parity,
 rejection messages, 0:00 confirm, bailed-scan disabled state. #25
 CLOSED.
 
+### v1.24 — Pause → change screens → resume (#23) (2026-08-04)
+
+**Commit:** `v1.24 (#23): paused screen swap — changeScreenPaused, audio-mix reconnection, ended-listener guard; scenarios EQ–EY`
+
+While paused, pick a different screen/window and resume onto it — the
+hunt for the next screen never lands in the recording. MediaRecorder
+records the compositor CANVAS's capture stream, not the screen stream,
+so swapping what feeds `screenVideo.srcObject` while paused is invisible
+to the recorder, chunk writes, and every save flow — shipped with zero
+changes to the recording pipeline or any streamed save path (all 156
+pre-existing scenarios pass unmodified; EY adds an end-to-end
+differential: a paused-swap session's saved bytes === a no-swap
+session's given identical chunk data).
+
+A new "Change screen" button sits between Pause and Stop & save, visible
+only while a screen-capturing recording is paused (hidden while actively
+recording, hidden again on resume/stop, never shown for camera-only —
+scenario EQ). `changeScreenPaused()` acquires the NEW capture first;
+only after it succeeds are the old track's 'ended' listener removed, any
+old screen-audio mix node disconnected, and the old tracks stopped. A
+cancelled picker is a fully SILENT no-op (deliberately quieter than
+selectScreen's pre-recording cancel banner — backing out of the picker
+mid-recording is routine); a real capture failure gets one gentle note.
+Either way the old screen stays live and the recording stays paused and
+resumable (ES/ET).
+
+`selectScreen()`'s inline 'ended' closure was extracted VERBATIM into
+`wireScreenEndedListener` / `unwireScreenEndedListener` so the listener
+is removable by exact (track, handler) reference. The deliberate
+`track.stop()` during a swap removes it first — scenario EU models a
+worst-case browser that fires 'ended' on a script-initiated stop and
+proves the swap can't trip `stopRecording()`; a GENUINE "Stop sharing"
+after a swap still stops the recording as before, and repeated swaps
+never accumulate listeners.
+
+Audio-mix reconnection (`connectScreenAudioToMix` /
+`disconnectScreenAudioFromMix` + bookkeeping-only additions to
+`createAudioMix` — its connect loop and order are unchanged, screen
+tracks matched by track id, which survives startRecording's stream
+re-wrapping): if and only if the recording started with an audio mix
+(v1.21.2 opus-presence rule), the new screen's system audio connects
+into the SAME live destination node and the old node disconnects;
+repeated swaps leak no nodes (EV). A recording that started with NO
+audio cannot gain a track mid-flight — the swap still succeeds, audio is
+skipped without a throw, and one gentle line explains why, shown only
+when the new screen actually has audio (EW). Screen-with-audio →
+screen-without degrades silently; the mix keeps the mic (EX).
+
+Orchestrator-review amendment folded in at ship: `state.audioMixDest`
+and `state.screenAudioSourceNodes` are now cleared at BOTH teardown
+sites where `state.audioContext` is nulled (start-failure path and
+cleanupStreams) — they were stale-but-unreachable before (every use
+guards on audioContext), now the mix teardown is atomic.
+
+Harness: **165 scenarios / 1197 assertions** (scenario prefixes end at
+EY). Harness-side: the AudioContext mock's source nodes now record
+connect/disconnect calls (was a bare no-op), `makeEndedCapableTrack`
+models real listener bookkeeping with worst-case stop()-fires-ended, and
+screenVideo/cameraVideo are exposed read-only via __api.
+
+**Known limitation (deliberate):** the compositor canvas stays sized to
+the FIRST screen's resolution for the life of the recording (compositing
+is never stopped/restarted during a swap — the draw clock keeps painting
+so nothing is encoded mid-switch); swapping to a very differently-sized
+source stretches it into the original dimensions. Resizing mid-recording
+has its own risks; revisit only if the owner hits it in practice.
+
+**Owner acceptance owed (real browsers, Firefox first)** — several items
+are real-browser-only: repeated-picker UX while paused, audible
+glitch/pop on audio-node swap, the canvas-stretch visual with two
+differently-sized sources, whether a live browser ever fires 'ended' on
+the deliberate stop, OS sharing-indicator behavior across the swap.
+
 ---
 
 ## Known limitations
