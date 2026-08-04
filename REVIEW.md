@@ -593,7 +593,7 @@ UI: show a "Change screen" affordance only while paused. Differential
 tests must show recorded bytes/save flows unchanged; new tests for the
 swap-while-paused state machine and audio-mix reconnection.
 
-### 25. Review-pane take controls: redo last take + typed timestamp (owner-requested 2026-08-03) — SHIPPED v1.23 (2026-08-04)
+### 25. Review-pane take controls: redo last take + typed timestamp (owner-requested 2026-08-03) — SHIPPED v1.23, CLOSED 2026-08-04
 
 From the owner's #21 F6 pass: after a cut + new take, re-doing that take
 requires manually scrubbing back to the seam. Two additions to the review
@@ -618,7 +618,8 @@ pinned byte-identical to `computeCutPlan`'s own last-segment branch
 (scenario EK). Scenarios EJ–EP, incl. two real-save differentials (EL,
 EP) proving the save flows untouched. Harness 156/1122. Note for the
 seam-formula invariant: `computeRedoLastTakePlan` is now a FOURTH
-lockstep site. Owner real-browser acceptance pending.
+lockstep site. Owner real-browser acceptance PASSED same day (all 8
+checklist items, both browsers) — CLOSED.
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature

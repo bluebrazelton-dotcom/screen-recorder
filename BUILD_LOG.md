@@ -2017,9 +2017,11 @@ behavior (EN), typed-vs-scrub byte-identical markers for the same T
 resetState gained DOM resets for the two new controls. No pre-existing
 scenario changed.
 
-**Owner acceptance owed (real browsers, Firefox first):** see the #25
-checklist — Redo visibility at 1 vs 2+ segments, redo + undo round
-trip, typed-time cut vs scrub parity, rejection messages, 0:00 confirm.
+**Owner acceptance PASSED (2026-08-04), both browsers, all 8 checklist
+items:** Redo visibility at 1 vs 2+ segments, redo + undo round trip,
+seam playback after a redone take, typed-time cut vs scrub parity,
+rejection messages, 0:00 confirm, bailed-scan disabled state. #25
+CLOSED.
 
 ---
 

@@ -1,7 +1,7 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-08-04 (post-v1.23). Supersedes the post-v1.22.2
-snapshot.
+Close-out snapshot, 2026-08-04 (post-v1.23, #25 CLOSED). Supersedes the
+post-v1.22.2 snapshot.
 
 ## Where things stand
 
@@ -22,33 +22,16 @@ snapshot.
 - **Harness: 156 scenarios / 1122 assertions** (`node test.cjs`; scenario
   prefixes end at EP). EL and EP are real-stitched-save differentials
   proving both new cut paths leave the save flows untouched.
-- **#25 owner acceptance is PENDING** — checklist below. Known nit,
-  deliberately deferred: Enter in the typed-time input doesn't submit
-  (click the button); fold in a keydown handler if the owner wants it.
+- **#25 CLOSED same day** — owner acceptance PASSED 2026-08-04, all 8
+  checklist items, both browsers. Known nit, deliberately deferred and
+  not raised by the owner: Enter in the typed-time input doesn't submit
+  (click the button); fold in a keydown handler if ever wanted.
 - Working pattern held again: Sonnet drafted in scratch and pre-verified
   by applying to scratch COPIES and running the real harness;
   orchestrator review verified the extraction was verbatim (diff
   hunk-by-hunk) and hand-checked the k===0 branch equivalence against
   the real computeCutPlan before presenting; owner approved before any
   repo write.
-
-## #25 owner-acceptance checklist (Firefox first, then Chrome)
-
-1. Record take 1 → Stop & review: NO "Redo last take" button (1 segment).
-2. Re-record from mid-take → record take 2 → Stop & review: "Redo last
-   take" visible. Click it → pane closes, status says "Kept m:ss …",
-   armed to continue from take 2's start.
-3. Undo re-record → both takes back in review, Undo button hides.
-4. Redo again, record take 2 again, verify the final saved file plays
-   clean through the seam.
-5. Typed time: enter a mid-take-1 time (e.g. 0:05) → same result as
-   scrubbing there and clicking Re-record from here.
-6. Typed garbage ("abc", "1:99", "12") → gentle inline message, nothing
-   else changes; pane stays open.
-7. Typed 0:00 → the discard-and-start-fresh confirm (same as scrubbing
-   to 0), not a rejection.
-8. Bailed-scan recording (if reproducible): both new controls disabled,
-   not hidden.
 
 ## Permanent design knowledge (carried forward)
 
@@ -124,10 +107,7 @@ snapshot.
 
 ## Queue
 
-- **#25 owner acceptance** (checklist above) — then close #25. Optional
-  same-session follow-up if wanted: Enter-to-submit in the typed-time
-  input.
-- **#23 pause → change screens → resume** — scoped in REVIEW #23 (canvas
+- **#23 (next): pause → change screens → resume** — scoped in REVIEW #23 (canvas
   compositor makes the video swap pipeline-free; audio-mix reconnection
   is the one new piece; affordance only while paused).
 - **#19 (docs/README) + #20 (final full regression)** at stabilization.
