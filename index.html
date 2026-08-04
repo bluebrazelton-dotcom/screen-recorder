@@ -595,6 +595,34 @@
     cursor: not-allowed;
   }
 
+  .review-time-jump {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .review-time-input {
+    width: 5rem;
+    padding: 0.3rem 0.4rem;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .btn-rerecord-at-time, .btn-redo-take {
+    background: var(--surface);
+    color: var(--green);
+    border: 1px solid var(--green-dim);
+  }
+  .btn-rerecord-at-time:hover, .btn-redo-take:hover { background: var(--surface-hover); }
+  .btn-rerecord-at-time:disabled, .btn-redo-take:disabled, .review-time-input:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
   .btn-save-as-is {
     background: var(--green);
     color: #111;
@@ -837,6 +865,11 @@
 
     <div class="caption-editor-toolbar">
       <button class="primary btn-rerecord-here" id="btnReRecordHere" onclick="reviewCutFromHere()">Re-record from 0:00</button>
+      <div class="review-time-jump">
+        <input type="text" class="review-time-input" id="reviewTimeInput" placeholder="m:ss" inputmode="numeric" aria-label="Re-record from this time">
+        <button class="primary btn-rerecord-at-time" id="btnRerecordAtTime" onclick="reviewCutFromTypedTime()">Re-record from this time</button>
+      </div>
+      <button class="primary btn-redo-take" id="btnRedoLastTake" onclick="redoLastTake()" style="display:none;">Redo last take</button>
       <button class="primary btn-save-as-is" onclick="reviewSaveAsIs()">Save as is</button>
       <button class="primary btn-stop" onclick="requestReviewDiscard()">Discard recording</button>
     </div>
@@ -3339,6 +3372,28 @@ function computeCutPlan(scans, T) {
   }
   return { kind: 'cut', segIndex: i, cutAtByte: cl[k].start, keptMs: offsets[i] + cl[k].timestamp,
            segOffsetMs: offsets[i], clusterIndex: k };
+}
+
+// REVIEW #25a — "Redo last take". The plan is the exact shape computeCutPlan's
+// own k===0 branch produces for a T at the very start of the last segment:
+// segIndex = the last segment, cutAtByte: 0 (whole-segment discard, v1.19
+// machinery), keptMs = the PREVIOUS segment's content end (same offsets
+// formula, LOCKSTEP with computeCutPlan/concatenateWebM/scanSegmentsForStitch
+// — see computeCutPlan's own doc comment). Skips computeCutPlan's cluster
+// search entirely: there's no T to search for, the target is unconditionally
+// "the last segment, in full", so this never needs a scrub position. Pure,
+// like computeCutPlan itself — returns null when there's nothing to redo
+// (fewer than 2 segments), the same case the caller's button-visibility
+// check (openReviewPane) already prevents from being reachable via a click.
+function computeRedoLastTakePlan(scans) {
+  if (!scans || scans.length < 2) return null;
+  const offsets = new Array(scans.length);
+  offsets[0] = 0;
+  for (let i = 1; i < scans.length; i++) {
+    offsets[i] = offsets[i - 1] + Math.max(scans[i - 1].lastClusterMaxBlockTime, scans[i - 1].maxClusterTs) + SEAM_GAP_MS;
+  }
+  const i = scans.length - 1;
+  return { kind: 'cut', segIndex: i, cutAtByte: 0, keptMs: offsets[i - 1] + scans[i - 1].lastClusterMaxBlockTime };
 }
 
 // Refine a Rule-A cluster-drop to a block boundary INSIDE the cluster
@@ -6006,6 +6061,7 @@ async function openReviewPane(segments) {
   setRecorderControlsVisible(false);
   document.getElementById('reviewPane').classList.add('visible');
   reviewSetStatus('');
+  document.getElementById('reviewTimeInput').value = ''; // fresh input every time the pane opens — never carries a stale typed time in
 
   // Filter out zero-chunk segments FIRST (matching stitchAndSave's existing
   // priorsWithData filter) — segments and scans must stay index-aligned, so
@@ -6030,6 +6086,12 @@ async function openReviewPane(segments) {
 
   reviewState.segments = withData;
   reviewState.totalBytes = totalBytes;
+  // "Redo last take" only makes sense with a prior take to fall back to —
+  // with exactly 1 segment, discarding the whole thing is Back to recorder
+  // or Start over, not a "redo". Set once here (a successful cut always
+  // closes the pane rather than looping back for another one, so this never
+  // needs to be revisited mid-pane).
+  document.getElementById('btnRedoLastTake').style.display = withData.length >= 2 ? '' : 'none';
   if (totalBytes > REVIEW_PREVIEW_SIZE_WARNING_BYTES) {
     reviewSetStatus('This is a long recording — preparing it for review may take a moment.');
   }
@@ -6051,6 +6113,9 @@ async function openReviewPane(segments) {
     reviewSetStatus(''); // preview is ready — clear any lingering size-guard message
   }
   document.getElementById('btnReRecordHere').disabled = !reviewState.scansOk;
+  document.getElementById('btnRerecordAtTime').disabled = !reviewState.scansOk;
+  document.getElementById('reviewTimeInput').disabled = !reviewState.scansOk;
+  document.getElementById('btnRedoLastTake').disabled = !reviewState.scansOk;
   if (!reviewState.scansOk) {
     reviewSetStatus(blob
       ? "Re-record from here isn't available for this recording — you can still watch it, save it as is, or go back."
@@ -6153,83 +6218,187 @@ async function reviewCutFromHere() {
       return;
     }
 
-    const segments = reviewState.segments;
-    const discardedIds = [];
-    let keptSegments, cutSessionId = null, hadPrevMarker = false, prevCutAtByte = null, prevCutAtMs = null;
-    // Rule A's own byte/time — overwritten below only if refinement succeeds.
-    let cutAtByte = plan.cutAtByte, keptMs = plan.keptMs;
+    await applyReviewCutPlan(plan, T);
+  } catch (err) {
+    console.error('Re-record cut failed:', err);
+    reviewSetStatus("Couldn't set the re-record point. Your recording is safe — keep reviewing, or use Save as is.");
+  }
+}
 
-    if (plan.cutAtByte > 0) {
-      const cutSeg = segments[plan.segIndex];
-      cutSessionId = cutSeg.sessionId;
+// Applies a computeCutPlan()-shaped 'cut' plan (the 'noop'/'startOver' kinds
+// are handled by each caller before this runs, since the message shown for
+// each differs slightly by entry point) through the exact bookkeeping v1.19/
+// #22 shipped: block-precision refinement on the cutAtByte>0 branch,
+// discard-whole on the cutAtByte===0 branch, the undo record, closing the
+// pane, and the "Kept <duration>" status. Shared by reviewCutFromHere
+// (scrub position), redoLastTake (#25a — always cutAtByte===0, its plan
+// built directly by computeRedoLastTakePlan rather than through
+// computeCutPlan's cluster search), and reviewCutFromTypedTime (#25b — same
+// computeCutPlan path as scrubbing, just sourced from a typed input). `T` is
+// only read on the cutAtByte>0 branch (refineCutToBlock's target time);
+// callers whose plan is always cutAtByte===0 don't need a real one.
+async function applyReviewCutPlan(plan, T) {
+  const segments = reviewState.segments;
+  const discardedIds = [];
+  let keptSegments, cutSessionId = null, hadPrevMarker = false, prevCutAtByte = null, prevCutAtMs = null;
+  // Rule A's own byte/time — overwritten below only if refinement succeeds.
+  let cutAtByte = plan.cutAtByte, keptMs = plan.keptMs;
 
-      // Block-precision refinement (REVIEW #22 session 2): Rule A always
-      // drops the WHOLE dropped cluster; try to cut inside it instead, at
-      // the nearest real block boundary. reviewState.scans is populated
-      // exclusively by assembleReviewPreview's default-mode
-      // createWebmStreamScanner() pass over EVERY segment (never clustersOnly
-      // — that shape is only ever used for stitch segments 2..N inside
-      // scanSegmentsForStitch, a different scan reviewState.scans never
-      // holds), so cluster.start is always present here; the undefined check
-      // is a defensive skip for a shape this code doesn't expect to see, not
-      // a reachable path today. The whole attempt is an enhancement over an
-      // already-shippable plan: ANY failure (missing/odd-shaped cluster, a
-      // readSessionByteRange hiccup, refineCutToBlock declining the cluster)
-      // falls back to the Rule A byte/time silently — a DB hiccup here must
-      // never turn a workable Rule A cut into a surfaced error.
-      try {
-        const cluster = reviewState.scans[plan.segIndex] && reviewState.scans[plan.segIndex].clusters[plan.clusterIndex];
-        if (cluster && cluster.start !== undefined) {
-          const clusterBytes = await readSessionByteRange(cutSessionId, cluster.start, cluster.end);
-          const refined = refineCutToBlock(clusterBytes, cluster.timestamp, T - plan.segOffsetMs);
-          if (refined) {
-            cutAtByte = cluster.start + refined.relCutOffset;
-            keptMs = plan.segOffsetMs + refined.keptEndMs;
-          }
+  if (plan.cutAtByte > 0) {
+    const cutSeg = segments[plan.segIndex];
+    cutSessionId = cutSeg.sessionId;
+
+    // Block-precision refinement (REVIEW #22 session 2): Rule A always
+    // drops the WHOLE dropped cluster; try to cut inside it instead, at
+    // the nearest real block boundary. reviewState.scans is populated
+    // exclusively by assembleReviewPreview's default-mode
+    // createWebmStreamScanner() pass over EVERY segment (never clustersOnly
+    // — that shape is only ever used for stitch segments 2..N inside
+    // scanSegmentsForStitch, a different scan reviewState.scans never
+    // holds), so cluster.start is always present here; the undefined check
+    // is a defensive skip for a shape this code doesn't expect to see, not
+    // a reachable path today. The whole attempt is an enhancement over an
+    // already-shippable plan: ANY failure (missing/odd-shaped cluster, a
+    // readSessionByteRange hiccup, refineCutToBlock declining the cluster)
+    // falls back to the Rule A byte/time silently — a DB hiccup here must
+    // never turn a workable Rule A cut into a surfaced error.
+    try {
+      const cluster = reviewState.scans[plan.segIndex] && reviewState.scans[plan.segIndex].clusters[plan.clusterIndex];
+      if (cluster && cluster.start !== undefined) {
+        const clusterBytes = await readSessionByteRange(cutSessionId, cluster.start, cluster.end);
+        const refined = refineCutToBlock(clusterBytes, cluster.timestamp, T - plan.segOffsetMs);
+        if (refined) {
+          cutAtByte = cluster.start + refined.relCutOffset;
+          keptMs = plan.segOffsetMs + refined.keptEndMs;
         }
-      } catch (err) {
-        console.error('Block-precision refinement failed, using the whole-cluster cut instead:', err);
       }
-
-      // Read BEFORE overwriting — undo of a re-cut must restore this exact
-      // previous marker, not just clear it.
-      const prev = await getSessionRecord(cutSessionId);
-      hadPrevMarker = !!prev && typeof prev.cutAtByte === 'number' && isFinite(prev.cutAtByte);
-      if (hadPrevMarker) { prevCutAtByte = prev.cutAtByte; prevCutAtMs = prev.cutAtMs; }
-      await setSessionCut(cutSessionId, cutAtByte, keptMs);
-      for (let i = plan.segIndex + 1; i < segments.length; i++) {
-        await setSessionDiscarded(segments[i].sessionId, true);
-        discardedIds.push(segments[i].sessionId);
-      }
-      keptSegments = segments.slice(0, plan.segIndex + 1);
-    } else {
-      // cutAtByte === 0: segments[segIndex..] discarded whole, segIndex
-      // included; never becomes a stored cutAtByte marker (session 1's design
-      // note) — if segIndex itself already carried an earlier marker, it's
-      // left alone, harmless since the whole session is being discarded.
-      for (let i = plan.segIndex; i < segments.length; i++) {
-        await setSessionDiscarded(segments[i].sessionId, true);
-        discardedIds.push(segments[i].sessionId);
-      }
-      keptSegments = segments.slice(0, plan.segIndex);
+    } catch (err) {
+      console.error('Block-precision refinement failed, using the whole-cluster cut instead:', err);
     }
 
-    reviewState.undo = {
-      cutSessionId, hadPrevMarker, prevCutAtByte, prevCutAtMs,
-      discardedSessionIds: discardedIds,
-      // NOT state.priorSegments.slice() — that value is stale for the whole
-      // life of the pane (openReviewPane never writes it back; see
-      // finalizeRecording's [...state.priorSegments, current] construction).
-      // Undo has to arm the FULL pane chain, exactly what reviewBackToRecorder
-      // would set — segments is reviewState.segments itself here, so this is
-      // reviewState.segments.slice() by another name.
-      restoreSegments: segments.slice(),
-    };
-    state.priorSegments = keptSegments;
-    closeReviewPane();
-    resetUI();
-    updateStatus('idle', `Kept ${formatMinSec(keptMs || 0)}. Select a screen and click Record to continue from there.`);
-    document.getElementById('btnUndoReRecord').style.display = '';
+    // Read BEFORE overwriting — undo of a re-cut must restore this exact
+    // previous marker, not just clear it.
+    const prev = await getSessionRecord(cutSessionId);
+    hadPrevMarker = !!prev && typeof prev.cutAtByte === 'number' && isFinite(prev.cutAtByte);
+    if (hadPrevMarker) { prevCutAtByte = prev.cutAtByte; prevCutAtMs = prev.cutAtMs; }
+    await setSessionCut(cutSessionId, cutAtByte, keptMs);
+    for (let i = plan.segIndex + 1; i < segments.length; i++) {
+      await setSessionDiscarded(segments[i].sessionId, true);
+      discardedIds.push(segments[i].sessionId);
+    }
+    keptSegments = segments.slice(0, plan.segIndex + 1);
+  } else {
+    // cutAtByte === 0: segments[segIndex..] discarded whole, segIndex
+    // included; never becomes a stored cutAtByte marker (session 1's design
+    // note) — if segIndex itself already carried an earlier marker, it's
+    // left alone, harmless since the whole session is being discarded.
+    for (let i = plan.segIndex; i < segments.length; i++) {
+      await setSessionDiscarded(segments[i].sessionId, true);
+      discardedIds.push(segments[i].sessionId);
+    }
+    keptSegments = segments.slice(0, plan.segIndex);
+  }
+
+  reviewState.undo = {
+    cutSessionId, hadPrevMarker, prevCutAtByte, prevCutAtMs,
+    discardedSessionIds: discardedIds,
+    // NOT state.priorSegments.slice() — that value is stale for the whole
+    // life of the pane (openReviewPane never writes it back; see
+    // finalizeRecording's [...state.priorSegments, current] construction).
+    // Undo has to arm the FULL pane chain, exactly what reviewBackToRecorder
+    // would set — segments is reviewState.segments itself here, so this is
+    // reviewState.segments.slice() by another name.
+    restoreSegments: segments.slice(),
+  };
+  state.priorSegments = keptSegments;
+  closeReviewPane();
+  resetUI();
+  updateStatus('idle', `Kept ${formatMinSec(keptMs || 0)}. Select a screen and click Record to continue from there.`);
+  document.getElementById('btnUndoReRecord').style.display = '';
+}
+
+// "Redo last take" (#25a): discards the newest segment WHOLE and re-arms
+// continue-recording at its start — one click, the existing whole-segment
+// cut machinery (cutAtByte === 0, v1.19) applied directly at segIndex = the
+// last segment (see computeRedoLastTakePlan). Precision is exact — a
+// segment boundary, not a byte inside a cluster — so there's no
+// refineCutToBlock step here; applyReviewCutPlan's cutAtByte===0 branch
+// never refines regardless of caller (no clusterIndex/segOffsetMs on that
+// kind of plan — see computeCutPlan's own doc comment). Gated on scansOk
+// like reviewCutFromHere (redoing needs reviewState.scans for the offsets
+// math); the button itself is only shown with 2+ segments (openReviewPane),
+// so the defensive null-plan return below shouldn't be reachable from a
+// click, only from a direct call (e.g. a test).
+async function redoLastTake() {
+  if (!reviewState.scansOk) {
+    reviewSetStatus("Redo last take isn't available for this recording — you can still watch it, save it as is, or go back.");
+    return;
+  }
+  try {
+    const plan = computeRedoLastTakePlan(reviewState.scans);
+    if (!plan) return;
+    await applyReviewCutPlan(plan, 0);
+  } catch (err) {
+    console.error('Redo last take failed:', err);
+    reviewSetStatus("Couldn't redo the last take. Your recording is safe — keep reviewing, or use Save as is.");
+  }
+}
+
+// Parse a typed "m:ss" / "mm:ss" / "h:mm:ss" jump time (#25b) into
+// milliseconds, or null if it doesn't parse or a component is out of range
+// (seconds, and minutes-within-an-hour, must be 00-59). Deliberately its own
+// small grammar rather than parseCaptionTimestamp's — that one REQUIRES a
+// fractional-seconds group (built for caption-file round-tripping, see
+// formatMinSec's own comment above) and a viewer typing a jump time has no
+// reason to type milliseconds. Minutes (in m:ss) and hours (in h:mm:ss) are
+// unbounded — "125:00" is a legitimate 2h05m mark in a long recording.
+function parseReviewTimestamp(str) {
+  if (typeof str !== 'string') return null;
+  const trimmed = str.trim();
+  const hms = /^(\d+):([0-5]?\d):([0-5]?\d)$/.exec(trimmed);
+  if (hms) {
+    const h = parseInt(hms[1], 10), m = parseInt(hms[2], 10), s = parseInt(hms[3], 10);
+    return (h * 3600 + m * 60 + s) * 1000;
+  }
+  const ms = /^(\d+):([0-5]?\d)$/.exec(trimmed);
+  if (ms) {
+    const m = parseInt(ms[1], 10), s = parseInt(ms[2], 10);
+    return (m * 60 + s) * 1000;
+  }
+  return null;
+}
+
+// Typed-timestamp "Re-record from here" (#25b): validates the input, then
+// feeds the SAME computeCutPlan() path scrubbing uses (reviewCutFromHere) —
+// since #22, that path already refines to block precision on its own, so
+// the cut lands within about a second of the typed time, same as it would
+// from a scrub to that position. An unparseable or out-of-range string is
+// rejected with a gentle inline message and nothing else changes: no plan
+// is computed, no marker is touched.
+async function reviewCutFromTypedTime() {
+  if (!reviewState.scansOk) {
+    reviewSetStatus("Re-record from here isn't available for this recording — you can still watch it, save it as is, or go back.");
+    return;
+  }
+  const input = document.getElementById('reviewTimeInput');
+  const T = parseReviewTimestamp(input.value);
+  if (T === null) {
+    reviewSetStatus("That doesn't look like a time — try m:ss (like 1:30), or h:mm:ss for a longer recording.");
+    return;
+  }
+  try {
+    const plan = computeCutPlan(reviewState.scans, T);
+
+    if (plan.kind === 'noop') {
+      reviewSetStatus("That's already the end of the recording — there's nothing after it to remove.");
+      return;
+    }
+    if (plan.kind === 'startOver') {
+      showReviewDiscardConfirm('Re-recording from the very beginning means discarding this recording. Discard it and start fresh?');
+      return;
+    }
+
+    await applyReviewCutPlan(plan, T);
   } catch (err) {
     console.error('Re-record cut failed:', err);
     reviewSetStatus("Couldn't set the re-record point. Your recording is safe — keep reviewing, or use Save as is.");

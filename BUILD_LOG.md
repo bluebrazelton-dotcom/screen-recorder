@@ -1964,6 +1964,63 @@ Harness: **149 scenarios / 1053 assertions**.
 (webcam off), camera-only entrance intact (webcam on), and a stable
 control row through the full cut → record → stop cycle.
 
+### v1.23 — Review-pane take controls (#25): "Redo last take" + typed timestamp (2026-08-04)
+
+**Commit:** `v1.23 (#25): review-pane take controls — "Redo last take" + typed m:ss re-record time; applyReviewCutPlan extraction; scenarios EJ–EP`
+
+Both parts of REVIEW #25 in one session, built on one shared refactor:
+`reviewCutFromHere`'s cut-application body (block-precision refinement,
+undo bookkeeping, discard/marker writes, pane close, "Kept …" status)
+moved VERBATIM into `applyReviewCutPlan(plan, T)` — zero logic changes,
+proven by every pre-existing DO/EE/EF/EG/EH scenario passing unmodified.
+The 'noop'/'startOver' plan kinds stay with each caller (their messages
+differ slightly by entry point).
+
+1. **"Redo last take" (#25a).** One click in the review pane discards
+   the newest segment whole and re-arms continue-recording at its
+   start. `computeRedoLastTakePlan(scans)` builds the plan — the exact
+   shape `computeCutPlan`'s own `k===0` branch returns for a T at the
+   start of the last segment (same fields, same order, same
+   `lastClusterMaxBlockTime`-only keptMs formula; scenario EK pins the
+   equivalence with a JSON-equality oracle) — and `redoLastTake()`
+   applies it through `applyReviewCutPlan`. Precision is exact (a
+   segment boundary — `cutAtByte === 0`, the v1.19 whole-segment
+   machinery; refinement never runs on that branch). Button shows only
+   with 2+ segments (one segment's "redo" is Back to recorder / Start
+   over, not a redo); disabled — not hidden — under the same `scansOk`
+   gate as "Re-record from here". Undo is unchanged: same undo record,
+   same full-pane-chain restore.
+   **NOTE:** `computeRedoLastTakePlan` is a FOURTH lockstep copy of the
+   seam-offset formula (`Math.max(lastClusterMaxBlockTime, maxClusterTs)
+   + SEAM_GAP_MS`), joining concatenateWebM / scanSegmentsForStitch /
+   computeCutPlan — deliberate, matching the documented precedent; any
+   future seam-formula change now has four sites.
+2. **Typed `m:ss` re-record time (#25b).** A validated text input
+   beside "Re-record from here": `parseReviewTimestamp` accepts
+   m:ss / mm:ss / h:mm:ss (unbounded minutes/hours, 0–59 seconds and
+   in-hour minutes; deliberately NOT the caption grammar, which
+   requires fractional seconds), rejects anything else with a gentle
+   inline message and touches nothing. A valid time feeds the SAME
+   `computeCutPlan()` call scrubbing uses — #22's block refinement
+   applies automatically, so the cut lands within ~a second of the
+   typed time and no granularity caveat appears in the copy. 0:00 is a
+   real time (hits the startOver confirm, same as scrubbing to 0).
+   Known nit, deliberately deferred: Enter in the input doesn't submit —
+   click the button.
+
+Harness: **156 scenarios / 1122 assertions** (was 149/1053). EJ–EP:
+button visibility/gating (EJ), plan-vs-oracle byte-identity + apply +
+exact undo (EK), real-stitched-save differential after a redo (EL), the
+parser's validation matrix (EM), typed-path rejection/boundary/gate
+behavior (EN), typed-vs-scrub byte-identical markers for the same T
+(EO), and a second real-save differential through the typed path (EP).
+resetState gained DOM resets for the two new controls. No pre-existing
+scenario changed.
+
+**Owner acceptance owed (real browsers, Firefox first):** see the #25
+checklist — Redo visibility at 1 vs 2+ segments, redo + undo round
+trip, typed-time cut vs scrub parity, rejection messages, 0:00 confirm.
+
 ---
 
 ## Known limitations

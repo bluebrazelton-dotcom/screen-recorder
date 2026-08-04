@@ -1,53 +1,74 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-08-03 (post-v1.22.2). Supersedes the post-v1.21.2
+Close-out snapshot, 2026-08-04 (post-v1.23). Supersedes the post-v1.22.2
 snapshot.
 
 ## Where things stand
 
-- **Two issues CLOSED today, four releases shipped and pushed** (origin/main
-  current): v1.21.3 (Screen toggle lit state tracks the live capture +
-  cancelled re-selection resync), v1.22 (#22 session 1: refineCutToBlock /
-  readSessionByteRange / computeCutPlan segOffsetMs+clusterIndex + DZ–ED
-  differentials), v1.22.1 (#22 session 2: reviewCutFromHere wire-in +
-  EE–EH + the DO keep-whole re-pin), v1.22.2 (dark-Screen-click-opens-
-  picker + Undo's own flex row).
-- **#21 CLOSED**: the owner's full consolidated pass (Part R + F1–F15
-  Firefox + C1–C13 Chrome) PASSED on v1.21.2. Chrome's "no all-set banner"
-  is designed behavior (FSA write is confirmed programmatically; the
-  confirm bar is Firefox's unverifiable-download path only).
-- **#22 CLOSED**: block-precision cut shipped in two sessions and
-  owner-accepted (B1–B6, both browsers) — cut lands within a second of the
-  scrubbed time (was ~7.5s Firefox / ~1s Chrome). v1.22.2's two follow-up
-  findings also owner-verified same day.
-- **Harness: 149 scenarios / 1053 assertions** (`node test.cjs`; scenario
-  prefixes end at EI).
-- Working pattern that held all day: Sonnet drafts in scratch (and
-  pre-verifies by applying to scratch COPIES and running the real harness —
-  keep requiring that, it caught nothing wrong but proves the anchors),
-  orchestrator reviews (caught 1 real defect per session: the keptEndMs
-  floor in s1; the camera-only-unreachable regression in v1.22.2 was
-  caught by scenario AH at apply time), owner approves before any repo
-  write, owner accepts in a real browser after.
+- **v1.23 SHIPPED (#25, both parts, one session): review-pane take
+  controls.** (a) "Redo last take" — one click discards the newest
+  segment whole and re-arms continue-recording at its start; visible only
+  with 2+ segments, disabled (not hidden) under the scansOk gate. (b) A
+  typed m:ss / mm:ss / h:mm:ss field beside "Re-record from here" feeding
+  the SAME computeCutPlan path as scrubbing — #22's block precision
+  inherited automatically, no granularity caveat in the copy.
+- **Delivery shape:** one verbatim extraction — reviewCutFromHere's
+  cut-application body became the shared `applyReviewCutPlan(plan, T)`
+  (zero logic changes; DO/EE/EF/EG/EH pass unmodified) — plus pure
+  `computeRedoLastTakePlan` (scenario EK pins it byte-identical to
+  computeCutPlan's own last-segment k===0 branch) and pure
+  `parseReviewTimestamp` (NOT the caption grammar — that one requires
+  fractional seconds).
+- **Harness: 156 scenarios / 1122 assertions** (`node test.cjs`; scenario
+  prefixes end at EP). EL and EP are real-stitched-save differentials
+  proving both new cut paths leave the save flows untouched.
+- **#25 owner acceptance is PENDING** — checklist below. Known nit,
+  deliberately deferred: Enter in the typed-time input doesn't submit
+  (click the button); fold in a keydown handler if the owner wants it.
+- Working pattern held again: Sonnet drafted in scratch and pre-verified
+  by applying to scratch COPIES and running the real harness;
+  orchestrator review verified the extraction was verbatim (diff
+  hunk-by-hunk) and hand-checked the k===0 branch equivalence against
+  the real computeCutPlan before presenting; owner approved before any
+  repo write.
 
-## Permanent design knowledge (new ● + carried forward)
+## #25 owner-acceptance checklist (Firefox first, then Chrome)
 
+1. Record take 1 → Stop & review: NO "Redo last take" button (1 segment).
+2. Re-record from mid-take → record take 2 → Stop & review: "Redo last
+   take" visible. Click it → pane closes, status says "Kept m:ss …",
+   armed to continue from take 2's start.
+3. Undo re-record → both takes back in review, Undo button hides.
+4. Redo again, record take 2 again, verify the final saved file plays
+   clean through the seam.
+5. Typed time: enter a mid-take-1 time (e.g. 0:05) → same result as
+   scrubbing there and clicking Re-record from here.
+6. Typed garbage ("abc", "1:99", "12") → gentle inline message, nothing
+   else changes; pane stays open.
+7. Typed 0:00 → the discard-and-start-fresh confirm (same as scrubbing
+   to 0), not a rejection.
+8. Bailed-scan recording (if reproducible): both new controls disabled,
+   not hidden.
+
+## Permanent design knowledge (carried forward)
+
+- ● **The seam-offset formula now has FOUR lockstep sites**:
+  concatenateWebM / scanSegmentsForStitch / computeCutPlan /
+  computeRedoLastTakePlan — `Math.max(lastClusterMaxBlockTime,
+  maxClusterTs) + SEAM_GAP_MS` (33ms). Any seam change touches all four;
+  DS assertNoOverlap enforces, EK's JSON-equality oracle pins the fourth
+  against the third.
 - ● **Both browsers' MediaRecorders write UNKNOWN-SIZE clusters** (Chrome
   1-byte 0xFF, Firefox 8-byte all-ones — scenarios N/O/AL). This is why
-  #22 needed zero byte-surgery: a block-boundary truncation just ends at
-  EOF/next cluster, the same shape every crash tail already has.
-  refineCutToBlock REFUSES known-size clusters (scenario-AX asymmetry) and
-  falls back to Rule A.
+  #22 needed zero byte-surgery. refineCutToBlock REFUSES known-size
+  clusters (scenario-AX asymmetry) and falls back to Rule A.
 - ● **The keep-whole promotion is intended behavior**: T in the gap after
-  a cluster's last block keeps that whole cluster (cut byte = cluster end)
-  instead of Rule A's whole-cluster drop. DO was re-pinned for it via the
-  expectedBlockCut oracle; its undo/data-loss assertions are unmodified.
+  a cluster's last block keeps that whole cluster (cut byte = cluster
+  end). DO's expectedBlockCut oracle pins it.
 - ● **The dark Screen button has FOUR click meanings** (scenario EI):
-  webcam off + no stream → opens the picker; webcam on + no stream →
-  camera-only entrance (v1.12 — hijacking this makes camera-only
-  UNREACHABLE since Record is disabled in screen mode without a stream);
-  lit → toggle-off; intent-off → re-enable intent. Touch toggleSource only
-  with AH/EI in view.
+  webcam off + no stream → picker; webcam on + no stream → camera-only
+  entrance (v1.12); lit → toggle-off; intent-off → re-enable intent.
+  Touch toggleSource only with AH/EI in view.
 - ● FF153: audio codec in mimeType + no audio track = silent zero-chunk
   recorder (v1.21.2 fix: opus only when audio present; scenario DX). FF
   has no vp9. FF first blob can be ~7.5s late (start-verify grace). FF
@@ -55,64 +76,65 @@ snapshot.
 - file://-Chrome can't list device names; owner's Chrome has
   showSaveFilePicker on file://; Bluetooth hands-free masquerades as
   interference.
-- Watch for **Firefox 154** (~1–2 weeks): may fix the upstream opus bug;
+- Watch for **Firefox 154** (~1 week): may fix the upstream opus bug;
   v1.21.2's fix and the watchdogs stay regardless.
 
 ## Load-bearing invariants (do not break)
 
-- Seam offsets = previous segment's CONTENT END:
-  `Math.max(lastClusterMaxBlockTime, maxClusterTs) + SEAM_GAP_MS` (33ms),
-  in LOCKSTEP in concatenateWebM / scanSegmentsForStitch / computeCutPlan;
-  DS assertNoOverlap enforces. refineCutToBlock's keptEndMs FLOORS at the
-  cluster timestamp for the same lockstep (DZ pins it) — don't remove the
-  Math.max(0, …).
-- Refinement in reviewCutFromHere is an ENHANCEMENT: its own try/catch
-  falls back to Rule A's byte/time on any failure (EF pins it); seam-gap/
-  noop plans never attempt the ranged read (EH pins it). Never let a
-  refinement error surface to the user.
+- Seam offsets = previous segment's CONTENT END, four lockstep sites (see
+  above). refineCutToBlock's keptEndMs FLOORS at the cluster timestamp
+  (DZ pins it) — don't remove the Math.max(0, …).
+- `applyReviewCutPlan` is the ONE cut-application path (undo record,
+  refinement, discards, pane close, status). Its 'noop'/'startOver'
+  handling stays with each CALLER (messages differ by entry point). Its
+  `T` is read only on the cutAtByte>0 branch — redoLastTake passes 0
+  legitimately; if you ever read T unconditionally, every caller needs a
+  real one.
+- Refinement is an ENHANCEMENT: try/catch falls back to Rule A's
+  byte/time on any failure (EF pins); seam-gap/noop plans never attempt
+  the ranged read (EH pins). Never let a refinement error surface.
 - `claimFinalize()` makes onstop / stop-watchdog / salvage mutually
   exclusive; finalizeStarted SURVIVES resetUI, resets only in
-  startRecording. onstop clears the stop watchdog only AFTER winning the
-  claim. All salvage paths force stopMode='save'.
-- Undo re-record arms the FULL pane chain (restoreSegments) — DO/EE pin
-  it; undo of a re-cut restores the PREVIOUS marker exactly.
+  startRecording. All salvage paths force stopMode='save'.
+- Undo re-record arms the FULL pane chain (restoreSegments) — DO/EE/EK
+  pin it; undo of a re-cut restores the PREVIOUS marker exactly.
 - confirmDownloadArrived: mark-completed-first, background delete.
 - The review-pane preview is the ONE legitimate concatenateWebM caller.
-- New reviewState fields go into resetState().
+- New reviewState fields go into resetState(). (#25 added none — the
+  typed input is read off the DOM at click time; the harness resetState
+  DOES reset the two new DOM controls.)
 
 ## Gotchas (unchanged ones compressed)
 
 - New vm module state must be `var`; timing consts go in ORIG_TIMINGS AND
-  resetState's timer-clearing block. ORIG/resetState now also
-  capture/restore getDisplayMedia (DY) — mirror that pattern for any new
-  navigator mock a scenario swaps.
-- PowerShell Get-Content/Set-Content mangles this repo's BOM-less LF files
-  — Edit tools or bash/sed only.
+  resetState's timer-clearing block. ORIG/resetState also
+  capture/restore getDisplayMedia (DY) — mirror for any new navigator
+  mock a scenario swaps.
+- PowerShell Get-Content/Set-Content mangles this repo's BOM-less LF
+  files — Edit tools or bash/sed only. (Applying v1.23 via bash `cp`
+  from scratch copies worked cleanly; git's CRLF warnings are benign —
+  the object store keeps LF.)
 - Grep tool can render `//` as `\` (display artifact) — Read before
   believing a "syntax error".
-- Scenarios AL/AM/AN pin literal timestamp/Duration strings; AG is now
-  the lit-guard case (stream survives); EI pins the four Screen-click
-  meanings.
+- Scenarios AL/AM/AN pin literal timestamp/Duration strings; AG is the
+  lit-guard case; EI pins the four Screen-click meanings.
 - Real-browser behavior is invisible to the harness — owner acceptance
-  gates every UI-flow feature. Console-paste diagnostics remain the field
-  tool of choice.
+  gates every UI-flow feature. Console-paste diagnostics remain the
+  field tool of choice.
 
 ## Queue
 
-- **#25 (next): review-pane take controls** — (a) "Redo last take"
-  (whole-segment cut at segIndex=last via the existing cutAtByte===0
-  machinery; exact precision; show only with 2+ segments), (b) typed
-  `m:ss` timestamp beside "Re-record from here" feeding the same
-  computeCutPlan path — which now inherits #22's block precision
-  automatically, so the old cluster-granularity caveat is GONE from the
-  UI copy. Sonnet drafts, orchestrator reviews, owner approves/accepts.
+- **#25 owner acceptance** (checklist above) — then close #25. Optional
+  same-session follow-up if wanted: Enter-to-submit in the typed-time
+  input.
 - **#23 pause → change screens → resume** — scoped in REVIEW #23 (canvas
-  compositor makes the video swap pipeline-free; audio-mix reconnection is
-  the one new piece; affordance only while paused).
+  compositor makes the video swap pipeline-free; audio-mix reconnection
+  is the one new piece; affordance only while paused).
 - **#19 (docs/README) + #20 (final full regression)** at stabilization.
-  #19 now owes: save-first-then-open caption workflow note; the
-  scrub-back-to-redo note (obsolete if #25(a) ships first); the
-  Chrome-vs-Firefox save-flow difference is already on its list.
+  #19 now owes: save-first-then-open caption workflow note; document
+  "Redo last take" (the scrub-back-to-redo note is OBSOLETE — #25(a)
+  shipped); the Chrome-vs-Firefox save-flow difference is already on
+  its list.
 
 ## Ground rules (unchanged)
 

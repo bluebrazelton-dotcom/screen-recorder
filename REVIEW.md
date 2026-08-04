@@ -326,9 +326,9 @@ instead of chasing a moving one.
 
 Also owed from the owner's 2026-08-03 #21 pass: the caption-editor workflow
 must state that a recording is **saved first, then opened** in the editor
-(it edits saved files, not the in-progress session); and if #25(a) hasn't
-shipped, explain that re-doing a just-recorded take means scrubbing back to
-that timestamp in Stop & review.
+(it edits saved files, not the in-progress session). (The scrub-back-to-redo
+note is obsolete — #25(a) shipped "Redo last take" in v1.23; document that
+button instead.)
 
 ### 21. Re-record from a timestamp ("take-based recording") — owner-prioritized (2026-07-29), CLOSED 2026-08-03
 Owner's ask: pause/stop a recording, review it, pick a timestamp, and
@@ -593,7 +593,7 @@ UI: show a "Change screen" affordance only while paused. Differential
 tests must show recorded bytes/save flows unchanged; new tests for the
 swap-while-paused state machine and audio-mix reconnection.
 
-### 25. Review-pane take controls: redo last take + typed timestamp (owner-requested 2026-08-03)
+### 25. Review-pane take controls: redo last take + typed timestamp (owner-requested 2026-08-03) — SHIPPED v1.23 (2026-08-04)
 
 From the owner's #21 F6 pass: after a cut + new take, re-doing that take
 requires manually scrubbing back to the seam. Two additions to the review
@@ -607,6 +607,18 @@ fed into the same `computeCutPlan` path as scrubbing (until #22, the cut
 still lands on the nearest cluster boundary at-or-before T — say so in the
 UI). Sonnet drafts, orchestrator reviews; differential tests must show the
 save flows unchanged.
+
+SHIPPED v1.23 exactly as scoped, both parts, one session. #22 shipped
+first, so (b)'s cluster-granularity caveat never made it into the UI —
+the typed path inherits block precision through the shared
+`computeCutPlan` call. Delivery shape: one verbatim extraction
+(`applyReviewCutPlan`, pulled from `reviewCutFromHere` with zero logic
+changes) shared by all three cut entry points; `computeRedoLastTakePlan`
+pinned byte-identical to `computeCutPlan`'s own last-segment branch
+(scenario EK). Scenarios EJ–EP, incl. two real-save differentials (EL,
+EP) proving the save flows untouched. Harness 156/1122. Note for the
+seam-formula invariant: `computeRedoLastTakePlan` is now a FOURTH
+lockstep site. Owner real-browser acceptance pending.
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature

@@ -313,6 +313,14 @@ async function resetState() {
   documentMock.getElementById('reviewStatus').textContent = '';
   delete documentMock.getElementById('reviewVideo').pause; // scenarios that install a pause() spy must not leak it
   documentMock.getElementById('reviewVideo').currentTime = 0;
+  // REVIEW #25: the redo/typed-time controls are plain DOM, same leak risk
+  // as the elements just above (openReviewPane sets these; scenarios that
+  // poke reviewState directly instead of calling it never touch them).
+  documentMock.getElementById('reviewTimeInput').value = '';
+  documentMock.getElementById('reviewTimeInput').disabled = false;
+  documentMock.getElementById('btnRerecordAtTime').disabled = false;
+  documentMock.getElementById('btnRedoLastTake').style.display = 'none';
+  documentMock.getElementById('btnRedoLastTake').disabled = false;
   lastWritten = []; recordedErrors = []; rafQueue = []; addChunkCalls = 0; downloadClicks = [];
   writeCalls = []; abortCalls = 0; closedFiles = 0; failWriteAfter = -1;
   statusHistory = []; objectUrlBlobs = [];
@@ -5358,6 +5366,325 @@ Real cue text
     assert(state.sources.screen === false && state.sources.camera === true, 'EI: round trip lands back in camera-only');
     sandbox.selectScreen = origSelect;
     state.cameraStream = null;
+  });
+
+  // ============================================================
+  // REVIEW #25 — review-pane take controls: (a) "Redo last take"
+  // (EJ-EL), (b) typed m:ss timestamp beside "Re-record from here" (EM-EP)
+  // ============================================================
+
+  // EJ — redoLastTake button visibility: hidden with exactly 1 segment
+  // (discarding the only take isn't a "redo" — that's Back to recorder /
+  // Start over), visible with 2+, and gated by scansOk exactly like
+  // "Re-record from here" (same bailed-scan precedent as scenario DR).
+  await scenario('EJ redoLastTake button visibility: hidden with 1 segment, visible with 2+, disabled when the scan is gated', async () => {
+    // ---- 1 segment: hidden ----
+    {
+      const ids = await seedSegments([syntheticWebm()]);
+      const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+      await S.openReviewPane(segments);
+      assert(documentMock.getElementById('btnRedoLastTake').style.display === 'none', 'EJ: hidden with exactly 1 segment');
+      S.closeReviewPane();
+    }
+    // ---- 2 segments: visible and enabled ----
+    {
+      const ids = await seedSegments([syntheticWebm(), syntheticWebm()]);
+      const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+      await S.openReviewPane(segments);
+      assert(documentMock.getElementById('btnRedoLastTake').style.display === '', 'EJ: visible with 2 segments');
+      assert(documentMock.getElementById('btnRedoLastTake').disabled === false, 'EJ: enabled when the scan is clean');
+      S.closeReviewPane();
+    }
+    // ---- 3 segments: still visible ----
+    {
+      const ids = await seedSegments([syntheticWebm(), syntheticWebm(), syntheticWebm()]);
+      const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+      await S.openReviewPane(segments);
+      assert(documentMock.getElementById('btnRedoLastTake').style.display === '', 'EJ: visible with 3 segments');
+      S.closeReviewPane();
+    }
+    // ---- a bailed scan disables it (same gate as Re-record from here) —
+    // stays VISIBLE (2 segments) but disabled, so "disabled" communicates
+    // the limitation rather than the button silently vanishing ----
+    {
+      const ids = await seedSegments([syntheticWebm(), syntheticPoisonWebm()]);
+      const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+      await S.openReviewPane(segments);
+      assert(api.reviewState.scansOk === false, 'EJ precondition: the poisoned segment bails the scan');
+      assert(documentMock.getElementById('btnRedoLastTake').style.display === '', 'EJ: still visible (2 segments) when gated');
+      assert(documentMock.getElementById('btnRedoLastTake').disabled === true, 'EJ: disabled when scansOk is false, same as Re-record from here');
+      S.closeReviewPane();
+    }
+  });
+
+  // EK — redoLastTake (#25a): computeRedoLastTakePlan produces the exact
+  // same plan computeCutPlan's own k===0 branch would for a T at the very
+  // start of the last segment (byte-identical cut plan — the requirement is
+  // literally "the existing whole-segment cut machinery applied at
+  // segIndex=last"), redoLastTake() applies it through the same
+  // applyReviewCutPlan() reviewCutFromHere uses (same marker/discard/
+  // priorSegments/status shape DO's oracle checks), and Undo restores
+  // exactly — same assertion shape DO/EE use.
+  await scenario('EK redoLastTake: byte-identical plan to computeCutPlan\'s own last-segment cut, applied and undone exactly', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm(), buf2 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1), scan2 = scanResult(buf2);
+    const ids = await seedSegments([buf0, buf1, buf2]);
+    const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+    // Sentinel deliberately different from `segments` — same trick DO/EE use
+    // to prove undo arms the full pane chain, not whatever priorSegments
+    // held before the redo.
+    const priorBefore = [{ sessionId: 'zzz-unrelated', mimeType: 'video/webm' }];
+
+    // ---- plan equivalence: the scrubbed-T oracle vs computeRedoLastTakePlan ----
+    const offset1 = seamOffset(scan0), offset2 = offset1 + seamOffset(scan1);
+    const T = offset2 + scan2.clusters[0].timestamp;   // the very start of the last segment
+    const oraclePlan = S.computeCutPlan([scan0, scan1, scan2], T);
+    assert(oraclePlan.kind === 'cut' && oraclePlan.segIndex === 2 && oraclePlan.cutAtByte === 0,
+      'EK precondition: this T lands on computeCutPlan\'s own k===0 branch for the last segment (got ' + JSON.stringify(oraclePlan) + ')');
+    const redoPlan = S.computeRedoLastTakePlan([scan0, scan1, scan2]);
+    assert(JSON.stringify(redoPlan) === JSON.stringify(oraclePlan),
+      'EK: computeRedoLastTakePlan is byte-identical to computeCutPlan\'s own last-segment cut (got ' + JSON.stringify(redoPlan) + ' vs ' + JSON.stringify(oraclePlan) + ')');
+    assert(S.computeRedoLastTakePlan([scan0]) === null, 'EK: fewer than 2 segments has no redo plan (defensive — the button is never shown then)');
+
+    // ---- apply: redoLastTake() produces the same shape DO's oracle checks for a cutAtByte===0 plan ----
+    state.priorSegments = priorBefore.slice();
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1, scan2];
+    api.reviewState.scansOk = true;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+
+    await S.redoLastTake();
+
+    let sessions = await readStore('sessions');
+    const s2 = sessions.find((x) => x.id === ids[2]);
+    assert(s2.discarded === true, 'EK: the last segment is flagged discarded whole');
+    assert(s2.cutAtByte === undefined, 'EK: no cutAtByte marker for a whole-segment discard (cutAtByte===0 never becomes a stored marker)');
+    assert(sessions.find((x) => x.id === ids[0]).discarded === undefined && sessions.find((x) => x.id === ids[1]).discarded === undefined,
+      'EK: the earlier two segments are untouched');
+    assert(state.priorSegments.length === 2 && state.priorSegments[0].sessionId === ids[0] && state.priorSegments[1].sessionId === ids[1],
+      'EK: priorSegments keeps only the first two segments');
+    assert(documentMock.getElementById('reviewPane').classList.contains('visible') === false, 'EK: the review pane closes on a successful redo');
+    assert(documentMock.getElementById('btnUndoReRecord').style.display === '', 'EK: the Undo re-record affordance appears');
+    assert(statusHistory.some((m) => m === `Kept ${S.formatMinSec(oraclePlan.keptMs)}. Select a screen and click Record to continue from there.`),
+      'EK: the post-redo status reports the same kept duration computeCutPlan\'s own last-segment cut would');
+
+    // ---- undo restores exactly (arms the FULL pane chain, un-discards only what this redo discarded) ----
+    await S.undoReRecord();
+    sessions = await readStore('sessions');
+    assert(sessions.find((x) => x.id === ids[2]).discarded === undefined, 'EK undo: the discarded segment is restored');
+    assert(state.priorSegments.length === 3 && state.priorSegments.every((s, i) => s.sessionId === ids[i]),
+      'EK undo: priorSegments arms the full pane chain (all 3 segments), not the stale sentinel');
+    assert(documentMock.getElementById('btnUndoReRecord').style.display === 'none', 'EK undo: the Undo button hides itself after use');
+    assert(api.reviewState.undo === null, 'EK undo: the undo record is consumed');
+  });
+
+  // EL — redoLastTake differential: after discarding the last segment, the
+  // REAL streamed stitch save over what remains matches stitchOracle
+  // exactly — same shape as EG's real-save differential for a refined
+  // scrub cut, proving redoLastTake doesn't disturb the save path.
+  await scenario('EL redoLastTake differential: the real save after a redo matches stitchOracle(remaining segments)', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm(), buf2 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1), scan2 = scanResult(buf2);
+    const ids = await seedSegments([buf0, buf1, buf2]);
+    const segments = ids.map((id) => ({ sessionId: id, mimeType: 'video/webm' }));
+
+    state.priorSegments = [];
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1, scan2];
+    api.reviewState.scansOk = true;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+
+    await S.redoLastTake();
+    assert(state.priorSegments.length === 2, 'EL precondition: the redo kept the first two segments');
+
+    const want = await stitchOracle([buf0, buf1]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    const r = await S.saveSessionsStreamedStitch(state.priorSegments, 'x.webm');
+    assert(r === 'saved', 'EL precondition: the real stitched save succeeded (got ' + r + ')');
+    const got = Buffer.from(await lastWritten.pop().arrayBuffer());
+    assert(Buffer.compare(got, want) === 0,
+      'EL: real stitched save after redoLastTake === stitchOracle([buf0, buf1]) (' + got.length + ' vs ' + want.length + ' bytes)');
+    assertNoOverlap(got, 'EL post-redo stitched output');
+  });
+
+  // EM — parseReviewTimestamp (#25b): m:ss / mm:ss / h:mm:ss accepted (with
+  // unbounded minutes/hours), garbage and out-of-range components (seconds,
+  // or in-hour minutes, >= 60) rejected. Deliberately NOT the caption
+  // grammar (parseCaptionTimestamp REQUIRES a fractional-seconds group) —
+  // see the function's own comment in index.html.
+  await scenario('EM parseReviewTimestamp: m:ss/mm:ss/h:mm:ss accepted, garbage and out-of-range rejected', async () => {
+    assert(S.parseReviewTimestamp('0:00') === 0, 'EM: 0:00 is a valid boundary (got ' + S.parseReviewTimestamp('0:00') + ')');
+    assert(S.parseReviewTimestamp('1:30') === 90000, 'EM: 1:30 -> 90000ms (got ' + S.parseReviewTimestamp('1:30') + ')');
+    assert(S.parseReviewTimestamp('01:05') === 65000, 'EM: 01:05 (mm:ss) -> 65000ms (got ' + S.parseReviewTimestamp('01:05') + ')');
+    assert(S.parseReviewTimestamp('125:00') === 7500000, 'EM: unbounded minutes, 125:00 -> 7500000ms (got ' + S.parseReviewTimestamp('125:00') + ')');
+    assert(S.parseReviewTimestamp('1:02:03') === 3723000, 'EM: h:mm:ss, 1:02:03 -> 3723000ms (got ' + S.parseReviewTimestamp('1:02:03') + ')');
+    assert(S.parseReviewTimestamp(' 2:07 ') === 127000, 'EM: surrounding whitespace is trimmed (got ' + S.parseReviewTimestamp(' 2:07 ') + ')');
+
+    assert(S.parseReviewTimestamp('') === null, 'EM: empty string rejected');
+    assert(S.parseReviewTimestamp('abc') === null, 'EM: garbage rejected');
+    assert(S.parseReviewTimestamp('12') === null, 'EM: no colon at all is rejected');
+    assert(S.parseReviewTimestamp('1:99') === null, 'EM: out-of-range seconds rejected (got ' + S.parseReviewTimestamp('1:99') + ')');
+    assert(S.parseReviewTimestamp('1:60') === null, 'EM: seconds===60 is out of range (0-59 only)');
+    assert(S.parseReviewTimestamp('1:99:00') === null, 'EM: out-of-range in-hour minutes rejected in h:mm:ss');
+    assert(S.parseReviewTimestamp('1:2:99') === null, 'EM: out-of-range seconds rejected in h:mm:ss');
+    assert(S.parseReviewTimestamp('-1:00') === null, 'EM: negative time rejected');
+    assert(S.parseReviewTimestamp('1:2:3:4') === null, 'EM: too many components rejected');
+    assert(S.parseReviewTimestamp(null) === null, 'EM: non-string input rejected');
+  });
+
+  // EN — reviewCutFromTypedTime (#25b): garbage/out-of-range input is
+  // rejected with a gentle inline message and changes nothing (no plan
+  // computed, no marker touched, pane stays open); 0:00 is a VALID time —
+  // it hits computeCutPlan's startOver kind (same in-pane confirm
+  // reviewCutFromHere shows for a scrub to 0), not a rejection; the scansOk
+  // gate matches "Re-record from here" exactly.
+  await scenario('EN reviewCutFromTypedTime: garbage/out-of-range rejected inline with nothing touched; 0:00 boundary is a real time, not a rejection; scansOk gate matches Re-record from here', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const ids = await seedSegments([buf0, buf1]);
+    const segments = [{ sessionId: ids[0], mimeType: 'video/webm' }, { sessionId: ids[1], mimeType: 'video/webm' }];
+    const priorBefore = [{ sessionId: 'zzz-unrelated', mimeType: 'video/webm' }];
+
+    state.priorSegments = priorBefore.slice();
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+
+    for (const bad of ['not a time', '1:99', '', '12', '1:2:99', '-3:00']) {
+      documentMock.getElementById('reviewTimeInput').value = bad;
+      await S.reviewCutFromTypedTime();
+      assert(/doesn't look like a time/i.test(documentMock.getElementById('reviewStatus').textContent),
+        'EN: "' + bad + '" gets the gentle inline message (got "' + documentMock.getElementById('reviewStatus').textContent + '")');
+    }
+    const sessions = await readStore('sessions');
+    assert(sessions.every((s) => s.cutAtByte === undefined && s.discarded === undefined), 'EN: every rejected input left every session untouched');
+    assert(documentMock.getElementById('reviewPane').classList.contains('visible') === true, 'EN: the pane stays open through every rejection');
+    assert(state.priorSegments.length === 1 && state.priorSegments[0].sessionId === 'zzz-unrelated', 'EN: priorSegments is untouched by any rejected input');
+
+    // ---- boundary: 0:00 is accepted as a real time (startOver kind) ----
+    documentMock.getElementById('reviewTimeInput').value = '0:00';
+    await S.reviewCutFromTypedTime();
+    assert(documentMock.getElementById('reviewDiscardConfirm').classList.contains('visible') === true,
+      'EN: 0:00 is accepted as a real time and hits computeCutPlan\'s startOver kind, not the parse-rejection message');
+    S.hideReviewDiscardConfirm();
+
+    // ---- scansOk gate: same message/behavior as Re-record from here ----
+    api.reviewState.scansOk = false;
+    documentMock.getElementById('reviewTimeInput').value = '1:00';
+    await S.reviewCutFromTypedTime();
+    assert(/isn't available for this recording/.test(documentMock.getElementById('reviewStatus').textContent),
+      'EN: the scansOk gate blocks the typed path with the same message as Re-record from here');
+  });
+
+  // EO — reviewCutFromTypedTime (#25b) feeds the SAME computeCutPlan() path
+  // scrubbing uses: two independent runs against identical fixtures, one
+  // driven by reviewVideo.currentTime (scrub, reviewCutFromHere) and one by
+  // the typed input (reviewCutFromTypedTime) for the exact same whole-
+  // second T, must land on byte-identical stored markers — proving the
+  // typed path is the SAME computeCutPlan inputs/outputs, not a parallel
+  // implementation.
+  await scenario('EO reviewCutFromTypedTime: a typed time produces byte-identical results to scrubbing to the same T', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const offset1 = seamOffset(scan0);
+    // A whole-second T mid-cluster in segment 1 (its own clusters sit at
+    // local 0/1000/2000, content end ~2900 — offset1+1000 lands inside the
+    // cluster-1 span [1000,2000) once rounded) — no rounding loss between
+    // the two representations (video.currentTime in seconds vs a typed
+    // m:ss string with no fractional seconds), so both runs target the
+    // identical numeric T. offset1 itself isn't whole-second-aligned (it
+    // carries the +33ms seam gap), so round to the nearest whole second
+    // AFTER adding the target offset, or the round-trip assertion below
+    // (and computeCutPlan itself, fed a rounded T by reviewCutFromTypedTime)
+    // would disagree with the raw fractional value.
+    const T = Math.round((offset1 + 1000) / 1000) * 1000;
+    const mm = Math.floor(T / 60000), ss = Math.floor((T % 60000) / 1000);
+    const typedStr = `${mm}:${String(ss).padStart(2, '0')}`;
+    assert(S.parseReviewTimestamp(typedStr) === T, 'EO precondition: the typed string round-trips to the exact same T (got ' + S.parseReviewTimestamp(typedStr) + ' vs ' + T + ')');
+    const plan = S.computeCutPlan([scan0, scan1], T);
+    assert(plan.kind === 'cut', 'EO precondition: this T lands on a real cut (got ' + JSON.stringify(plan) + ')');
+
+    // ---- run 1: scrub (reviewCutFromHere) ----
+    let ids = await seedSegments([buf0, buf1]);
+    let segments = [{ sessionId: ids[0], mimeType: 'video/webm' }, { sessionId: ids[1], mimeType: 'video/webm' }];
+    state.priorSegments = [];
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    documentMock.getElementById('reviewVideo').currentTime = T / 1000;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+    await S.reviewCutFromHere();
+    let sessions = await readStore('sessions');
+    const scrubResult = sessions.find((x) => x.id === ids[1]);
+
+    // ---- run 2: typed (reviewCutFromTypedTime), fresh identical fixtures ----
+    ids = await seedSegments([buf0, buf1]);
+    segments = [{ sessionId: ids[0], mimeType: 'video/webm' }, { sessionId: ids[1], mimeType: 'video/webm' }];
+    state.priorSegments = [];
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    documentMock.getElementById('reviewTimeInput').value = typedStr;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+    await S.reviewCutFromTypedTime();
+    sessions = await readStore('sessions');
+    const typedResult = sessions.find((x) => x.id === ids[1]);
+
+    assert(typedResult.cutAtByte === scrubResult.cutAtByte, 'EO: the typed-time cutAtByte matches the scrub-to-the-same-T cutAtByte exactly (got ' + typedResult.cutAtByte + ' vs ' + scrubResult.cutAtByte + ')');
+    assert(typedResult.cutAtMs === scrubResult.cutAtMs, 'EO: the typed-time cutAtMs matches the scrub-to-the-same-T cutAtMs exactly (got ' + typedResult.cutAtMs + ' vs ' + scrubResult.cutAtMs + ')');
+    assert(typedResult.discarded === scrubResult.discarded, 'EO: the typed-time discarded flag matches the scrub-to-the-same-T result');
+  });
+
+  // EP — reviewCutFromTypedTime differential: a typed-time cut on segment 2
+  // of a 2-segment chain, then the REAL stitched save, matches
+  // stitchOracle(sliced buffers) exactly and has no cluster overlap — same
+  // shape as EG's differential for the scrub path, proving the typed path
+  // doesn't disturb the save flow.
+  await scenario('EP reviewCutFromTypedTime differential: real stitched save after a typed-time cut === stitchOracle(sliced buffers), no overlap', async () => {
+    const buf0 = syntheticWebm(), buf1 = syntheticWebm();
+    const scan0 = scanResult(buf0), scan1 = scanResult(buf1);
+    const offset1 = seamOffset(scan0);
+    const thirds = (b) => splitAt(b, [Math.floor(b.length / 3), Math.floor(2 * b.length / 3)]);
+    const id0 = await seedBuffers(thirds(buf0)), id1 = await seedBuffers(thirds(buf1));
+    const segments = [{ sessionId: id0, mimeType: 'video/webm' }, { sessionId: id1, mimeType: 'video/webm' }];
+
+    state.priorSegments = [];
+    api.reviewState.segments = segments;
+    api.reviewState.scans = [scan0, scan1];
+    api.reviewState.scansOk = true;
+    documentMock.getElementById('reviewPane').classList.add('visible');
+
+    // Whole-second T mid-cluster in segment 2 (same target EO uses).
+    // offset1 itself isn't whole-second-aligned (it carries the +33ms seam
+    // gap), so round to the nearest whole second AFTER adding the target
+    // offset — the typed grammar has no fractional seconds, so T must be
+    // exactly representable as m:ss or the round-trip assertion below fails.
+    const T = Math.round((offset1 + 1000) / 1000) * 1000;
+    const mm = Math.floor(T / 60000), ss = Math.floor((T % 60000) / 1000);
+    documentMock.getElementById('reviewTimeInput').value = `${mm}:${String(ss).padStart(2, '0')}`;
+
+    const plan = S.computeCutPlan([scan0, scan1], T);
+    assert(plan.kind === 'cut' && plan.segIndex === 1 && plan.cutAtByte > 0,
+      'EP precondition: this T is a real mid-segment-2 cut (got ' + JSON.stringify(plan) + ')');
+
+    await S.reviewCutFromTypedTime();
+
+    const sessionsAfter = await readStore('sessions');
+    const s1 = sessionsAfter.find((x) => x.id === id1);
+    assert(typeof s1.cutAtByte === 'number', 'EP precondition: the typed-time cut stored a real byte marker on segment 2');
+    // Whatever byte actually landed (Rule A's or a block-refined one — EO
+    // already proves that byte matches a scrub to the same T) is read back
+    // off the session, not re-derived, so this differential is purely about
+    // the save path reflecting whatever cut was made.
+    const want = await stitchOracle([buf0, buf1.slice(0, s1.cutAtByte)]);
+    windowMock.showSaveFilePicker = pickerSequence(['ok']);
+    const r = await S.saveSessionsStreamedStitch(state.priorSegments, 'x.webm');
+    assert(r === 'saved', 'EP precondition: the real stitched save succeeded (got ' + r + ')');
+    const got = Buffer.from(await lastWritten.pop().arrayBuffer());
+    assert(Buffer.compare(got, want) === 0,
+      'EP: real stitched save after a typed-time cut === stitchOracle([buf0, buf1.slice(0,cut)]) (' + got.length + ' vs ' + want.length + ' bytes)');
+    assertNoOverlap(got, 'EP typed-time cut stitched output');
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');
