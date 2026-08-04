@@ -2090,11 +2090,16 @@ so nothing is encoded mid-switch); swapping to a very differently-sized
 source stretches it into the original dimensions. Resizing mid-recording
 has its own risks; revisit only if the owner hits it in practice.
 
-**Owner acceptance owed (real browsers, Firefox first)** — several items
-are real-browser-only: repeated-picker UX while paused, audible
-glitch/pop on audio-node swap, the canvas-stretch visual with two
-differently-sized sources, whether a live browser ever fires 'ended' on
-the deliberate stop, OS sharing-indicator behavior across the swap.
+**Owner acceptance PASSED (2026-08-04), both browsers** — items 1–5, 7, 8
+all pass (incl. the canvas-stretch check, judged acceptable, and the
+deliberate-swap-never-trips-a-stop check). Item 6 (no-audio recording +
+swap to a source with audio → gentle note) passes in Chrome; in Firefox
+the scenario is UNREACHABLE — Firefox ignores getDisplayMedia's
+`audio: true` entirely (upstream bug 1541425, open since 2019), so a
+Firefox screen capture NEVER carries audio and the note can never fire
+there. Expected behavior, consistent with the v1.21.2 FF audio findings.
+#23 CLOSED. Spawned the system-audio question → #26 (Firefox loopback
+guidance).
 
 ---
 

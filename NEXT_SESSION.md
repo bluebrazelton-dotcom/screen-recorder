@@ -14,8 +14,12 @@ all items, both browsers).
   intact, still paused, still resumable (ES/ET). Zero recording-
   pipeline/save-flow changes: EY's end-to-end differential shows a
   paused-swap session's saved bytes === a no-swap session's.
-- **#23 owner acceptance is PENDING** — checklist below; several items
-  are REAL-BROWSER-ONLY this time.
+- **#23 CLOSED same day** — owner acceptance PASSED 2026-08-04, both
+  browsers (canvas stretch judged acceptable; deliberate swaps never
+  tripped a stop). Item 6's no-audio note is Chrome-only in practice:
+  Firefox ignores getDisplayMedia audio entirely (upstream Bugzilla
+  1541425), so the note's trigger can't occur there — expected. The
+  finding spawned **#26** (Firefox system-audio loopback guidance).
 - Working pattern held: Sonnet drafted in scratch + pre-verified on
   copies with the real harness; orchestrator review verified the
   ended-listener extraction byte-for-byte, hand-checked the
@@ -29,31 +33,6 @@ all items, both browsers).
   mock records connect/disconnect; `makeEndedCapableTrack` does real
   listener bookkeeping and models worst-case stop()-fires-'ended';
   screenVideo/cameraVideo exposed read-only via __api.
-
-## #23 owner-acceptance checklist (Firefox first, then Chrome)
-
-1. Screen+mic recording → pause → "Change screen" appears (hidden while
-   actively recording) → pick another window → resume → save. Played
-   back: no black frames or picker-hunt footage at the switch; audio
-   from the new screen present (if it has any); no audible pop at the
-   swap point.
-2. Pause → Change screen → CANCEL the picker → old screen still live,
-   resume works, no banner.
-3. Repeated swaps in one pause (2–3 in a row) → still resumable, saved
-   file fine. Note any picker friction/re-prompts (real-browser-only).
-4. After a swap, click the browser's own "Stop sharing" → recording
-   stops and saves, exactly as it always did.
-5. Camera-only recording → pause → NO "Change screen" button.
-6. No-audio recording (mic off, share without audio) → pause → swap to
-   a source WITH audio → gentle "started without audio" note; recording
-   completes fine (its audio is not included — expected).
-7. Canvas-stretch check: swap between two very differently-sized
-   sources (e.g. portrait window → full monitor) and eyeball the
-   stretch. Known deliberate limitation — judge whether it's acceptable
-   or needs a follow-up issue.
-8. Watch whether the deliberate swap ever trips a stop on live
-   Firefox/Chrome (it must not — the guard covers even a browser that
-   fires 'ended' on script stop()).
 
 ## Permanent design knowledge (new ● + carried forward)
 
@@ -123,14 +102,22 @@ all items, both browsers).
 
 ## Queue
 
-- **#23 owner acceptance** (checklist above) — then close #23. Item 7
-  (canvas stretch) may spawn a follow-up issue if the owner finds it
-  unacceptable.
+- **#26 (new, owner-raised): Firefox system-audio loopback guidance** —
+  scoped in REVIEW #26. Core fact: Firefox CANNOT capture system audio
+  from a web page (upstream Bugzilla 1541425, open since 2019; FF
+  silently ignores getDisplayMedia's audio:true — which the app already
+  requests, and which lights up automatically if FF ever ships it).
+  Shippable scope is guidance only: a Firefox-only no-audio hint
+  (placement/wording needs owner input — don't nag every share) + a #19
+  guide section for the loopback workaround (Stereo Mix / VB-Audio
+  Virtual Cable as the selected mic — the existing mic picker already
+  supports this today with zero code; caveats: mic+system needs an
+  OS-level mix e.g. VoiceMeeter, echo risk).
 - **#19 (docs/README) + #20 (final full regression)** — the feature set
-  may now be stabilizing; if no new owner asks emerge after #23 closes,
-  these are next. #19 owes: save-first-then-open caption workflow note;
-  document "Redo last take" + typed timestamp + "Change screen";
-  Chrome-vs-Firefox save-flow difference.
+  may now be stabilizing. #19 owes: save-first-then-open caption
+  workflow note; document "Redo last take" + typed timestamp + "Change
+  screen"; Chrome-vs-Firefox save-flow difference; and #26's loopback
+  guide (natural home).
 - Roadmap remainder (REVIEW feature map): chapter hotkeys + sidecar
   export, caption VTT/SRT import, mediabunny remux (Cues/MP4) — all
   unscheduled, owner-priority-driven.

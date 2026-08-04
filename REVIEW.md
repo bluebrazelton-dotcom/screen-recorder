@@ -568,7 +568,7 @@ only when the stream has audio (scenario DX; harness 138/940). The
 failure was never intermittent — it was configuration-determined
 (no-mic recordings always died; mic recordings always worked).**
 
-### 23. Pause → change screens → resume — owner-requested (2026-08-02) — SHIPPED v1.24 (2026-08-04)
+### 23. Pause → change screens → resume — owner-requested (2026-08-02) — SHIPPED v1.24, CLOSED 2026-08-04
 
 While paused, let the user pick a different screen/window, then resume —
 so the recording never captures the hunt for the next screen. Scoped
@@ -605,10 +605,12 @@ action mid-recording). Orchestrator amendment: mix teardown now
 atomically clears audioMixDest/screenAudioSourceNodes alongside
 audioContext at both teardown sites. Known deliberate limitation:
 canvas stays at the first screen's resolution — differently-sized swap
-sources stretch. Harness 165/1197. Owner real-browser acceptance
-pending (several items are real-browser-only: repeated-picker UX,
-audio pop on swap, canvas-stretch visual, live 'ended' behavior on
-deliberate stop).
+sources stretch. Harness 165/1197. Owner acceptance PASSED
+2026-08-04, both browsers (canvas stretch judged acceptable; no stop
+ever tripped by a deliberate swap). Item 6's no-audio note is
+Chrome-only in practice: Firefox ignores getDisplayMedia audio
+entirely (upstream bug 1541425), so the triggering condition can't
+occur there — expected, and it spawned #26. CLOSED.
 
 ### 25. Review-pane take controls: redo last take + typed timestamp (owner-requested 2026-08-03) — SHIPPED v1.23, CLOSED 2026-08-04
 
@@ -637,6 +639,30 @@ EP) proving the save flows untouched. Harness 156/1122. Note for the
 seam-formula invariant: `computeRedoLastTakePlan` is now a FOURTH
 lockstep site. Owner real-browser acceptance PASSED same day (all 8
 checklist items, both browsers) — CLOSED.
+
+### 26. System audio in Firefox: loopback guidance (owner-raised 2026-08-04, from the #23 pass)
+
+The app ALREADY records screen/system audio wherever the browser
+delivers it: captureScreen requests `audio: true`, Chrome's picker has
+the share-audio checkbox, and the mix/swap machinery handles it (v1.24).
+Firefox is the gap — and it is UPSTREAM-BLOCKED: Firefox ignores
+getDisplayMedia's audio request entirely (Bugzilla 1541425, open since
+2019, no implementation). No web page can capture system audio in
+Firefox at any effort level; this cannot be built in the app.
+
+What CAN ship (small): the loopback-device workaround made first-class.
+On Windows, a loopback input (driver "Stereo Mix" where the audio driver
+exposes it, or the free VB-Audio Virtual Cable) presents system audio as
+a microphone — and DidaRec already has a mic device picker
+(enumerateDevices/selectedMic), so the workaround works TODAY with zero
+code by selecting the loopback device as the mic. Scope: (a) a
+faculty-tone Firefox-only hint when a screen share lands with no audio
+track and the user plausibly wanted it (placement/wording TBD — don't
+nag every share); (b) a #19 user-guide section walking through Stereo
+Mix / VB-Cable setup, incl. the caveats (mic+system simultaneously needs
+an OS-level mix like VoiceMeeter, or choose one; echo risk if speakers
+feed the mic). Watch upstream: if Firefox ever ships 1541425, the app
+needs zero changes — the existing audio:true request lights up.
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature
