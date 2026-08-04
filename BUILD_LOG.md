@@ -2101,6 +2101,53 @@ there. Expected behavior, consistent with the v1.21.2 FF audio findings.
 #23 CLOSED. Spawned the system-audio question → #26 (Firefox loopback
 guidance).
 
+### v1.25 — First audio-less share hint (#26, hint half) (2026-08-04)
+
+**Commit:** `v1.25 (#26): one-time audio-less share hint, both browsers — showInfoBanner + info banner styling; scenarios EZ, FA–FG`
+
+A one-time hint when a screen/window capture comes back with NO audio
+track, explaining how to get computer sound into the recording — the
+shippable half of #26 (Firefox's system-audio gap is upstream-blocked,
+Bugzilla 1541425; the loopback workaround already works today via the
+existing mic picker; the full walkthrough is owed to #19).
+
+Fires from `selectScreen()` only, immediately after a successful capture
+with `getAudioTracks().length === 0`. Once EVER per browser profile: a
+`localStorage` flag (`audioHintShown`), same try/catch idiom as
+`micEnumAnonymized` — a broken localStorage degrades to "may show again",
+never breaks the capture flow (FF pins it). `changeScreenPaused()`
+deliberately has no call — one trigger point + the flag cover both entry
+points (FC pins the swap path stays silent); camera-only never reaches
+`selectScreen()` (FG).
+
+Browser branching reuses the `'showSaveFilePicker' in window` proxy the
+save flows already rely on (still zero UA sniffing in the codebase):
+Chrome-like → "tick 'Also share audio' in the picker next time";
+Firefox-like → loopback guidance (Stereo Mix / VB-Audio Cable as the
+selected microphone). Wordings verified against every pinned
+string/regex in the suite (deliberately avoid "without audio" and
+"couldn't switch", which ES/ET/EW match).
+
+Presentation: the existing dismissable `#errorBanner` with a new calm
+`.info` modifier class via `showInfoBanner(msg)`. The class lifecycle is
+a single choke point — `showError()` unconditionally strips `.info` on
+EVERY call (error, dismiss, clear), and `showInfoBanner` is the only
+adder (calling showError first, THEN adding the class — the reverse
+order self-cancels, a bug the draft's own scenarios caught before
+review). FD/FE pin dismiss and error-after-hint.
+
+Harness: **173 scenarios / 1234 assertions** (prefixes end at FG).
+Notable harness upgrade: the `showError` mock previously REPLACED the
+real function (no DOM effects ever ran); it now WRAPS it, mirroring the
+ORIG_updateStatus pattern — behavior-preserving for all 165 pre-existing
+scenarios (none assert on banner DOM) and the real classList logic is
+finally under test. resetState clears the banner's classes.
+
+**Owner acceptance owed (both browsers):** calm banner styling eyeball,
+correct wording per browser, shows once then never again (and clearing
+site data / localStorage brings it back), dismiss works, a later real
+error looks like a normal error.
+
 ---
 
 ## Known limitations

@@ -640,7 +640,7 @@ seam-formula invariant: `computeRedoLastTakePlan` is now a FOURTH
 lockstep site. Owner real-browser acceptance PASSED same day (all 8
 checklist items, both browsers) — CLOSED.
 
-### 26. System audio in Firefox: loopback guidance (owner-raised 2026-08-04, from the #23 pass)
+### 26. System audio in Firefox: loopback guidance (owner-raised 2026-08-04, from the #23 pass) — hint half SHIPPED v1.25 (2026-08-04)
 
 The app ALREADY records screen/system audio wherever the browser
 delivers it: captureScreen requests `audio: true`, Chrome's picker has
@@ -663,6 +663,18 @@ Mix / VB-Cable setup, incl. the caveats (mic+system simultaneously needs
 an OS-level mix like VoiceMeeter, or choose one; echo risk if speakers
 feed the mic). Watch upstream: if Firefox ever ships 1541425, the app
 needs zero changes — the existing audio:true request lights up.
+
+(a) SHIPPED v1.25, owner-expanded to BOTH browsers (Chrome's wording
+covers the missed "Also share audio" checkbox — a real silent-no-audio
+failure mode too). Owner decisions: first audio-less share only, once
+ever (localStorage flag). Trigger in selectScreen only; branching on
+the existing showSaveFilePicker proxy; calm .info modifier on the
+dismissable banner via showInfoBanner (showError strips the class on
+every call — single choke point). Scenarios EZ, FA–FG; harness
+173/1234; the harness's showError mock now WRAPS the real function
+(was a full replacement — real banner code under test for the first
+time). (b) the loopback walkthrough remains owed to #19. Owner
+acceptance pending.
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature

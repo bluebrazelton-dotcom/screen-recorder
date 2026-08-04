@@ -419,6 +419,17 @@
   }
   .error-banner-close:hover { opacity: 1; }
 
+  /* REVIEW #26: a calm "info" look for one-time hints (e.g. the first
+     audio-less screen share) — reuses the dismissable error-banner shell
+     via showInfoBanner() but swaps the error-red palette for a neutral
+     tint built from the app's existing --text-dim, never a new color. */
+  .error-banner.info {
+    background: rgba(136, 146, 164, 0.1);
+    border-color: rgba(136, 146, 164, 0.3);
+    color: var(--text);
+  }
+  .error-banner.info .error-banner-close { color: var(--text-dim); }
+
   /* Caption editor (v1.18) */
   .btn-caption-editor {
     background: var(--border);
@@ -4011,6 +4022,30 @@ function unwireScreenEndedListener() {
   state.screenEndedHandler = null;
 }
 
+// REVIEW #26: Firefox cannot capture system audio at all — upstream-blocked
+// (Bugzilla 1541425, open since 2019, no implementation); Chrome CAN, but
+// its picker's "Also share audio" checkbox is easy to miss. Rather than nag
+// on every share, explain the gap once, the first time it's actually hit
+// (a real capture with zero audio tracks), then stay quiet forever — a
+// localStorage flag makes that a per-browser-profile guarantee. Fires from
+// selectScreen() only: changeScreenPaused() has no call to this at all (see
+// its own doc comment) — the once-ever flag plus this single trigger point
+// already cover both entry points, and camera-only recordings never reach
+// selectScreen() to begin with.
+function maybeShowAudioHint(stream) {
+  if (!stream || stream.getAudioTracks().length > 0) return;
+  let alreadyShown = false;
+  // Same try/catch idiom as micEnumAnonymized/camEnumAnonymized — localStorage
+  // can throw on some file:// setups and must never break the capture flow.
+  try { alreadyShown = localStorage.getItem('audioHintShown') === '1'; } catch (e) { /* ignore */ }
+  if (alreadyShown) return;
+  const msg = ('showSaveFilePicker' in window)
+    ? 'This screen share doesn\'t include sound. To record computer audio, tick "Also share audio" (or "Share tab audio") in the picker next time you choose a screen.'
+    : 'Heads up: this browser can\'t record your computer\'s sound — only your microphone. To include computer audio, set up a loopback input (like Stereo Mix or VB-Audio Cable) and choose it as your microphone.';
+  showInfoBanner(msg);
+  try { localStorage.setItem('audioHintShown', '1'); } catch (e) { /* ignore */ }
+}
+
 async function selectScreen() {
   showError('');
   const btnSelect = document.getElementById('btnSelectScreen');
@@ -4026,6 +4061,7 @@ async function selectScreen() {
     }
 
     state.screenStream = await captureScreen();
+    maybeShowAudioHint(state.screenStream);
     screenVideo.srcObject = state.screenStream;
     await screenVideo.play();
 
@@ -5349,6 +5385,11 @@ function updateChunkCount(n) {
 function showError(msg) {
   const el = document.getElementById('errorBanner');
   const msgEl = document.getElementById('errorBannerMsg');
+  // REVIEW #26: strip the calm "info" look on EVERY call — a genuine error
+  // (msg truthy) or a dismiss/clear (msg falsy, incl. the close button's
+  // onclick="showError('')"). showInfoBanner() is the only path that adds
+  // 'info' back, so neither look can ever stick to the other's message.
+  el.classList.remove('info');
   if (msg) {
     msgEl.textContent = msg;
     el.classList.add('visible');
@@ -5356,6 +5397,17 @@ function showError(msg) {
     msgEl.textContent = '';
     el.classList.remove('visible');
   }
+}
+
+// REVIEW #26: same dismissable banner as showError, but for a one-time,
+// non-error hint (e.g. "this share had no sound"). showError still owns the
+// actual show/hide + text; this just adds the neutral modifier class on top.
+function showInfoBanner(msg) {
+  // showError() runs FIRST and unconditionally strips 'info' (so a stale
+  // hint look can never survive into a fresh call) — add it back after, or
+  // this call would strip its own class right back off.
+  showError(msg);
+  document.getElementById('errorBanner').classList.add('info');
 }
 
 // Timer

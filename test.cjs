@@ -230,7 +230,15 @@ const ORIG = {
   // installed in one scenario can never leak into the next via resetState().
   saveFile: sandbox.saveFile, stitchAndSave: sandbox.stitchAndSave,
 };
-sandbox.showError = (m) => { recordedErrors.push(m || ''); };
+// REVIEW #26: wrap (not replace) — same shape as the ORIG_updateStatus wrap
+// two lines below. Every existing scenario only ever asserted on
+// recordedErrors content, never on errorBanner DOM state, so this is
+// behavior-preserving for all of them; forwarding to the real showError()
+// is what lets #26's scenarios assert the real .info modifier-class
+// lifecycle (add via showInfoBanner, strip on the next showError call)
+// instead of re-implementing that logic a second time in the mock.
+const ORIG_showError = sandbox.showError;
+sandbox.showError = (m) => { recordedErrors.push(m || ''); return ORIG_showError(m); };
 const ORIG_updateStatus = sandbox.updateStatus;
 sandbox.updateStatus = (mode, text) => { statusHistory.push(text); return ORIG_updateStatus(mode, text); };
 const ORIG_CARRY_CAP = sandbox.STREAM_CARRY_CAP;
@@ -326,6 +334,13 @@ async function resetState() {
   documentMock.getElementById('downloadConfirm').classList.remove('visible');
   documentMock.getElementById('recoveryBanner').classList.remove('visible');
   documentMock.getElementById('stitchFallback').classList.remove('visible');
+  // REVIEW #26: now that showError() is wrapped (not replaced — see
+  // ORIG_showError above) and actually runs, it really does mutate
+  // errorBanner's classList across scenarios; reset both classes the same
+  // way the banners above are reset. (audioHintShown itself needs no
+  // explicit reset: it lives in localStorageStore, already zeroed below.)
+  documentMock.getElementById('errorBanner').classList.remove('visible');
+  documentMock.getElementById('errorBanner').classList.remove('info');
   documentMock.hidden = false;
   // v1.18: captionEditorState is module-level (like pipState) and persists
   // across scenarios unless reset here — cues/videoInfo/fileKey from one
@@ -6100,6 +6115,141 @@ Real cue text
     assert(noSwapBytes.length > 0, 'EY precondition: the no-swap run actually wrote bytes');
     assert(Buffer.compare(noSwapBytes, swapBytes) === 0,
       'EY: paused-swap session bytes === no-swap session bytes given identical chunk data (' + noSwapBytes.length + ' vs ' + swapBytes.length + ' bytes)');
+  });
+
+  // ============================================================
+  // REVIEW #26 — first audio-less share hint (both browsers)
+  // ============================================================
+
+  await scenario('EZ maybeShowAudioHint: first audio-less screen share via selectScreen shows a one-time hint (Chrome-like proxy: showSaveFilePicker present), applies the calm info look, sets the flag, and a second audio-less share on the same profile shows nothing more', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    windowMock.showSaveFilePicker = async () => { throw new Error('never called by selectScreen'); }; // Chrome-like proxy: only its PRESENCE is read, never invoked here
+    assert(sandbox.localStorage.getItem('audioHintShown') === null, 'EZ precondition: fresh profile, flag unset');
+
+    await sandbox.selectScreen(); // default getDisplayMedia mock returns a video-only stream (no audio track)
+    assert(state.screenStream !== null, 'EZ precondition: capture succeeded');
+    assert(recordedErrors.some((m) => m && /Also share audio/.test(m)), 'EZ: the Chrome-branch wording (picker checkbox) is shown (got ' + JSON.stringify(recordedErrors) + ')');
+    const el = documentMock.getElementById('errorBanner');
+    assert(el.classList.contains('info'), 'EZ: the calm info look is applied');
+    assert(el.classList.contains('visible'), 'EZ: the banner is shown');
+    assert(sandbox.localStorage.getItem('audioHintShown') === '1', 'EZ: the flag is set once the hint has been SHOWN');
+
+    // ---- second audio-less share on the same profile: no repeat ----
+    recordedErrors.length = 0;
+    await sandbox.selectScreen();
+    assert(state.screenStream !== null, 'EZ: second capture also succeeded');
+    assert(recordedErrors.every((m) => !m), 'EZ: no hint on a second audio-less share once the flag is persisted (got ' + JSON.stringify(recordedErrors) + ')');
+  });
+
+  await scenario('FA maybeShowAudioHint: Firefox-like proxy (no showSaveFilePicker) gets the loopback-guidance wording, not the Chrome wording; the flag is set the same way', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    // resetState() already deletes windowMock.showSaveFilePicker (absent = Firefox mode) — no override needed.
+    assert(!('showSaveFilePicker' in windowMock), 'FA precondition: Firefox-like proxy (no showSaveFilePicker)');
+
+    await sandbox.selectScreen(); // default mock: video-only, no audio
+    const last = recordedErrors[recordedErrors.length - 1];
+    assert(/loopback input/i.test(last || '') && /Stereo Mix|VB-Audio/i.test(last || ''), 'FA: the Firefox-branch wording (loopback guidance) is shown (got ' + JSON.stringify(recordedErrors) + ')');
+    assert(!/Also share audio/.test(last || ''), 'FA: not the Chrome wording (got ' + JSON.stringify(last) + ')');
+    assert(sandbox.localStorage.getItem('audioHintShown') === '1', 'FA: flag set after the Firefox-branch hint too');
+  });
+
+  await scenario('FB maybeShowAudioHint never fires when the share HAS audio, on a fresh profile — no message, flag stays unset', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    assert(sandbox.localStorage.getItem('audioHintShown') === null, 'FB precondition: fresh profile, flag unset');
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => makeStream([
+      { kind: 'video', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, stop() {} },
+      { kind: 'audio', addEventListener() {}, stop() {} },
+    ]);
+
+    await sandbox.selectScreen();
+    assert(state.screenStream !== null, 'FB precondition: capture succeeded');
+    assert(state.screenStream.getAudioTracks().length === 1, 'FB precondition: the captured stream really does have audio');
+    assert(recordedErrors.every((m) => !m), 'FB: no hint shown for a share that has audio (got ' + JSON.stringify(recordedErrors) + ')');
+    assert(sandbox.localStorage.getItem('audioHintShown') === null, 'FB: the flag is never set — the hint was never shown');
+  });
+
+  await scenario('FC maybeShowAudioHint never fires from changeScreenPaused, even on a fresh profile and even when the swapped-to screen has no audio — selectScreen is the ONLY trigger point', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    const oldTrack = { kind: 'video', id: 'old-screen', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const oldStream = makeStream([oldTrack]);
+    state.screenStream = oldStream;
+    S.wireScreenEndedListener(oldStream);
+
+    await api.startRecording();
+    sandbox.pauseResume();
+    assert(state.paused === true, 'FC precondition: paused');
+    assert(sandbox.localStorage.getItem('audioHintShown') === null, 'FC precondition: fresh profile, flag unset');
+
+    const newTrack = { kind: 'video', id: 'new-screen', getSettings: () => ({ width: 1280, height: 720 }), addEventListener() {}, removeEventListener() {}, stop() {} };
+    const newStream = makeStream([newTrack]); // no audio track — would qualify for the hint if selectScreen's trigger applied here too
+    sandbox.navigator.mediaDevices.getDisplayMedia = async () => newStream;
+
+    await S.changeScreenPaused();
+
+    assert(state.screenStream === newStream, 'FC precondition: the swap itself succeeded');
+    assert(recordedErrors.every((m) => !m || (!/Also share audio/.test(m) && !/loopback input/i.test(m))), 'FC: no audio hint from a changeScreenPaused swap (got ' + JSON.stringify(recordedErrors) + ')');
+    assert(sandbox.localStorage.getItem('audioHintShown') === null, 'FC: the flag is still unset — changeScreenPaused never touches it');
+
+    sandbox.pauseResume();
+    await sandbox.stopRecording();
+    await drain();
+  });
+
+  await scenario("FD dismissing the hint banner (the close button's showError('')) clears both the visible and info classes", async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    await sandbox.selectScreen(); // fresh profile -> hint shows (default mock: video-only)
+    const el = documentMock.getElementById('errorBanner');
+    assert(el.classList.contains('visible') && el.classList.contains('info'), 'FD precondition: hint is showing with the calm look');
+
+    sandbox.showError(''); // exactly what the close button's onclick="showError('')" does
+    assert(!el.classList.contains('visible'), 'FD: dismiss clears the banner');
+    assert(!el.classList.contains('info'), 'FD: dismiss clears the calm info look too');
+  });
+
+  await scenario('FE a genuine error shown after the audio hint renders as a normal error — the calm info look is gone, only the error look and the new text remain', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    await sandbox.selectScreen(); // fresh profile -> hint shows
+    const el = documentMock.getElementById('errorBanner');
+    assert(el.classList.contains('info'), 'FE precondition: hint showing with the calm look');
+
+    sandbox.showError('Could not access screen: device disappeared'); // a genuine error, same shape as selectScreen's own catch-block copy
+    assert(el.classList.contains('visible'), 'FE: the banner is still shown');
+    assert(!el.classList.contains('info'), 'FE: the calm info look is gone — this reads as a normal error now');
+    assert(documentMock.getElementById('errorBannerMsg').textContent === 'Could not access screen: device disappeared', 'FE: the real error text replaced the hint text');
+  });
+
+  await scenario('FF localStorage throwing on getItem/setItem during the audio-hint check never breaks selectScreen — the capture still succeeds and the hint still shows rather than the flow failing', async () => {
+    state.sources = { screen: true, camera: false, mic: false };
+    const origGetItem = sandbox.localStorage.getItem;
+    const origSetItem = sandbox.localStorage.setItem;
+    sandbox.localStorage.getItem = () => { throw new Error('SecurityError'); };
+    sandbox.localStorage.setItem = () => { throw new Error('SecurityError'); };
+
+    let threw = null;
+    try { await sandbox.selectScreen(); } catch (e) { threw = e; }
+
+    assert(threw === null, 'FF: selectScreen does not throw when localStorage is broken (got ' + (threw && threw.message) + ')');
+    assert(state.screenStream !== null, 'FF: the capture still succeeded');
+    assert(recordedErrors.some((m) => m && (/Also share audio/.test(m) || /loopback input/i.test(m))), 'FF: the hint still shows — a broken getItem is treated as "not shown yet", never as a reason to skip it (got ' + JSON.stringify(recordedErrors) + ')');
+
+    sandbox.localStorage.getItem = origGetItem;
+    sandbox.localStorage.setItem = origSetItem;
+  });
+
+  await scenario('FG camera-only recordings never reach selectScreen, so the audio hint can never fire for them — asserted directly, not just by code-path inspection', async () => {
+    state.sources = { screen: true, camera: true, mic: false };
+    state.cameraStream = makeStream([{ kind: 'video', getSettings: () => ({ width: 320, height: 240 }), addEventListener() {}, stop() {} }]);
+    sandbox.toggleSource('screen'); // reaches camera-only exactly like AH — selectScreen is never called
+    assert(state.sources.screen === false && state.sources.camera === true, 'FG precondition: camera-only reached');
+    assert(state.screenStream === null, 'FG precondition: no screen stream exists in camera-only mode');
+
+    await api.startRecording();
+    assert(state.recording === true, 'FG precondition: camera-only recording actually started');
+    assert(recordedErrors.every((m) => !m || (!/Also share audio/.test(m) && !/loopback input/i.test(m))), 'FG: no audio hint anywhere in a camera-only flow (got ' + JSON.stringify(recordedErrors) + ')');
+    assert(sandbox.localStorage.getItem('audioHintShown') === null, 'FG: the flag was never touched — selectScreen (the only trigger) was never called');
+
+    await sandbox.stopRecording();
+    await drain();
   });
 
   console.log('\n================  ' + passed + ' passed, ' + failed + ' failed  ================');

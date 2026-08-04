@@ -1,8 +1,27 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-08-04 (post-v1.24). Supersedes the post-v1.23
-snapshot. Same-day earlier: v1.23 shipped AND #25 closed (owner pass,
-all items, both browsers).
+Close-out snapshot, 2026-08-04 (post-v1.25). Supersedes the post-v1.24
+snapshot. Same-day earlier: v1.23 shipped AND #25 closed; v1.24 shipped
+AND #23 closed (owner passes, both browsers).
+
+## v1.25 (newest): first audio-less share hint (#26 hint half)
+
+- One-time hint when a screen capture lands with no audio track. Fires
+  in selectScreen only (FC pins swaps silent); once ever via
+  localStorage 'audioHintShown' (try/catch idiom, FF pins throwing
+  localStorage can't break selection); branches on the
+  showSaveFilePicker proxy — Chrome wording (tick "Also share audio")
+  vs Firefox wording (loopback input as the mic). Calm .info modifier
+  on the dismissable banner via showInfoBanner; showError strips .info
+  on EVERY call (single choke point — FD/FE pin the lifecycle).
+- **Harness: 173 scenarios / 1234 assertions** (prefixes end at FG).
+  The showError mock now WRAPS the real function (was a replacement) —
+  real banner classList logic under test for the first time.
+- **v1.25 owner acceptance PENDING**: banner styling eyeball both
+  browsers, correct per-browser wording, once-ever behavior (clearing
+  site data brings it back), dismiss, later real error styled normally.
+- #26's docs half (loopback walkthrough: Stereo Mix / VB-Cable,
+  VoiceMeeter for mic+system, echo caveat) stays owed to #19.
 
 ## Where things stand
 
@@ -102,22 +121,17 @@ all items, both browsers).
 
 ## Queue
 
-- **#26 (new, owner-raised): Firefox system-audio loopback guidance** —
-  scoped in REVIEW #26. Core fact: Firefox CANNOT capture system audio
-  from a web page (upstream Bugzilla 1541425, open since 2019; FF
-  silently ignores getDisplayMedia's audio:true — which the app already
-  requests, and which lights up automatically if FF ever ships it).
-  Shippable scope is guidance only: a Firefox-only no-audio hint
-  (placement/wording needs owner input — don't nag every share) + a #19
-  guide section for the loopback workaround (Stereo Mix / VB-Audio
-  Virtual Cable as the selected mic — the existing mic picker already
-  supports this today with zero code; caveats: mic+system needs an
-  OS-level mix e.g. VoiceMeeter, echo risk).
+- **v1.25 owner acceptance** (short list above) — then close #26's hint
+  half; the loopback walkthrough transfers to #19's list.
 - **#19 (docs/README) + #20 (final full regression)** — the feature set
-  may now be stabilizing. #19 owes: save-first-then-open caption
-  workflow note; document "Redo last take" + typed timestamp + "Change
-  screen"; Chrome-vs-Firefox save-flow difference; and #26's loopback
-  guide (natural home).
+  is now plausibly stable (queue is otherwise empty). #19 owes:
+  save-first-then-open caption workflow note; document "Redo last take"
+  + typed timestamp + "Change screen"; Chrome-vs-Firefox save-flow
+  difference; #26's loopback guide (Stereo Mix / VB-Cable, VoiceMeeter
+  for mic+system, echo caveat — core fact: Firefox cannot capture
+  system audio from a web page, upstream Bugzilla 1541425; if Firefox
+  ever ships it, the app's existing audio:true request lights up with
+  zero changes).
 - Roadmap remainder (REVIEW feature map): chapter hotkeys + sidecar
   export, caption VTT/SRT import, mediabunny remux (Cues/MP4) — all
   unscheduled, owner-priority-driven.
