@@ -2219,12 +2219,16 @@ other open item.
    the environment can't deliver names. Serving the app over `http://localhost` (or
    any http(s) origin) restores persisted grants and the full named dropdown.
 
-10. **Cut precision follows cluster size:** "Re-record from here" cuts at the
+10. ~~**Cut precision follows cluster size:** "Re-record from here" cuts at the
     last cluster boundary at/before the chosen time. Chrome's ~1s clusters
     give ~1s precision; Firefox's ~7.5s clusters mean the cut can land up to
     ~7.5s before the chosen point (extra re-recording — never surviving
     mistake content). Block-precision truncation inside the final kept
-    cluster is the queued fix (REVIEW #22).
+    cluster is the queued fix (REVIEW #22).~~ — ✓ Fixed in v1.22/v1.22.1:
+    block-precision refinement (`refineCutToBlock`) truncates inside the
+    final kept cluster, landing within ~one video block (~33ms) of the
+    chosen time in both browsers; unsafe refinements fall back to the
+    cluster boundary (Rule A), never worse than the old behavior.
 
 ---
 

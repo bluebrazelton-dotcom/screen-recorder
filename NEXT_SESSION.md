@@ -1,8 +1,12 @@
 # DidaRec — Next Session, Start Here
 
-Close-out snapshot, 2026-08-04 (post-v1.25). Supersedes the post-v1.24
-snapshot. Same-day earlier: v1.23 shipped AND #25 closed; v1.24 shipped
-AND #23 closed (owner passes, both browsers).
+Close-out snapshot, 2026-08-06 (post-README ship + #20 prep).
+Supersedes the post-v1.25 snapshot. This session: v1.25 owner
+acceptance PASSED and #26 fully CLOSED; #19's README half SHIPPED
+(docs-only, no version bump); the #20 master regression checklist was
+compiled and handed to the owner (kept out of the repo); stale Known
+Limitation #10 struck through (fixed by v1.22/v1.22.1). The owner is
+now RUNNING the #20 pass and will report results to a fresh session.
 
 ## v1.25 (newest): first audio-less share hint (#26 hint half)
 
@@ -135,9 +139,13 @@ AND #23 closed (owner passes, both browsers).
   Recording, per-browser saving, captions workflow, file:// Chrome
   device-name caveat. Placement decision owed (README section vs.
   separate file vs. in-app help).
-- **#20 (final full regression)** — owner re-tests EVERY feature
-  end-to-end in both browsers, Firefox first, from BUILD_LOG's
-  accumulated manual acceptance lists. Pairs with #19's guide.
+- **#20 (final full regression) — IN PROGRESS, owner-run.** Owner
+  re-tests EVERY feature end-to-end in both browsers, Firefox first.
+  The master checklist was compiled 2026-08-06 (120 items, 18 sections,
+  per-browser checkboxes) and lives with the owner, NOT in the repo.
+  Baseline for the pass: v1.25 + docs commits, harness 1234/1234 green
+  (verified 2026-08-06). Owner reports results to a fresh session;
+  failures become fix items BEFORE #19's faculty guide.
 - Roadmap remainder (REVIEW feature map): chapter hotkeys + sidecar
   export, mediabunny remux (Cues/MP4) — all unscheduled,
   owner-priority-driven. (Stale "caption VTT/SRT import" entry removed
