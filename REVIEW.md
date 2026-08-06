@@ -300,7 +300,7 @@ authoring polish remains queued but is no longer next; #21 is.
 
 ## User documentation (queued 2026-07-29)
 
-### 19. End-user instructions + README refresh — queued for when the feature set stabilizes
+### 19. End-user instructions + README refresh — README half DONE 2026-08-06; usage guide still open
 Owner-requested (2026-07-29): once the remaining pieces land (or are
 explicitly descoped — the caption editor's fate is under evaluation), write
 the user-facing documentation. Two deliverables:
@@ -321,8 +321,19 @@ the user-facing documentation. Two deliverables:
    never how it works. Decide placement when written: README section,
    separate guide file, and/or a lightweight in-app help affordance.
 
-Not started — deliberately last in the queue so it documents the final shape
-instead of chasing a moving one.
+Deliverable 1 (README) SHIPPED 2026-08-06: full rewrite — Firefox-first
+browser support with the Chrome-FSA vs. Firefox-download+confirm-bar
+save-flow difference; feature list now covers pause/resume, Change
+screen while paused, quality presets + noise suppression, the review
+pane's take controls (Redo last take, scrub-or-typed m:ss re-record),
+the caption editor (sidecar-only, save-first-then-open), honest device
+names; NEW "System audio on Firefox" section carries #26's loopback
+walkthrough (Stereo Mix / VB-Cable, VoiceMeeter for mic+system, echo
+caveat, Chrome's "Also share audio" contrast); placeholder URL replaced
+with the live Pages URL (bluebrazelton-dotcom.github.io/DidaRec).
+Requirements pin Firefox 153+ (owner's tested floor — earlier versions
+untested, not known-broken). Deliverable 2 (faculty-facing usage guide)
+remains open — deliberately last so it documents the final shape.
 
 Also owed from the owner's 2026-08-03 #21 pass: the caption-editor workflow
 must state that a recording is **saved first, then opened** in the editor
@@ -640,7 +651,7 @@ seam-formula invariant: `computeRedoLastTakePlan` is now a FOURTH
 lockstep site. Owner real-browser acceptance PASSED same day (all 8
 checklist items, both browsers) — CLOSED.
 
-### 26. System audio in Firefox: loopback guidance (owner-raised 2026-08-04, from the #23 pass) — hint half SHIPPED v1.25 (2026-08-04)
+### 26. System audio in Firefox: loopback guidance (owner-raised 2026-08-04, from the #23 pass) — hint half SHIPPED v1.25; CLOSED 2026-08-06
 
 The app ALREADY records screen/system audio wherever the browser
 delivers it: captureScreen requests `audio: true`, Chrome's picker has
@@ -673,8 +684,10 @@ dismissable banner via showInfoBanner (showError strips the class on
 every call — single choke point). Scenarios EZ, FA–FG; harness
 173/1234; the harness's showError mock now WRAPS the real function
 (was a full replacement — real banner code under test for the first
-time). (b) the loopback walkthrough remains owed to #19. Owner
-acceptance pending.
+time). (b) the loopback walkthrough SHIPPED 2026-08-06 as the README's
+"System audio on Firefox" section (#19 README half). Owner acceptance
+of (a) PASSED 2026-08-06, both browsers, all five checklist items.
+**#26 CLOSED 2026-08-06.**
 
 ### 20. Final-build full regression pass — owner-requested (2026-07-29)
 Before calling any build "final," the owner will re-test EVERY feature

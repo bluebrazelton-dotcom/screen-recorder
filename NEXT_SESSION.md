@@ -17,11 +17,10 @@ AND #23 closed (owner passes, both browsers).
 - **Harness: 173 scenarios / 1234 assertions** (prefixes end at FG).
   The showError mock now WRAPS the real function (was a replacement) —
   real banner classList logic under test for the first time.
-- **v1.25 owner acceptance PENDING**: banner styling eyeball both
-  browsers, correct per-browser wording, once-ever behavior (clearing
-  site data brings it back), dismiss, later real error styled normally.
-- #26's docs half (loopback walkthrough: Stereo Mix / VB-Cable,
-  VoiceMeeter for mic+system, echo caveat) stays owed to #19.
+- **v1.25 owner acceptance PASSED 2026-08-06, both browsers** — all
+  five checklist items. #26's hint half CLOSED.
+- #26's docs half SHIPPED 2026-08-06 as the README's "System audio on
+  Firefox" section — **#26 fully CLOSED**.
 
 ## Where things stand
 
@@ -121,20 +120,28 @@ AND #23 closed (owner passes, both browsers).
 
 ## Queue
 
-- **v1.25 owner acceptance** (short list above) — then close #26's hint
-  half; the loopback walkthrough transfers to #19's list.
-- **#19 (docs/README) + #20 (final full regression)** — the feature set
-  is now plausibly stable (queue is otherwise empty). #19 owes:
-  save-first-then-open caption workflow note; document "Redo last take"
-  + typed timestamp + "Change screen"; Chrome-vs-Firefox save-flow
-  difference; #26's loopback guide (Stereo Mix / VB-Cable, VoiceMeeter
-  for mic+system, echo caveat — core fact: Firefox cannot capture
-  system audio from a web page, upstream Bugzilla 1541425; if Firefox
-  ever ships it, the app's existing audio:true request lights up with
-  zero changes).
+- ~~v1.25 owner acceptance~~ PASSED 2026-08-06; **#26 fully CLOSED**
+  (hint half accepted; docs half shipped as the README's "System audio
+  on Firefox" section).
+- ~~#19 README half~~ SHIPPED 2026-08-06: full README rewrite —
+  Firefox-first + save-flow difference, feature list (take controls,
+  Change screen, captions save-first-then-open), loopback walkthrough,
+  live Pages URL (repo renamed: bluebrazelton-dotcom/DidaRec),
+  Firefox 153+ floor (owner's tested version — earlier untested).
+  Docs-only; no version bump; harness untouched at 173/1234.
+- **#19 remainder: faculty-facing usage guide** (REVIEW deliverable 2)
+  — plain-language what-to-click instructions for non-technical
+  faculty: recording basics, pause/resume, crash recovery + Continue
+  Recording, per-browser saving, captions workflow, file:// Chrome
+  device-name caveat. Placement decision owed (README section vs.
+  separate file vs. in-app help).
+- **#20 (final full regression)** — owner re-tests EVERY feature
+  end-to-end in both browsers, Firefox first, from BUILD_LOG's
+  accumulated manual acceptance lists. Pairs with #19's guide.
 - Roadmap remainder (REVIEW feature map): chapter hotkeys + sidecar
-  export, caption VTT/SRT import, mediabunny remux (Cues/MP4) — all
-  unscheduled, owner-priority-driven.
+  export, mediabunny remux (Cues/MP4) — all unscheduled,
+  owner-priority-driven. (Stale "caption VTT/SRT import" entry removed
+  2026-08-06 — import/export shipped with the v1.18 editor.)
 
 ## Ground rules (unchanged)
 

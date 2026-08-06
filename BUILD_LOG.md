@@ -2143,10 +2143,50 @@ ORIG_updateStatus pattern — behavior-preserving for all 165 pre-existing
 scenarios (none assert on banner DOM) and the real classList logic is
 finally under test. resetState clears the banner's classes.
 
-**Owner acceptance owed (both browsers):** calm banner styling eyeball,
-correct wording per browser, shows once then never again (and clearing
-site data / localStorage brings it back), dismiss works, a later real
-error looks like a normal error.
+**Owner acceptance PASSED 2026-08-06, both browsers:** calm banner
+styling, correct per-browser wording, once-ever (clearing site data
+brings it back), dismiss works, a later real error styled normally.
+**#26's hint half is CLOSED**; the loopback walkthrough transfers to
+#19's docs list.
+
+### README rewrite (#19 README half; closes #26's docs half) (2026-08-06)
+
+**Commit:** `docs (#19/#26): README rewrite — Firefox-first, save-flow
+difference, review-pane/caption/change-screen features, system-audio
+loopback walkthrough, live Pages URL`
+
+Docs-only change — `index.html` untouched, no version bump, harness
+unchanged at 173/1234. Full README rewrite (Sonnet-drafted in scratch,
+orchestrator-reviewed, owner-approved in full before write):
+
+- Browser support corrected: Firefox-first, both browsers fully
+  supported, with a "Browser support" section explaining the mechanical
+  save-flow difference (Chrome/Edge streamed `showSaveFilePicker` write
+  vs. Firefox download + "Downloaded — did it arrive?" confirm bar).
+- Feature list expanded: pause/resume, Change screen while paused,
+  quality presets + mic noise suppression, review-pane take controls
+  (Redo last take; scrub or typed `m:ss` re-record), caption editor
+  (sidecar-only, no burn-in, save-first-then-open workflow), honest
+  device names. Nothing removed.
+- NEW "System audio on Firefox" section — #26's docs half: Bugzilla
+  1541425 stated plainly, loopback-as-microphone workaround (Stereo
+  Mix / VB-Cable), VoiceMeeter for mic+system, echo caveat + fix,
+  Chrome/Edge's native "Also share audio" contrast, and a pointer to
+  the v1.25 in-app hint. Core promise preserved: if Firefox ships
+  1541425, the app's existing `audio:true` request lights up with zero
+  changes.
+- Requirements: Firefox 153+ (owner's tested floor, 153.0.1 — earlier
+  versions untested, not known-broken), Chrome/Edge 86+ carried over.
+- Usage placeholder replaced with the live URLs (repo renamed):
+  https://bluebrazelton-dotcom.github.io/DidaRec/ and
+  https://github.com/bluebrazelton-dotcom/DidaRec (both verified 200).
+
+Every feature claim was verified against `index.html` before shipping
+(the draft's NOTES.md maps each claim to its code site). **#26 is now
+fully CLOSED** (hint half: v1.25 acceptance passed 2026-08-06, both
+browsers; docs half: this README). #19's remaining deliverable is the
+faculty-facing usage guide; #20 (final full regression) is the only
+other open item.
 
 ---
 
